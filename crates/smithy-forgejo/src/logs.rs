@@ -87,6 +87,32 @@ struct ViewLine {
     message: String,
 }
 
+const MAX_REDIRECTS: usize = 4;
+
+/// Valeur du cookie `_csrf` posé par une réponse (ignoré s'il est vide ou supprimé).
+fn csrf_cookie(headers: &header::HeaderMap) -> Option<String> {
+    headers
+        .get_all(header::SET_COOKIE)
+        .iter()
+        .filter_map(|v| v.to_str().ok())
+        .filter(|c| !c.to_ascii_lowercase().contains("max-age=0"))
+        .find_map(|c| c.strip_prefix("_csrf="))
+        .map(|c| c.split(';').next().unwrap_or_default().to_owned())
+        .filter(|c| !c.is_empty())
+}
+
+/// Chemin (et requête) d'un en-tête `Location`, absolu ou relatif.
+fn local_path(location: &str) -> Option<String> {
+    if location.starts_with('/') {
+        return Some(location.to_owned());
+    }
+    let url = reqwest::Url::parse(location).ok()?;
+    Some(match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_owned(),
+    })
+}
+
 /// Ce que partagent les requêtes web d'un même affichage de logs.
 struct WebCtx {
     /// `(valeur du cookie _csrf, jeton de la page)`, pour les versions qui l'exigent.
@@ -115,51 +141,73 @@ impl Forgejo {
             )
     }
 
-    /// Adaptateur `Legacy` : le jeton CSRF vient de n'importe quelle page du dépôt (cookie
-    /// `_csrf` + `csrfToken` dans le HTML). Cette page sert aussi de test de session.
+    /// Familles `Legacy` et `Transitional` : le jeton CSRF vient d'une page du dépôt (cookie
+    /// `_csrf` + `csrfToken` dans le HTML). Dès la 13 la page du run redirige (307) vers
+    /// `…/jobs/0/attempt/1` : on suit, comme un navigateur. Cette page sert aussi de test de session.
     async fn web_context(&self, flavor: Flavor, repo: &Repo, number: u64) -> Result<WebCtx> {
         if !flavor.needs_csrf() {
             return Ok(WebCtx { csrf: None });
         }
-        let path = format!("/{}/{}/actions/runs/{number}", repo.owner, repo.name);
-        let resp = self
-            .web
-            .get(format!("{}{path}", self.base_url))
-            .header(header::COOKIE, self.cookie_header(None))
-            .send()
-            .await
-            .map_err(|e| Error::Network(e.without_url().to_string()))?;
-        let status = resp.status();
-        if Self::session_lost(status) {
-            return Err(Error::SessionExpired);
+        let mut path = format!("/{}/{}/actions/runs/{number}", repo.owner, repo.name);
+        let mut cookie: Option<String> = None;
+        for _ in 0..MAX_REDIRECTS {
+            let mut cookies = self.cookie_header(None);
+            if let Some(c) = &cookie {
+                cookies.push_str(&format!("; _csrf={c}"));
+            }
+            let resp = self
+                .web
+                .get(format!("{}{path}", self.base_url))
+                .header(header::COOKIE, cookies)
+                .send()
+                .await
+                .map_err(|e| Error::Network(e.without_url().to_string()))?;
+            let status = resp.status();
+            if let Some(c) = csrf_cookie(resp.headers()) {
+                cookie = Some(c);
+            }
+            if status.is_redirection() {
+                // On ne garde que le chemin : l'hôte d'une URL absolue peut différer de celui configuré.
+                let next = resp
+                    .headers()
+                    .get(header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(local_path);
+                match next {
+                    Some(p) if !p.starts_with("/user/login") => {
+                        path = p;
+                        continue;
+                    }
+                    _ => return Err(Error::SessionExpired),
+                }
+            }
+            if Self::session_lost(status) {
+                return Err(Error::SessionExpired);
+            }
+            if !status.is_success() {
+                return Err(Error::Network(format!("HTTP {status} sur {path}")));
+            }
+            let page = resp
+                .text()
+                .await
+                .map_err(|e| Error::Network(e.without_url().to_string()))?;
+            let token = page
+                .split("csrfToken: '")
+                .nth(1)
+                .and_then(|rest| rest.split('\'').next())
+                .filter(|t| !t.is_empty());
+            return match (cookie, token) {
+                (Some(c), Some(t)) => Ok(WebCtx {
+                    csrf: Some((c, t.to_owned())),
+                }),
+                _ => Err(Error::Decode(
+                    "jeton CSRF introuvable (page modifiée dans cette version de Forgejo ?)".into(),
+                )),
+            };
         }
-        if !status.is_success() {
-            return Err(Error::Network(format!("HTTP {status} sur {path}")));
-        }
-        let cookie = resp
-            .headers()
-            .get_all(header::SET_COOKIE)
-            .iter()
-            .filter_map(|v| v.to_str().ok())
-            .find_map(|c| c.strip_prefix("_csrf="))
-            .map(|c| c.split(';').next().unwrap_or_default().to_owned());
-        let page = resp
-            .text()
-            .await
-            .map_err(|e| Error::Network(e.without_url().to_string()))?;
-        let token = page
-            .split("csrfToken: '")
-            .nth(1)
-            .and_then(|rest| rest.split('\'').next())
-            .filter(|t| !t.is_empty());
-        match (cookie, token) {
-            (Some(c), Some(t)) if !c.is_empty() => Ok(WebCtx {
-                csrf: Some((c, t.to_owned())),
-            }),
-            _ => Err(Error::Decode(
-                "jeton CSRF introuvable (page modifiée dans cette version de Forgejo ?)".into(),
-            )),
-        }
+        Err(Error::Decode(
+            "trop de redirections sur la page du run".into(),
+        ))
     }
 
     /// `steps` : étapes dont on veut la sortie. Une étape hors bornes fait répondre
@@ -241,8 +289,12 @@ impl Forgejo {
         }
         let ctx = self.web_context(flavor, repo, number).await?;
 
-        // 1. Position du job dans le run (le chemin veut l'index, pas l'id).
-        let first = self.job_view(&ctx, repo, number, 0, None, &[]).await?;
+        // 1. Position du job dans le run (le chemin veut l'index, pas l'id). Dès la 13, une
+        //    requête sans `attempt` répond 500 : on part de la tentative 1, qui existe toujours.
+        let first_attempt = flavor.uses_attempts().then_some(1);
+        let first = self
+            .job_view(&ctx, repo, number, 0, first_attempt, &[])
+            .await?;
         let index = first
             .state
             .run
@@ -251,32 +303,34 @@ impl Forgejo {
             .position(|j| j.name == pipeline.job)
             .ok_or_else(|| Error::NotFound(format!("job « {} »", pipeline.job)))?;
 
-        // 2. Liste des étapes. `Modern` : dernière tentative (relances) ; `Legacy` : pas de tentative.
-        let (attempt, view) = if flavor.uses_attempts() {
-            let probe = if index == 0 {
-                first
-            } else {
-                self.job_view(&ctx, repo, number, index, None, &[]).await?
-            };
-            let latest = probe
-                .state
-                .current_job
-                .all_attempts
-                .iter()
-                .map(|a| a.number)
-                .max()
-                .unwrap_or(1);
-            let view = self
-                .job_view(&ctx, repo, number, index, Some(latest), &[])
-                .await?;
-            (Some(latest), view)
-        } else if index == 0 {
-            (None, first)
+        // 2. Liste des étapes. Avec tentatives : on lit `allAttempts` sur la tentative 1 de ce
+        //    job, puis on passe à la dernière si le job a été relancé.
+        let view = if index == 0 {
+            first
         } else {
-            (
-                None,
-                self.job_view(&ctx, repo, number, index, None, &[]).await?,
-            )
+            self.job_view(&ctx, repo, number, index, first_attempt, &[])
+                .await?
+        };
+        let (attempt, view) = match first_attempt {
+            None => (None, view),
+            Some(_) => {
+                let latest = view
+                    .state
+                    .current_job
+                    .all_attempts
+                    .iter()
+                    .map(|a| a.number)
+                    .max()
+                    .unwrap_or(1);
+                if latest == 1 {
+                    (Some(1), view)
+                } else {
+                    let v = self
+                        .job_view(&ctx, repo, number, index, Some(latest), &[])
+                        .await?;
+                    (Some(latest), v)
+                }
+            }
         };
 
         // 3. Leur sortie.
@@ -334,6 +388,8 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     const RUN: &str = "/smithy/demo/actions/runs/7/jobs";
+    const PAGE: &str = "/smithy/demo/actions/runs/7";
+    const JOBS: [&str; 2] = ["build", "test"];
 
     fn repo() -> Repo {
         Repo {
@@ -375,6 +431,24 @@ mod tests {
         })
     }
 
+    fn steps_json() -> Value {
+        json!([
+            {"summary": "Set up job", "status": "success"},
+            {"summary": "cargo test", "status": "failure"}
+        ])
+    }
+
+    /// Lignes dans le désordre, avec ANSI et barre de progression.
+    fn logs_json() -> Value {
+        json!([
+            {"step": 1, "cursor": 3, "lines": [
+                {"index": 2, "message": "10%\r100%"},
+                {"index": 1, "message": "\u{1b}[31mrouge\u{1b}[0m"},
+                {"index": 3, "message": "fin"}]},
+            {"step": 0, "cursor": 1, "lines": [{"index": 1, "message": "prêt"}]}
+        ])
+    }
+
     /// Annonce la version du serveur (détermine l'adaptateur).
     async fn mount_version(server: &MockServer, version: &str) {
         Mock::given(method("GET"))
@@ -384,6 +458,7 @@ mod tests {
             .await;
     }
 
+    /// Réponse web sans protection CSRF (cookies de session seuls).
     async fn mock(server: &MockServer, p: &str, contains: &str, body: Value) {
         Mock::given(method("POST"))
             .and(path(p))
@@ -394,52 +469,194 @@ mod tests {
             .await;
     }
 
+    /// Réponse web avec les deux moitiés du jeton CSRF.
+    async fn mock_csrf(server: &MockServer, p: &str, contains: &str, body: Value) {
+        Mock::given(method("POST"))
+            .and(path(p))
+            .and(header("Cookie", "lang=fr; session=abc; _csrf=ck123"))
+            .and(header("X-Csrf-Token", "tok456"))
+            .and(body_string_contains(contains))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn posts(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| r.url.path().to_owned())
+            .collect()
+    }
+
+    /// Mock d'une page du dépôt qui fournit le jeton CSRF.
+    fn csrf_page() -> ResponseTemplate {
+        ResponseTemplate::new(200)
+            .append_header("Set-Cookie", "_csrf=ck123; Path=/; Max-Age=86400")
+            .set_body_string("<script>window.config = { csrfToken: 'tok456', x: 1 }</script>")
+    }
+
+    // --- Forgejo 14 et 15 : `Modern` (pas de CSRF, tentatives)
+
     #[tokio::test]
-    async fn logs_d_un_second_job_avec_relance() {
+    async fn modern_second_job_avec_relance() {
+        // Même comportement en 14 et en 15.
+        for version in ["14.0.5+gitea-1.22.0", "15.0.10+gitea-1.22.0"] {
+            let server = MockServer::start().await;
+            mount_version(&server, version).await;
+            // 1. liste des jobs : depuis la tentative 1 (sans `attempt` la 14 répond 500)
+            mock(
+                &server,
+                &format!("{RUN}/0/attempt/1"),
+                "\"logCursors\":[]",
+                view(&JOBS, &[1], json!([]), json!([])),
+            )
+            .await;
+            // 2. tentatives du job « test » (index 1) : la 2 est la dernière
+            mock(
+                &server,
+                &format!("{RUN}/1/attempt/1"),
+                "\"logCursors\":[]",
+                view(&JOBS, &[1, 2], json!([]), json!([])),
+            )
+            .await;
+            // 3. étapes de la tentative 2, puis 4. leur sortie
+            mock(
+                &server,
+                &format!("{RUN}/1/attempt/2"),
+                "\"logCursors\":[]",
+                view(&JOBS, &[1, 2], steps_json(), json!([])),
+            )
+            .await;
+            mock(
+                &server,
+                &format!("{RUN}/1/attempt/2"),
+                "\"step\":1",
+                view(&JOBS, &[1, 2], steps_json(), logs_json()),
+            )
+            .await;
+
+            let log = forgejo(&server)
+                .job_log(&repo(), &pipeline("test"))
+                .await
+                .unwrap();
+            assert_eq!(log.notice, None, "{version} est vérifiée");
+            assert_eq!(log.steps.len(), 2);
+            assert_eq!(log.steps[0].status, Status::Success);
+            assert_eq!(log.steps[0].lines, ["prêt"]);
+            assert_eq!(log.steps[1].status, Status::Failure);
+            assert_eq!(log.steps[1].lines, ["rouge", "100%", "fin"]);
+            // Jamais d'appel sans `attempt`, et aucune page lue pour un jeton CSRF.
+            assert!(
+                posts(&server).await.iter().all(|p| p.contains("attempt")),
+                "{version}"
+            );
+            assert!(
+                server
+                    .received_requests()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|r| r.url.path() != PAGE)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn modern_une_seule_tentative_economise_les_appels() {
         let server = MockServer::start().await;
-        mount_version(&server, "15.0.0+gitea-1.22.0").await;
-        let jobs = ["build", "test"];
-        // 1. liste des jobs (index 0, sans tentative)
+        mount_version(&server, "15.0.10+gitea-1.22.0").await;
+        // Job d'index 0, une tentative : liste des jobs = étapes, plus la sortie → 2 appels.
         mock(
             &server,
-            &format!("{RUN}/0"),
+            &format!("{RUN}/0/attempt/1"),
             "\"logCursors\":[]",
-            view(&jobs, &[1], json!([]), json!([])),
+            view(&JOBS, &[1], steps_json(), json!([])),
         )
         .await;
-        // 2. tentatives du job « test » (index 1) : la 2 est la dernière
         mock(
             &server,
-            &format!("{RUN}/1"),
-            "\"logCursors\":[]",
-            view(&jobs, &[1, 2], json!([]), json!([])),
-        )
-        .await;
-        let steps = json!([
-            {"summary": "Set up job", "status": "success"},
-            {"summary": "cargo test", "status": "failure"}
-        ]);
-        // 3. étapes de la tentative 2
-        mock(
-            &server,
-            &format!("{RUN}/1/attempt/2"),
-            "\"logCursors\":[]",
-            view(&jobs, &[1, 2], steps.clone(), json!([])),
-        )
-        .await;
-        // 4. sortie (lignes dans le désordre, avec ANSI et barre de progression)
-        let log = json!([
-            {"step": 1, "cursor": 3, "lines": [
-                {"index": 2, "message": "10%\r100%"},
-                {"index": 1, "message": "\u{1b}[31mrouge\u{1b}[0m"},
-                {"index": 3, "message": "fin"}]},
-            {"step": 0, "cursor": 1, "lines": [{"index": 1, "message": "prêt"}]}
-        ]);
-        mock(
-            &server,
-            &format!("{RUN}/1/attempt/2"),
+            &format!("{RUN}/0/attempt/1"),
             "\"step\":1",
-            view(&jobs, &[1, 2], steps, log),
+            view(&JOBS, &[1], steps_json(), logs_json()),
+        )
+        .await;
+        let log = forgejo(&server)
+            .job_log(&repo(), &pipeline("build"))
+            .await
+            .unwrap();
+        assert_eq!(log.steps[1].lines, ["rouge", "100%", "fin"]);
+        assert_eq!(posts(&server).await.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn job_sans_etape_donne_un_log_vide() {
+        // Job annulé avant démarrage : steps vide, aucune demande de sortie.
+        let server = MockServer::start().await;
+        mount_version(&server, "15.0.10+gitea-1.22.0").await;
+        mock(
+            &server,
+            &format!("{RUN}/0/attempt/1"),
+            "",
+            view(&["build"], &[1], json!([]), json!([])),
+        )
+        .await;
+        let log = forgejo(&server)
+            .job_log(&repo(), &pipeline("build"))
+            .await
+            .unwrap();
+        assert!(log.steps.is_empty());
+        assert_eq!(posts(&server).await.len(), 1);
+    }
+
+    // --- Forgejo 13 : `Transitional` (CSRF et tentatives)
+
+    #[tokio::test]
+    async fn forgejo_13_csrf_via_la_redirection_et_tentatives() {
+        let server = MockServer::start().await;
+        mount_version(&server, "13.0.5+gitea-1.22.0").await;
+        // Dès la 13 la page du run redirige, avec une URL absolue vers un autre hôte :
+        // seul le chemin compte. Le cookie `_csrf` est déjà posé par la redirection.
+        Mock::given(method("GET"))
+            .and(path(PAGE))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header(
+                        "Location",
+                        "http://forge.interne:3000/smithy/demo/actions/runs/7/jobs/0/attempt/1",
+                    )
+                    .append_header("Set-Cookie", "_csrf=ck123; Path=/; Max-Age=86400"),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{RUN}/0/attempt/1")))
+            .and(header("Cookie", "lang=fr; session=abc; _csrf=ck123"))
+            .respond_with(csrf_page())
+            .mount(&server)
+            .await;
+        mock_csrf(
+            &server,
+            &format!("{RUN}/0/attempt/1"),
+            "\"logCursors\":[]",
+            view(&JOBS, &[1], json!([]), json!([])),
+        )
+        .await;
+        mock_csrf(
+            &server,
+            &format!("{RUN}/1/attempt/1"),
+            "\"logCursors\":[]",
+            view(&JOBS, &[1], steps_json(), json!([])),
+        )
+        .await;
+        mock_csrf(
+            &server,
+            &format!("{RUN}/1/attempt/1"),
+            "\"step\":1",
+            view(&JOBS, &[1], steps_json(), logs_json()),
         )
         .await;
 
@@ -447,13 +664,114 @@ mod tests {
             .job_log(&repo(), &pipeline("test"))
             .await
             .unwrap();
-        assert_eq!(log.steps.len(), 2);
-        assert_eq!(log.steps[0].name, "Set up job");
-        assert_eq!(log.steps[0].status, Status::Success);
-        assert_eq!(log.steps[0].lines, ["prêt"]);
-        assert_eq!(log.steps[1].status, Status::Failure);
+        assert_eq!(log.notice, None);
         assert_eq!(log.steps[1].lines, ["rouge", "100%", "fin"]);
     }
+
+    #[tokio::test]
+    async fn redirection_vers_le_login_donne_session_expiree() {
+        let server = MockServer::start().await;
+        mount_version(&server, "13.0.5+gitea-1.22.0").await;
+        Mock::given(method("GET"))
+            .and(path(PAGE))
+            .respond_with(ResponseTemplate::new(303).insert_header("Location", "/user/login"))
+            .mount(&server)
+            .await;
+        let r = forgejo(&server).job_log(&repo(), &pipeline("test")).await;
+        assert!(matches!(r, Err(Error::SessionExpired)), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn boucle_de_redirections() {
+        let server = MockServer::start().await;
+        mount_version(&server, "13.0.5+gitea-1.22.0").await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", PAGE))
+            .mount(&server)
+            .await;
+        let r = forgejo(&server).job_log(&repo(), &pipeline("test")).await;
+        assert!(
+            matches!(r, Err(Error::Decode(ref m)) if m.contains("redirections")),
+            "{r:?}"
+        );
+    }
+
+    // --- Forgejo 10 à 12 : `Legacy` (CSRF, pas de tentative)
+
+    #[tokio::test]
+    async fn forgejo_10_jeton_csrf_et_pas_de_tentative() {
+        let server = MockServer::start().await;
+        mount_version(&server, "10.0.3+gitea-1.22.0").await;
+        Mock::given(method("GET"))
+            .and(path(PAGE))
+            .and(header("Cookie", "lang=fr; session=abc"))
+            .respond_with(csrf_page())
+            .mount(&server)
+            .await;
+        mock_csrf(
+            &server,
+            &format!("{RUN}/0"),
+            "\"logCursors\":[]",
+            view(&JOBS, &[], json!([]), json!([])),
+        )
+        .await;
+        mock_csrf(
+            &server,
+            &format!("{RUN}/1"),
+            "\"logCursors\":[]",
+            view(&JOBS, &[], steps_json(), json!([])),
+        )
+        .await;
+        mock_csrf(
+            &server,
+            &format!("{RUN}/1"),
+            "\"step\":1",
+            view(&JOBS, &[], steps_json(), logs_json()),
+        )
+        .await;
+
+        let log = forgejo(&server)
+            .job_log(&repo(), &pipeline("test"))
+            .await
+            .unwrap();
+        assert_eq!(log.notice, None, "version vérifiée : aucune réserve");
+        assert_eq!(log.steps[1].lines, ["rouge", "100%", "fin"]);
+        assert!(
+            posts(&server).await.iter().all(|p| !p.contains("attempt")),
+            "pas d'attempt en 10 à 12"
+        );
+    }
+
+    #[tokio::test]
+    async fn forgejo_10_session_perdue_a_la_lecture_de_la_page() {
+        let server = MockServer::start().await;
+        mount_version(&server, "11.0.16+gitea-1.22.0").await;
+        Mock::given(method("GET"))
+            .and(path(PAGE))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+        let r = forgejo(&server).job_log(&repo(), &pipeline("test")).await;
+        assert!(matches!(r, Err(Error::SessionExpired)), "{r:?}");
+    }
+
+    #[tokio::test]
+    async fn forgejo_10_page_sans_jeton() {
+        let server = MockServer::start().await;
+        mount_version(&server, "12.0.4+gitea-1.22.0").await;
+        Mock::given(method("GET"))
+            .and(path(PAGE))
+            .respond_with(ResponseTemplate::new(200).set_body_string("<html>rien</html>"))
+            .mount(&server)
+            .await;
+        let r = forgejo(&server).job_log(&repo(), &pipeline("test")).await;
+        assert!(
+            matches!(r, Err(Error::Decode(ref m)) if m.contains("CSRF")),
+            "{r:?}"
+        );
+    }
+
+    // --- Cas communs
 
     #[tokio::test]
     async fn sans_cookie_aucune_requete() {
@@ -494,9 +812,10 @@ mod tests {
     #[tokio::test]
     async fn job_inconnu_et_numero_inconnu() {
         let server = MockServer::start().await;
+        mount_version(&server, "15.0.10+gitea-1.22.0").await;
         mock(
             &server,
-            &format!("{RUN}/0"),
+            &format!("{RUN}/0/attempt/1"),
             "",
             view(&["build"], &[1], json!([]), json!([])),
         )
@@ -517,146 +836,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn job_sans_etape_donne_un_log_vide() {
-        // Job annulé avant démarrage : steps vide, aucune demande de sortie.
-        let server = MockServer::start().await;
-        mount_version(&server, "15.0.0+gitea-1.22.0").await;
-        mock(
-            &server,
-            &format!("{RUN}/0"),
-            "",
-            view(&["build"], &[1], json!([]), json!([])),
-        )
-        .await;
-        mock(
-            &server,
-            &format!("{RUN}/0/attempt/1"),
-            "",
-            view(&["build"], &[1], json!([]), json!([])),
-        )
-        .await;
-        let log = forgejo(&server)
-            .job_log(&repo(), &pipeline("build"))
-            .await
-            .unwrap();
-        assert!(log.steps.is_empty());
-        let posts = server
-            .received_requests()
-            .await
-            .unwrap()
-            .iter()
-            .filter(|r| r.method.as_str() == "POST")
-            .count();
-        assert_eq!(
-            posts, 2,
-            "liste des jobs puis liste des étapes, pas de demande de sortie"
-        );
-    }
-
-    /// Forgejo 10 à 12 : page du run pour le jeton CSRF, pas de segment `attempt`.
-    async fn mount_legacy_page(server: &MockServer) {
-        Mock::given(method("GET"))
-            .and(path("/smithy/demo/actions/runs/7"))
-            .and(header("Cookie", "lang=fr; session=abc"))
-            .respond_with(
-                ResponseTemplate::new(200)
-                    .append_header("Set-Cookie", "_csrf=ck123; Path=/; Max-Age=86400")
-                    .set_body_string(
-                        "<script>window.config = { csrfToken: 'tok456', x: 1 }</script>",
-                    ),
-            )
-            .mount(server)
-            .await;
-    }
-
-    #[tokio::test]
-    async fn forgejo_10_jeton_csrf_et_pas_de_tentative() {
-        let server = MockServer::start().await;
-        mount_version(&server, "10.0.3+gitea-1.22.0").await;
-        mount_legacy_page(&server).await;
-        let jobs = ["build", "test"];
-        let steps = json!([
-            {"summary": "Set up job", "status": "success"},
-            {"summary": "Tests", "status": "failure"}
-        ]);
-        let log = json!([{"step": 1, "cursor": 1, "lines": [{"index": 1, "message": "boum"}]}]);
-        // Les deux demandes partent du même chemin, sans `attempt`, avec les deux moitiés du CSRF.
-        let csrf_post = |contains: &'static str, body: Value| {
-            Mock::given(method("POST"))
-                .and(path(format!("{RUN}/1")))
-                .and(header("Cookie", "lang=fr; session=abc; _csrf=ck123"))
-                .and(header("X-Csrf-Token", "tok456"))
-                .and(body_string_contains(contains))
-                .respond_with(ResponseTemplate::new(200).set_body_json(body))
-        };
-        Mock::given(method("POST"))
-            .and(path(format!("{RUN}/0")))
-            .and(header("X-Csrf-Token", "tok456"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(view(
-                &jobs,
-                &[],
-                json!([]),
-                json!([]),
-            )))
-            .mount(&server)
-            .await;
-        csrf_post(
-            "\"logCursors\":[]",
-            view(&jobs, &[], steps.clone(), json!([])),
-        )
-        .mount(&server)
-        .await;
-        csrf_post("\"step\":1", view(&jobs, &[], steps, log))
-            .mount(&server)
-            .await;
-
-        let log = forgejo(&server)
-            .job_log(&repo(), &pipeline("test"))
-            .await
-            .unwrap();
-        assert_eq!(log.notice, None, "version vérifiée : aucune réserve");
-        assert_eq!(log.steps[1].lines, ["boum"]);
-        assert!(
-            server
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .all(|r| !r.url.path().contains("attempt")),
-            "pas de segment attempt en 10 à 12"
-        );
-    }
-
-    #[tokio::test]
-    async fn forgejo_10_session_perdue_a_la_lecture_de_la_page() {
-        let server = MockServer::start().await;
-        mount_version(&server, "11.0.16+gitea-1.22.0").await;
-        Mock::given(method("GET"))
-            .and(path("/smithy/demo/actions/runs/7"))
-            .respond_with(ResponseTemplate::new(404))
-            .mount(&server)
-            .await;
-        let r = forgejo(&server).job_log(&repo(), &pipeline("test")).await;
-        assert!(matches!(r, Err(Error::SessionExpired)), "{r:?}");
-    }
-
-    #[tokio::test]
-    async fn forgejo_10_page_sans_jeton() {
-        let server = MockServer::start().await;
-        mount_version(&server, "12.0.4+gitea-1.22.0").await;
-        Mock::given(method("GET"))
-            .and(path("/smithy/demo/actions/runs/7"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("<html>rien</html>"))
-            .mount(&server)
-            .await;
-        let r = forgejo(&server).job_log(&repo(), &pipeline("test")).await;
-        assert!(
-            matches!(r, Err(Error::Decode(ref m)) if m.contains("CSRF")),
-            "{r:?}"
-        );
-    }
-
-    #[tokio::test]
     async fn version_non_supportee_sans_requete_web() {
         for v in ["9.0.3+gitea-1.22.0", "7.0.12+gitea-1.21.11", "1.22.0"] {
             let server = MockServer::start().await;
@@ -674,20 +853,12 @@ mod tests {
     #[tokio::test]
     async fn version_non_verifiee_prevenue_dans_le_log() {
         let server = MockServer::start().await;
-        mount_version(&server, "14.0.0+gitea-1.22.0").await;
-        let jobs = ["build"];
-        mock(
-            &server,
-            &format!("{RUN}/0"),
-            "",
-            view(&jobs, &[1], json!([]), json!([])),
-        )
-        .await;
+        mount_version(&server, "16.0.0+gitea-1.22.0").await;
         mock(
             &server,
             &format!("{RUN}/0/attempt/1"),
             "",
-            view(&jobs, &[1], json!([]), json!([])),
+            view(&["build"], &[1], json!([]), json!([])),
         )
         .await;
         let log = forgejo(&server)
@@ -695,7 +866,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            log.notice.as_deref().unwrap().contains("non vérifiée"),
+            log.notice.as_deref().unwrap().contains("plus récente"),
             "{:?}",
             log.notice
         );
@@ -705,19 +876,11 @@ mod tests {
     async fn version_illisible_ou_muette_donne_un_support_partiel() {
         // /version absent (404) : on essaie quand même, avec une réserve.
         let server = MockServer::start().await;
-        let jobs = ["build"];
-        mock(
-            &server,
-            &format!("{RUN}/0"),
-            "",
-            view(&jobs, &[1], json!([]), json!([])),
-        )
-        .await;
         mock(
             &server,
             &format!("{RUN}/0/attempt/1"),
             "",
-            view(&jobs, &[1], json!([]), json!([])),
+            view(&["build"], &[1], json!([]), json!([])),
         )
         .await;
         let log = forgejo(&server)
@@ -725,6 +888,41 @@ mod tests {
             .await
             .unwrap();
         assert!(log.notice.is_some());
+    }
+
+    #[test]
+    fn chemin_d_une_redirection() {
+        assert_eq!(local_path("/a/b?x=1").as_deref(), Some("/a/b?x=1"));
+        assert_eq!(local_path("http://h:3000/a/b").as_deref(), Some("/a/b"));
+        assert_eq!(
+            local_path("https://h/a/b?x=1#f").as_deref(),
+            Some("/a/b?x=1")
+        );
+        assert_eq!(local_path("pas une url"), None);
+    }
+
+    #[test]
+    fn cookie_csrf_ignore_si_vide_ou_supprime() {
+        let headers = |vals: &[&str]| {
+            let mut h = header::HeaderMap::new();
+            for v in vals {
+                h.append(
+                    header::SET_COOKIE,
+                    header::HeaderValue::from_str(v).unwrap(),
+                );
+            }
+            h
+        };
+        assert_eq!(
+            csrf_cookie(&headers(&["_csrf=abc; Path=/"])).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(csrf_cookie(&headers(&["_csrf=; Path=/; Max-Age=0"])), None);
+        assert_eq!(
+            csrf_cookie(&headers(&["_csrf=x; Max-Age=0", "lang=fr"])),
+            None
+        );
+        assert_eq!(csrf_cookie(&headers(&["lang=fr"])), None);
     }
 
     #[test]

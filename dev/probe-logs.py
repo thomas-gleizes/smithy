@@ -95,24 +95,36 @@ def main():
     number = rich[0]["run_number"]
     out["run_number_in_url"] = rich[0]["url"].rstrip("/").endswith(f"/runs/{number}")
 
-    # --- jeton CSRF des pages (cookie `_csrf` + valeur dans la page)
-    s, page, h = call(f"/{repo}/actions/runs/{number}", cookies=session)
-    out["page_status"] = s
+    # --- jeton CSRF des pages (cookie `_csrf` + valeur dans la page). Depuis la 13, la page du
+    # run redirige (307) vers `.../jobs/0/attempt/1` : on suit la redirection, comme un navigateur.
+    path = f"/{repo}/actions/runs/{number}"
+    page, csrf_cookie, hops = "", None, []
+    for _ in range(4):
+        cks = dict(session)
+        if csrf_cookie:
+            cks["_csrf"] = csrf_cookie
+        s, page, h = call(path, cookies=cks)
+        hops.append(s)
+        for c in h.get_all("Set-Cookie") or []:
+            if c.startswith("_csrf=") and c.split(";")[0] != "_csrf=":
+                csrf_cookie = c.split(";")[0].split("=", 1)[1]
+        loc = h.get("Location")
+        if s in (301, 302, 303, 307, 308) and loc:
+            path = urllib.parse.urlparse(loc).path
+            continue
+        break
+    out["page_status"] = hops
     m = re.search(r"csrfToken: *'([^']*)'", page)
     page_csrf = m.group(1) if m else None
     out["page_has_csrf_token"] = bool(page_csrf)
-    csrf_cookie = None
-    for c in h.get_all("Set-Cookie") or []:
-        if c.startswith("_csrf="):
-            csrf_cookie = c.split(";")[0].split("=", 1)[1]
     out["page_sets_csrf_cookie"] = bool(csrf_cookie)
 
     cursors = {"logCursors": []}
 
     def post(path, ck, csrf_header, body=cursors):
-        c = dict(session) if ck is not None else {}
-        if ck:
-            c["_csrf"] = csrf_cookie or ""
+        c = dict(session)  # la session est toujours envoyée : on ne fait varier que la protection CSRF
+        if ck and csrf_cookie:
+            c["_csrf"] = csrf_cookie
         hh = {"X-Csrf-Token": page_csrf} if csrf_header and page_csrf else {}
         s, t, _ = call(path, json_body=body, headers=hh, cookies=c)
         try:
@@ -125,22 +137,32 @@ def main():
     base_path = f"/{repo}/actions/runs/{number}/jobs"
     variants = {}
     # index du job « test » : lu sur le run (liste des jobs), repli sur 1
-    first = post(f"{base_path}/0", True, True)
+    first = post(f"{base_path}/0/attempt/1", True, True)
+    if not first.get("json"):
+        first = post(f"{base_path}/0", True, True)
     idx = first.get("jobs", ["build", "test"]).index("test") if first.get("json") else 1
     out["job_index_by_name"] = idx
-    variants["session seule"] = post(f"{base_path}/{idx}", None, False)
-    variants["session + cookie _csrf"] = post(f"{base_path}/{idx}", True, False)
-    variants["session + cookie _csrf + en-tête"] = post(f"{base_path}/{idx}", True, True)
-    variants["avec /attempt/1 (+ _csrf)"] = post(f"{base_path}/{idx}/attempt/1", True, True)
+    # Toutes les combinaisons : segment attempt × protection CSRF.
+    for attempt in (False, True):
+        for label, ck, hd in (("sans csrf", None, False), ("cookie _csrf", True, False), ("cookie _csrf + en-tête", True, True)):
+            path = f"{base_path}/{idx}" + ("/attempt/1" if attempt else "")
+            variants[("avec attempt, " if attempt else "sans attempt, ") + label] = post(path, ck, hd)
     out["variants"] = variants
 
-    # --- sortie des étapes (meilleure variante), étape hors bornes
-    best = f"{base_path}/{idx}/attempt/1" if variants["avec /attempt/1 (+ _csrf)"]["json"] else f"{base_path}/{idx}"
-    steps = max(variants["avec /attempt/1 (+ _csrf)"].get("steps", 0), variants["session + cookie _csrf + en-tête"].get("steps", 0))
+    # --- sortie des étapes (première variante qui répond en JSON), étape hors bornes
+    # (une variante qui répond en JSON mais sans étape, comme « sans attempt » en 15, ne compte pas)
+    best_label = next((k for k, x in variants.items() if x["json"] and x["steps"] > 0), None)
+    out["working_variant"] = best_label
+    best = f"{base_path}/{idx}" + ("/attempt/1" if best_label and best_label.startswith("avec") else "")
+    steps = variants[best_label]["steps"] if best_label else 0
+    use_csrf = bool(best_label) and "cookie" in best_label
+    use_header = bool(best_label) and "en-tête" in best_label
     cur = {"logCursors": [{"step": i, "cursor": None, "expanded": True} for i in range(steps)]}
     c = dict(session)
-    c["_csrf"] = csrf_cookie or ""
-    s, t, _ = call(best, json_body=cur, headers={"X-Csrf-Token": page_csrf or ""}, cookies=c)
+    if use_csrf and csrf_cookie:
+        c["_csrf"] = csrf_cookie
+    hdrs = {"X-Csrf-Token": page_csrf or ""} if use_header else {}
+    s, t, _ = call(best, json_body=cur, headers=hdrs, cookies=c)
     try:
         d = json.loads(t)
         out["lines_per_step"] = [len(x["lines"]) for x in d["logs"]["stepsLog"]]
@@ -148,10 +170,10 @@ def main():
         out["has_all_attempts"] = "allAttempts" in d["state"]["currentJob"]
     except Exception:
         out["lines_per_step"] = f"HTTP {s} non JSON"
-    s, t, _ = call(best, json_body={"logCursors": [{"step": 99, "cursor": None, "expanded": True}]}, headers={"X-Csrf-Token": page_csrf or ""}, cookies=c)
+    s, t, _ = call(best, json_body={"logCursors": [{"step": 99, "cursor": None, "expanded": True}]}, headers=hdrs, cookies=c)
     out["out_of_range_step_status"] = s
     s, _, _ = call(best, json_body=cursors, cookies={})
-    out["without_cookie_status"] = s
+    out["without_cookie_status"] = s  # aucun cookie du tout (ni session ni CSRF)
     print(json.dumps(out, ensure_ascii=False, indent=1))
 
 

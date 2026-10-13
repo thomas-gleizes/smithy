@@ -19,14 +19,16 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 
 The logs come from Forgejo's internal web routes, which change between versions. smithy detects the server version (`/api/v1/version`) and picks the matching adapter. Listing runs and repositories uses the stable REST API and does not depend on this.
 
-| Forgejo        | Logs                | Notes |
-|----------------|---------------------|-------|
-| 10, 11, 12     | Supported (verified) | CSRF token, no `attempt` segment |
-| 13, 14         | Partial (not verified) | smithy tries the 15 behaviour and says so in the log view |
-| 15             | Supported (verified) | |
-| 16 and later   | Partial (not verified) | |
-| 9 and earlier  | Not supported       | Not verified before 10: the log view shows why |
-| Gitea          | Not supported       | Forgejo only |
+| Forgejo        | Logs                   | Notes |
+|----------------|------------------------|-------|
+| 10, 11, 12     | Supported (verified)   | CSRF token, no `attempt` segment |
+| 13             | Supported (verified)   | CSRF token and `attempt` segment |
+| 14, 15         | Supported (verified)   | No CSRF, `attempt` segment |
+| 16 and later   | Partial (not verified) | smithy tries the 15 behaviour and says so in the log view |
+| 9 and earlier  | Not supported          | Not verified before 10: the log view shows why |
+| Gitea          | Not supported          | Forgejo only |
+
+Verified means every version from 10 to 15 was run locally (steps, a 6000-line step, ANSI colours, progress bars, wrong password, expired session).
 
 An unverified version is never silently trusted: the log view shows a ⚠ notice, and a failing route is reported as such. To verify a version yourself: `FORGEJO_VERSION=13 ./dev/dev.sh probe` starts an isolated instance and prints what changed.
 

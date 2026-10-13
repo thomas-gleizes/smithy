@@ -27,17 +27,20 @@ Workspace de 3 crates, dépendances à sens unique : `smithy` → `smithy-forgej
 
 Les routes web des logs varient selon la version, donc `smithy-forgejo/src/version.rs` associe la version (`/api/v1/version`, mise en cache dans `Forgejo::decision`) à un adaptateur `Flavor` et à un niveau de support (`Support::{Full, Partial, Unsupported}`) :
 
-| Version | Adaptateur | Logs | Différences |
-|---|---|---|---|
-| 10, 11, 12 | `Legacy` | complet (sondé) | jeton CSRF exigé sur la route (cookie `_csrf` posé par une page du dépôt + en-tête `X-Csrf-Token` = `csrfToken` de la page) ; pas de segment `attempt` ; cookies `i_like_gitea`, `gitea_incredible` (31 jours) ; `currentJob.detail` ; login : champ `_csrf` dans le formulaire, échec en 303 vers `/user/login` |
-| 13, 14 | `Modern` supposé | partiel (**non sondé**) | à vérifier : Docker bloqué lors du dernier essai |
-| 15 | `Modern` | complet (sondé) | voir ci-dessous |
-| ≥ 16 | `Modern` supposé | partiel | |
-| ≤ 9, Gitea | — | non supporté (`Error::UnsupportedVersion`, aucune requête web) | |
+| Version | Adaptateur | Logs | CSRF (cookie `_csrf` + en-tête) | Segment `attempt` | Login |
+|---|---|---|---|---|---|
+| 10, 11, 12 | `Legacy` | complet (sondé) | exigé | absent (404) | champ `_csrf`, échec en 303 vers `/user/login`, cookies `i_like_gitea` + `gitea_incredible` |
+| 13 | `Transitional` | complet (sondé) | exigé | obligatoire (500 sans) | idem |
+| 14 | `Modern` | complet (sondé) | plus exigé | obligatoire | pas de champ `_csrf`, échec en 303, mêmes cookies |
+| 15 | `Modern` | complet (sondé) | non | obligatoire (réponse vide sans) | pas de champ `_csrf`, échec en **200**, cookies `session` + `persistent` |
+| ≥ 16 | `Modern` supposé | partiel | | | |
+| ≤ 9, Gitea | — | non supporté (`Error::UnsupportedVersion`, aucune requête web) | | | |
 
-Une version partielle est utilisée et `JobLog.notice` la signale (⚠ dans le cadre de la vue des logs). Pour valider ou ajouter une version : `FORGEJO_VERSION=N dev/dev.sh probe` (instance isolée, voir plus bas), lire le JSON, puis ajuster `decide` et, si le comportement est nouveau, ajouter une variante de `Flavor`. Les 10, 11 et 12 se comportent à l'identique ; la transition vers la 15 est entre la 12 et la 15. Ne jamais déduire d'un test sur la 15 que la 10 se comporte pareil : c'est l'instance réelle de Thomas (v10, migration prévue).
+Deux interrupteurs indépendants expliquent tout : le CSRF (retiré en 14) et `attempt` (apparu en 13). Autres faits mesurés : `currentJob` s'appelle `detail` en 10–13 et `details` en 14–15 (`allAttempts` apparaît en 13) ; dès la 13 la page du run redirige (307) vers `…/jobs/0/attempt/1` (on la suit pour lire le jeton) ; **sans `attempt`, les 13 et 14 répondent 500** : le premier appel part donc de la tentative 1 pour toutes les versions qui utilisent les tentatives ; le cookie `gitea_incredible` (10–14) dure 31 jours ; une étape hors bornes donne 500 (HTML) partout. Le login ne dépend pas de la version : il lit le formulaire (avec ou sans `_csrf`) et considère comme un échec toute réponse qui n'est pas une redirection hors de `/user/login`.
 
-## Particularités de l'API Forgejo (famille `Modern`, validée sur Forgejo 15 ; swagger de l'instance)
+Une version partielle est utilisée et `JobLog.notice` la signale (⚠ dans le cadre de la vue des logs). Pour valider ou ajouter une version : `FORGEJO_VERSION=N dev/dev.sh probe` (instance isolée, voir plus bas), lire le JSON, puis ajuster `decide` et, si le comportement est nouveau, ajouter une variante de `Flavor`. Les 10, 11 et 12 se comportent à l'identique ; la 13 puis la 14 changent chacune une chose. Ne jamais déduire d'un test sur la 15 que la 10 se comporte pareil : c'est l'instance réelle de Thomas (v10, migration prévue).
+
+## Particularités de l'API Forgejo (décrites ici pour la 15 ; swagger de l'instance)
 
 - Les runs viennent de `GET /repos/{o}/{r}/actions/tasks` (clé `workflow_runs`, un run par entrée = un job ; `run_number` est le numéro du run dans l'URL, distinct de `id`). Il n'existe **aucun endpoint REST de jobs ni de logs** dans le swagger.
 - Les logs ne sont servis que par les **routes web internes** (non documentées, donc susceptibles de changer) : `POST /{o}/{r}/actions/runs/{run_number}/jobs/{index}/attempt/{n}` avec `{"logCursors":[{"step":0,"cursor":null,"expanded":true}]}`. Sans le segment `attempt/{n}`, `steps` reste vide sans erreur. `index` est la position du job dans `state.run.jobs`, pas son id. Les lignes contiennent des séquences ANSI et des `\r`. Une étape hors bornes dans `logCursors` fait répondre une page HTML d'erreur : lire d'abord la liste des étapes (appel sans curseur). Pas de pagination observée (6000 lignes en une réponse) ; un curseur `N` renvoie les lignes d'index > N. Procédure dans `smithy-forgejo/src/logs.rs` : liste des jobs → index → dernière tentative (`allAttempts`) → étapes → sortie.
