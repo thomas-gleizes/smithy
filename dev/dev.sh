@@ -11,6 +11,7 @@ URL="http://localhost:${PORT}"
 USER_NAME="smithy"
 USER_PASS="smithy-dev-password"
 REPO="demo"
+PRIVATE_REPO="secret"
 ENV_FILE=".env.local"
 
 fg() { docker compose exec -T -u git forgejo forgejo "$@"; }
@@ -46,13 +47,42 @@ up() {
   echo "prêt : ${URL}  (login ${USER_NAME} / ${USER_PASS})"
 }
 
-put_file() { # chemin contenu message ; ne fait rien si le fichier existe déjà
-  if api "${URL}/api/v1/repos/${USER_NAME}/${REPO}/contents/$1?ref=main" >/dev/null 2>&1; then
+put_file_in() { # dépôt chemin contenu message ; ne fait rien si le fichier existe déjà
+  if api "${URL}/api/v1/repos/${USER_NAME}/$1/contents/$2?ref=main" >/dev/null 2>&1; then
     return
   fi
-  local b64; b64=$(printf '%s' "$2" | base64 -w0)
-  api -X POST "${URL}/api/v1/repos/${USER_NAME}/${REPO}/contents/$1" \
-    -d "{\"content\":\"${b64}\",\"message\":\"$3\",\"branch\":\"main\"}" >/dev/null
+  local b64; b64=$(printf '%s' "$3" | base64 -w0)
+  api -X POST "${URL}/api/v1/repos/${USER_NAME}/$1/contents/$2" \
+    -d "{\"content\":\"${b64}\",\"message\":\"$4\",\"branch\":\"main\"}" >/dev/null
+}
+put_file() { put_file_in "$REPO" "$@"; }
+
+# Dépôt privé : vérifie que les logs passent bien avec le token (le dépôt public les sert à tout le monde).
+# Workflow riche : 2 jobs, plusieurs étapes, sortie longue, couleurs ANSI.
+seed_private() {
+  if ! api "${URL}/api/v1/repos/${USER_NAME}/${PRIVATE_REPO}" >/dev/null 2>&1; then
+    api -X POST "${URL}/api/v1/user/repos" \
+      -d "{\"name\":\"${PRIVATE_REPO}\",\"private\":true,\"auto_init\":true,\"default_branch\":\"main\"}" >/dev/null
+    echo "dépôt privé ${USER_NAME}/${PRIVATE_REPO} créé"
+  fi
+  put_file_in "$PRIVATE_REPO" .forgejo/workflows/rich.yml 'name: rich
+on: [push]
+jobs:
+  build:
+    runs-on: docker
+    steps:
+      - name: Compilation
+        run: |
+          printf "\033[32mOK\033[0m compilation\n"
+          for i in $(seq 1 250); do echo "ligne $i"; done
+      - name: Progression
+        run: printf "10%%\r50%%\r100%%\n"
+  test:
+    runs-on: docker
+    steps:
+      - name: Tests
+        run: printf "\033[31mrouge\033[0m puis \033[1;33mjaune\033[0m\n" && exit 1
+' "ci: workflow riche"
 }
 
 # Pousse des workflows de démo : chaque commit déclenche un run vert et un run rouge.
@@ -74,6 +104,7 @@ jobs:
     steps:
       - run: echo "boum" && exit 1
 ' "ci: workflow rouge"
+  seed_private
   echo "workflows poussés ; runs visibles sur ${URL}/${USER_NAME}/${REPO}/actions"
 }
 
