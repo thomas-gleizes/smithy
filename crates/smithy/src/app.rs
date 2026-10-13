@@ -174,7 +174,7 @@ impl App {
         }
     }
 
-    /// Tab / Maj+Tab : section suivante (`1`) ou précédente (`-1`).
+    /// Flèches droite / gauche : section suivante (`1`) ou précédente (`-1`).
     pub fn logs_select_section(&mut self, delta: isize) {
         let (w, h) = self.view_size();
         if let Some(v) = self.logs.as_mut() {
@@ -697,7 +697,7 @@ mod tests {
         assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
         a.logs_toggle_all();
         assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 2);
-        // Tab : on atteint l'autre section sans défiler (tout tient presque à l'écran)
+        // Flèches : on atteint l'autre section sans défiler (tout tient presque à l'écran)
         a.viewport.set(10); // tout est replié (dernier `a`) et tient à l'écran
         a.logs_select_section(1);
         a.logs_toggle_section();

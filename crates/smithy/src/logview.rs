@@ -107,7 +107,7 @@ pub struct LogView {
     /// Retour à la ligne actif.
     pub wrap: bool,
     sections: Vec<Section>,
-    /// Section choisie avec Tab, quand elle ne peut pas être la ligne du haut (tout tient à
+    /// Section choisie avec les flèches, quand elle ne peut pas être la ligne du haut (tout tient à
     /// l'écran : on ne défile pas, mais on doit pouvoir atteindre chaque section). `None` :
     /// la section courante est celle de la ligne du haut.
     selected: Option<usize>,
@@ -253,7 +253,7 @@ impl LogView {
         })
     }
 
-    /// Section courante, celle que Espace plie ou déplie : la choisie avec Tab, sinon l'étape
+    /// Section courante, celle que Espace plie ou déplie : la choisie avec les flèches, sinon l'étape
     /// de la ligne en haut de l'écran.
     pub fn current_step(&self, width: usize) -> Option<usize> {
         self.selected
@@ -309,7 +309,7 @@ impl LogView {
         }
     }
 
-    /// Tab / Maj+Tab : section suivante ou précédente (bornées aux extrémités).
+    /// Flèches droite / gauche : section suivante ou précédente (bornées aux extrémités).
     pub fn select_section(&mut self, delta: isize, width: usize, height: usize) {
         if self.sections.is_empty() {
             return;
@@ -828,7 +828,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_atteint_chaque_section_meme_quand_tout_tient_a_l_ecran() {
+    fn les_fleches_atteignent_chaque_section_meme_quand_tout_tient_a_l_ecran() {
         // Cas d'un job réussi : tout est replié et rien ne défile, il faut quand même pouvoir
         // ouvrir la 2e et la 3e étape.
         let mut v = sectioned(&[
@@ -887,7 +887,7 @@ mod tests {
     }
 
     #[test]
-    fn tab_ne_fait_defiler_que_si_le_titre_est_hors_de_l_ecran() {
+    fn changer_de_section_ne_fait_defiler_que_si_le_titre_est_hors_de_l_ecran() {
         let mut v = sectioned(&[
             ("a", Status::Failure, 2),
             ("b", Status::Failure, 20),

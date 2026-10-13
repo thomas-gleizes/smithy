@@ -135,10 +135,10 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
 /// Tronquée, elle ferait disparaître justement les touches les moins connues.
 fn logs_help(width: usize) -> &'static str {
     [
-        "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · Tab section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
-        "j/k défiler · Tab section · Espace plier · a tout · w repli · Esc retour",
-        "Tab · Espace plier · w repli · Esc retour",
-        "Tab · Espace · w · Esc",
+        "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
+        "j/k défiler · ←/→ section · Espace plier · a tout · w repli · Esc retour",
+        "←/→ · Espace plier · w repli · Esc retour",
+        "←/→ · Espace · w · Esc",
         "Esc",
     ]
     .into_iter()

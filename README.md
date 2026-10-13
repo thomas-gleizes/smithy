@@ -103,7 +103,7 @@ In the log view:
 |-----------------------|---------------------------------|
 | `j` / `k`, `↓` / `↑`  | Scroll one line                 |
 | `PgDn` / `f`, `PgUp` / `b` | Scroll one page          |
-| `Tab` / `Shift+Tab`   | Select the next / previous step |
+| `→` / `←`             | Select the next / previous step |
 | `Space`               | Fold / unfold the selected step |
 | `a`                   | Unfold all steps (or fold all if all are open) |
 | `g` / `Home`, `G` / `End` | Top / bottom                |
@@ -112,7 +112,7 @@ In the log view:
 | `Esc`, `q`, `Backspace` | Back to the runs              |
 | `Ctrl+C`              | Quit                            |
 
-The selected step is the one you moved to with `Tab`, or otherwise the one at the top of the screen; its title is shown in reverse video. Folding state survives refreshes, and a step that was open while running stays open when it finishes.
+The selected step is the one you moved to with `→` / `←`, or otherwise the one at the top of the screen; its title is shown in reverse video. Folding state survives refreshes, and a step that was open while running stays open when it finishes.
 
 Long lines are clipped by default; `w` wraps them at the exact terminal width (characters are cut, not words, so paths and JSON stay intact). Scrolling counts screen rows when wrapped, so a single very long line can be read to its end. Output is capped to the last 50,000 lines per step.
 
