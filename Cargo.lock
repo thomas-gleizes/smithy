@@ -1315,6 +1315,7 @@ dependencies = [
  "directories",
  "ratatui",
  "serde",
+ "serde_json",
  "smithy-core",
  "smithy-forgejo",
  "tokio",

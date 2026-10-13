@@ -1,5 +1,8 @@
 mod app;
 mod config;
+// Branché à l'étape suivante (login par session) ; testé en attendant.
+#[allow(dead_code)]
+mod session;
 mod ui;
 
 use std::{
@@ -7,7 +10,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use smithy_core::Provider;
@@ -22,7 +25,16 @@ const TICK: Duration = Duration::from_millis(100);
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = config::load()?;
-    let provider = Arc::new(Forgejo::new(cfg.url, cfg.token));
+    let server = cfg.server(std::env::var("SMITHY_SERVER").ok().as_deref())?;
+    let token = server.token.clone().with_context(|| {
+        format!(
+            "serveur « {} » : `token` manquant (le login par session arrive bientôt)",
+            server.name
+        )
+    })?;
+    let provider = Arc::new(match server.kind {
+        config::ServerKind::Forgejo => Forgejo::new(server.url.clone(), token),
+    });
 
     let mut terminal = ratatui::init();
     let result = run(&mut terminal, provider).await;
