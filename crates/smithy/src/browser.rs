@@ -186,6 +186,10 @@ impl Browser {
                     .take()
                     .and_then(|name| entries.iter().position(|e| e.name == name))
                     .unwrap_or(0);
+                // Le décalage mémorisé appartient à l'ancien dossier : le garder laisserait le
+                // début d'un dossier court caché au-dessus de la sélection (ratatui ne fait que
+                // descendre jusqu'à la sélection, il ne remonte pas pour remplir l'écran).
+                self.list_offset.set(0);
                 self.dir = DirState::Ready(entries);
             }
             Err(e) => {
@@ -316,6 +320,7 @@ impl Browser {
             .as_ref()
             .and_then(|b| b.iter().position(|x| x.name == self.reference))
             .unwrap_or(0);
+        self.picker_offset.set(0);
         self.mode = Mode::Branches { selected: current };
         if self.branches.is_none() {
             self.branches_error = None;
@@ -576,6 +581,24 @@ mod tests {
             "src",
             "on retombe sur le dossier quitté"
         );
+    }
+
+    #[test]
+    fn le_decalage_de_la_liste_est_remis_a_zero_a_chaque_dossier() {
+        let mut b = browsing();
+        b.list_offset.set(100); // laissé par le rendu d'un long dossier
+        b.picker_offset.set(40);
+        b.move_selection(1);
+        b.enter(); // « src »
+        b.on_dir(
+            &repo(),
+            "main",
+            "src",
+            Ok(vec![entry("a.rs", "src/a.rs", EntryKind::File, 1)]),
+        );
+        assert_eq!(b.list_offset.get(), 0);
+        b.open_branches();
+        assert_eq!(b.picker_offset.get(), 0);
     }
 
     #[test]

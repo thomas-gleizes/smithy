@@ -9,6 +9,9 @@ use smithy_core::{Branch, Entry, EntryKind, Error, FileContent, Repo, Result};
 use crate::{Forgejo, PAGE_SIZE};
 
 const MAX_BRANCH_PAGES: usize = 20;
+/// Lecture d'un fichier : plus généreux que le délai des autres requêtes (10 s, corps compris),
+/// pour qu'un Mio sur un VPN lent n'échoue pas en « erreur réseau ».
+const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Taille examinée pour décider qu'un fichier est binaire (octet nul), comme Git.
 const BINARY_SNIFF: usize = 8192;
 
@@ -138,6 +141,7 @@ impl Forgejo {
             .get(self.api(&api))
             .header("Authorization", format!("token {}", self.token))
             .query(&[("ref", reference)])
+            .timeout(FILE_TIMEOUT)
             .send()
             .await
             .map_err(net)?;

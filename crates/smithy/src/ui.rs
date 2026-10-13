@@ -152,7 +152,23 @@ fn pick_help<'a>(width: usize, variants: &[&'a str]) -> &'a str {
         .iter()
         .copied()
         .find(|h| h.chars().count() <= width)
-        .unwrap_or("Esc")
+        // Rien ne tient : la plus courte, qui indique au moins comment sortir.
+        .or(variants.last().copied())
+        .unwrap_or("")
+}
+
+/// Aide de la liste des dépôts et des runs.
+fn lists_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ naviguer · ↵ logs · e explorer le code · tab changer de panneau · r rafraîchir · q quitter",
+            "j/k naviguer · ↵ logs · e code · tab panneau · r rafraîchir · q quitter",
+            "↵ logs · e code · tab · r · q quitter",
+            "↵ · e · tab · q",
+            "q",
+        ],
+    )
 }
 
 fn logs_help(width: usize) -> &'static str {
@@ -440,7 +456,7 @@ fn draw_lists(f: &mut Frame, app: &App) {
         Line::from("")
     };
     let help = Line::from(Span::styled(
-        "j/k ↑/↓ naviguer · ↵ logs · e explorer le code · tab changer de panneau · r rafraîchir · q quitter",
+        lists_help(f.area().width as usize),
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(vec![help, second]), rows[1]);
@@ -911,6 +927,65 @@ mod tests {
         app.browser.as_mut().unwrap().move_selection(-1);
         render(&app, 80, 12);
         assert_eq!(browser(&app).list_offset.get(), before);
+    }
+
+    #[test]
+    fn remonter_d_un_long_dossier_vers_un_court_montre_le_debut() {
+        // Régression : le décalage de l'ancien dossier (130 entrées, sélection en bas) restait
+        // appliqué à la racine (14 entrées), dont le début disparaissait au-dessus de l'écran.
+        let mut app = explorer_app();
+        let root: Vec<_> = ["bin", "docs", "dossier", "many", "src", "zzz"]
+            .iter()
+            .map(|n| e(n, EntryKind::Dir, 0))
+            .collect();
+        feed_dir(&mut app, "", root.clone());
+        {
+            let b = app.browser.as_mut().unwrap();
+            b.move_selection(3); // « many »
+            b.enter();
+            let many: Vec<_> = (0..130)
+                .map(|i| Entry {
+                    name: format!("f{i:03}.txt"),
+                    path: format!("many/f{i:03}.txt"),
+                    kind: EntryKind::File,
+                    size: 1,
+                })
+                .collect();
+            b.on_dir(&tree_repo(), "main", "many", Ok(many));
+            b.select_last();
+        }
+        for _ in 0..3 {
+            render(&app, 80, 14); // le rendu mémorise un décalage élevé
+        }
+        assert!(browser(&app).list_offset.get() > 100);
+        {
+            let b = app.browser.as_mut().unwrap();
+            b.up();
+            b.on_dir(&tree_repo(), "main", "", Ok(root));
+        }
+        let t = render(&app, 80, 14);
+        assert!(
+            t.contains("▸ bin/") && t.contains("▸ docs/"),
+            "le début de la racine doit être visible\n{t}"
+        );
+        assert!(t.contains("4/6"), "« many » est resélectionné");
+        assert_eq!(browser(&app).list_offset.get(), 0);
+    }
+
+    #[test]
+    fn aide_de_la_liste_des_depots_adaptee_a_la_largeur() {
+        // 80 colonnes : l'ancienne aide tenait, la nouvelle (avec « e ») doit tenir aussi.
+        let h = lists_help(80);
+        assert!(h.contains("e code") && h.contains("q quitter"), "{h}");
+        assert!(lists_help(120).contains("e explorer le code"));
+        for w in [100, 80, 60, 40, 20, 8, 3, 0] {
+            let h = lists_help(w);
+            assert!(h.chars().count() <= w.max(1), "{h:?} dépasse {w}");
+            assert!(h.contains('q'), "toujours la sortie : {h:?}");
+        }
+        // Rendu réel à 80 colonnes
+        let app = App::new();
+        assert!(render(&app, 80, 10).contains("q quitter"));
     }
 
     #[test]
