@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Projet
 
-`smithy` : TUI Rust (ratatui) pour consulter la CI de forges git. Forgejo seul est implémenté ; GitHub, GitLab, Bitbucket et Azure DevOps sont prévus, d'où le trait `Provider`. Usage visé : machine sans bureau derrière un VPN. Outil personnel, publié sur GitHub (licence `MIT OR Apache-2.0`). Le dossier s'appelle encore `forgejo-tui`. L'UI et les messages sont en français.
+`smithy` : TUI Rust (ratatui) pour consulter la CI de forges git. Forgejo seul est implémenté ; GitHub, GitLab, Bitbucket et Azure DevOps sont prévus, d'où le trait `Provider`. Usage visé : machine sans bureau derrière un VPN. Outil personnel, publié sur GitHub (licence `MIT OR Apache-2.0`). L'UI et les messages sont en français.
 
 ## Commandes
 
@@ -41,4 +41,4 @@ Workspace de 3 crates, dépendances à sens unique : `smithy` → `smithy-forgej
 
 - Lints workspace : `unsafe_code = "forbid"`, clippy en `warn` (`-D warnings` via `make lint`).
 - `rustls` uniquement (pas d'OpenSSL) pour que le binaire tourne sur une machine sans bureau.
-- Pas de dépôt git initialisé pour l'instant ; `repository` dans `Cargo.toml` contient encore le placeholder `OWNER`.
+- Le `README.md` (anglais) est à tenir à jour à chaque évolution visible : fonctionnalités, raccourcis, config, backends supportés, roadmap.
