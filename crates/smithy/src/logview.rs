@@ -1,13 +1,14 @@
-//! Vue plein écran de la sortie d'un job : lignes, défilement et retour à la ligne.
+//! Vue plein écran de la sortie d'un job : sections par étape, défilement et retour à la ligne.
 //!
 //! Le défilement se compte en **lignes d'écran** et non en lignes de log : une seule ligne
 //! (un blob JSON de 5000 caractères) peut dépasser la hauteur du terminal une fois repliée,
-//! et il faut pouvoir la lire jusqu'au bout. Sans retour à la ligne, les deux coïncident.
-//! Aucune dépendance au terminal : la largeur et la hauteur utiles sont passées par l'appelant.
+//! et il faut pouvoir la lire jusqu'au bout. Les lignes d'une étape repliée ne comptent pour
+//! aucune ligne d'écran. Aucune dépendance au terminal : la largeur et la hauteur utiles sont
+//! passées par l'appelant.
 
 use std::cell::RefCell;
 
-use smithy_core::{Pipeline, Repo, Status};
+use smithy_core::{JobLog, Pipeline, Repo, Status};
 
 use crate::wrap;
 
@@ -22,6 +23,8 @@ pub enum LineKind {
 pub struct LogLine {
     pub kind: LineKind,
     pub text: String,
+    /// Étape à laquelle la ligne appartient (son titre compris), si elle en a une.
+    pub step: Option<usize>,
 }
 
 #[derive(Debug)]
@@ -38,6 +41,48 @@ pub struct Row<'a> {
     pub text: &'a str,
     /// Suite d'une ligne repliée (et non début d'une ligne de log).
     pub continuation: bool,
+    /// Titre de la section courante (celle que `Espace` plie ou déplie).
+    pub current: bool,
+}
+
+/// Où se placer à l'ouverture.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Start {
+    /// Sur cette ligne de log (le titre de la première étape en échec).
+    Line(usize),
+    End,
+}
+
+/// Une étape, pliable.
+#[derive(Debug)]
+struct Section {
+    name: String,
+    /// Indice de son titre dans les lignes.
+    header: usize,
+    /// Nombre de lignes de sortie (titre exclu).
+    len: usize,
+    collapsed: bool,
+}
+
+impl Section {
+    fn header_text(&self) -> String {
+        if self.collapsed {
+            let n = self.len;
+            format!(
+                "▸ {} ({n} ligne{})",
+                self.name,
+                if n > 1 { "s" } else { "" }
+            )
+        } else {
+            format!("▾ {}", self.name)
+        }
+    }
+}
+
+/// Comme sur le web : les étapes réussies ou ignorées sont repliées, celles qui échouent ou
+/// tournent encore restent ouvertes.
+fn default_collapsed(status: Status) -> bool {
+    matches!(status, Status::Success | Status::Skipped)
 }
 
 /// Début de chaque ligne de log, en lignes d'écran (`starts[i]`), plus le total à la fin.
@@ -61,6 +106,11 @@ pub struct LogView {
     pub notice: Option<String>,
     /// Retour à la ligne actif.
     pub wrap: bool,
+    sections: Vec<Section>,
+    /// Section choisie avec Tab, quand elle ne peut pas être la ligne du haut (tout tient à
+    /// l'écran : on ne défile pas, mais on doit pouvoir atteindre chaque section). `None` :
+    /// la section courante est celle de la ligne du haut.
+    selected: Option<usize>,
     index: RefCell<Option<RowIndex>>,
 }
 
@@ -73,13 +123,67 @@ impl LogView {
             scroll: 0,
             notice: None,
             wrap: false,
+            sections: Vec::new(),
+            selected: None,
             index: RefCell::new(None),
         }
     }
 
-    /// Remplace le contenu ; le défilement est à recaler par l'appelant.
-    pub fn set_lines(&mut self, lines: Vec<LogLine>) {
+    /// Remplace le contenu. L'état plié/déplié des étapes déjà vues est conservé ; une étape
+    /// vue pour la première fois prend le réglage par défaut selon son statut (donc une étape
+    /// ouverte parce qu'elle tournait le reste après sa fin). Le défilement est à recaler.
+    pub fn set_log(&mut self, log: &JobLog) {
+        let previous: Vec<bool> = self.sections.iter().map(|s| s.collapsed).collect();
+        let mut lines = Vec::new();
+        let mut sections = Vec::new();
+        if log.steps.is_empty() {
+            lines.push(LogLine {
+                kind: LineKind::Text,
+                text: "(aucune étape : le job n'a pas démarré)".to_owned(),
+                step: None,
+            });
+        }
+        for (i, step) in log.steps.iter().enumerate() {
+            sections.push(Section {
+                name: step.name.clone(),
+                header: lines.len(),
+                len: step.lines.len(),
+                collapsed: previous
+                    .get(i)
+                    .copied()
+                    .unwrap_or_else(|| default_collapsed(step.status)),
+            });
+            lines.push(LogLine {
+                kind: LineKind::Step(step.status),
+                text: String::new(), // rempli par `refresh_headers`
+                step: Some(i),
+            });
+            lines.extend(step.lines.iter().map(|l| LogLine {
+                kind: LineKind::Text,
+                text: l.clone(),
+                step: Some(i),
+            }));
+        }
+        self.sections = sections;
         self.state = LogState::Ready(lines);
+        self.refresh_headers();
+    }
+
+    /// Variante pour les tests : des lignes sans étape, donc jamais repliées.
+    #[cfg(test)]
+    pub fn set_lines(&mut self, lines: Vec<LogLine>) {
+        self.sections.clear();
+        self.state = LogState::Ready(lines);
+        *self.index.borrow_mut() = None;
+    }
+
+    /// Réécrit les titres (flèche, nombre de lignes cachées) et invalide l'index d'écran.
+    fn refresh_headers(&mut self) {
+        if let LogState::Ready(lines) = &mut self.state {
+            for s in &self.sections {
+                lines[s.header].text = s.header_text();
+            }
+        }
         *self.index.borrow_mut() = None;
     }
 
@@ -88,6 +192,15 @@ impl LogView {
             LogState::Ready(lines) => lines,
             _ => &[],
         }
+    }
+
+    /// Les lignes de sortie d'une étape repliée n'occupent aucune ligne d'écran.
+    fn hidden(&self, line: &LogLine) -> bool {
+        line.kind == LineKind::Text
+            && line
+                .step
+                .and_then(|i| self.sections.get(i))
+                .is_some_and(|s| s.collapsed)
     }
 
     /// Exécute `f` sur l'index des lignes d'écran pour cette largeur, en le (re)construisant au besoin.
@@ -99,7 +212,9 @@ impl LogView {
             let mut total = 0;
             for l in self.lines() {
                 starts.push(total);
-                total += if self.wrap {
+                total += if self.hidden(l) {
+                    0
+                } else if self.wrap {
                     wrap::rows(&l.text, key)
                 } else {
                     1
@@ -125,7 +240,8 @@ impl LogView {
         self.with_index(width, |i| i.starts.get(line).copied().unwrap_or(0))
     }
 
-    /// Ligne de log qui contient la ligne d'écran `row`.
+    /// Ligne de log qui contient la ligne d'écran `row`. Les lignes cachées (0 ligne d'écran)
+    /// partagent leur début avec la suivante : c'est toujours la dernière à ce début qui est visible.
     pub fn line_of_row(&self, width: usize, row: usize) -> usize {
         self.with_index(width, |i| {
             // `starts` finit par le total (pas une ligne) : on borne à la dernière vraie ligne.
@@ -137,6 +253,24 @@ impl LogView {
         })
     }
 
+    /// Section courante, celle que Espace plie ou déplie : la choisie avec Tab, sinon l'étape
+    /// de la ligne en haut de l'écran.
+    pub fn current_step(&self, width: usize) -> Option<usize> {
+        self.selected
+            .filter(|&i| i < self.sections.len())
+            .or_else(|| {
+                self.lines()
+                    .get(self.line_of_row(width, self.scroll))
+                    .and_then(|l| l.step)
+            })
+    }
+
+    /// Défilement demandé par l'utilisateur : la section courante redevient celle du haut.
+    pub fn scroll_to_row(&mut self, row: usize, max: usize) {
+        self.scroll = row.min(max);
+        self.selected = None;
+    }
+
     /// Bascule le retour à la ligne en gardant la même ligne de log en haut de l'écran.
     pub fn toggle_wrap(&mut self, width: usize, height: usize) {
         let top_line = self.line_of_row(width, self.scroll);
@@ -144,6 +278,70 @@ impl LogView {
         self.scroll = self
             .row_of_line(width, top_line)
             .min(self.max_scroll(width, height));
+    }
+
+    /// Plie ou déplie la section courante ; son titre reste visible.
+    pub fn toggle_section(&mut self, width: usize, height: usize) {
+        let Some(step) = self.current_step(width) else {
+            return;
+        };
+        self.sections[step].collapsed ^= true;
+        self.selected = Some(step);
+        self.refresh_headers();
+        self.reveal_section(width, height, step);
+    }
+
+    /// Tout déplier, ou tout plier si tout est déjà déplié. La section courante reste visible.
+    pub fn toggle_all(&mut self, width: usize, height: usize) {
+        if self.sections.is_empty() {
+            return;
+        }
+        let current = self.current_step(width);
+        let collapse = self.sections.iter().all(|s| !s.collapsed);
+        for s in &mut self.sections {
+            s.collapsed = collapse;
+        }
+        self.selected = current;
+        self.refresh_headers();
+        match current {
+            Some(step) => self.reveal_section(width, height, step),
+            None => self.scroll = 0,
+        }
+    }
+
+    /// Tab / Maj+Tab : section suivante ou précédente (bornées aux extrémités).
+    pub fn select_section(&mut self, delta: isize, width: usize, height: usize) {
+        if self.sections.is_empty() {
+            return;
+        }
+        let current = self.current_step(width).unwrap_or(0);
+        let next = current
+            .saturating_add_signed(delta)
+            .min(self.sections.len() - 1);
+        self.selected = Some(next);
+        self.reveal_section(width, height, next);
+    }
+
+    /// Fait défiler le minimum pour que le titre de la section soit visible : s'il l'est déjà,
+    /// rien ne bouge ; sinon il vient en haut.
+    fn reveal_section(&mut self, width: usize, height: usize, step: usize) {
+        let row = self.row_of_line(width, self.sections[step].header);
+        let max = self.max_scroll(width, height);
+        if row < self.scroll || row >= self.scroll + height.max(1) {
+            self.scroll = row.min(max);
+        } else {
+            self.scroll = self.scroll.min(max);
+        }
+    }
+
+    /// Où se placer à l'ouverture : sur la première étape en échec (c'est là qu'on cherche),
+    /// sinon en bas si le job tourne encore, sinon en haut (`None`).
+    pub fn initial_start(&self, live: bool) -> Option<Start> {
+        self.lines()
+            .iter()
+            .position(|l| matches!(l.kind, LineKind::Step(Status::Failure)))
+            .map(Start::Line)
+            .or(live.then_some(Start::End))
     }
 
     /// Les lignes d'écran visibles : de `scroll` sur `height` lignes.
@@ -155,32 +353,31 @@ impl LogView {
         let first_line = self.line_of_row(width, self.scroll);
         let first_row = self.row_of_line(width, first_line);
         let mut skip = self.scroll.saturating_sub(first_row);
+        let current = self.current_step(width);
         let mut out = Vec::with_capacity(height);
-        for line in lines.iter().skip(first_line) {
+        for line in lines.iter().skip(first_line).filter(|l| !self.hidden(l)) {
+            let is_current = matches!(line.kind, LineKind::Step(_)) && line.step == current;
+            let mut push = |text, continuation| {
+                out.push(Row {
+                    kind: line.kind,
+                    text,
+                    continuation,
+                    current: is_current,
+                });
+                out.len() == height
+            };
             if self.wrap {
                 for (n, chunk) in wrap::chunks(&line.text, width).into_iter().enumerate() {
                     if skip > 0 {
                         skip -= 1;
                         continue;
                     }
-                    out.push(Row {
-                        kind: line.kind,
-                        text: chunk,
-                        continuation: n > 0,
-                    });
-                    if out.len() == height {
+                    if push(chunk, n > 0) {
                         return out;
                     }
                 }
-            } else {
-                out.push(Row {
-                    kind: line.kind,
-                    text: &line.text,
-                    continuation: false,
-                });
-                if out.len() == height {
-                    return out;
-                }
+            } else if push(&line.text, false) {
+                return out;
             }
         }
         out
@@ -216,6 +413,7 @@ mod tests {
                 .map(|t| LogLine {
                     kind: LineKind::Text,
                     text: (*t).to_owned(),
+                    step: None,
                 })
                 .collect(),
         );
@@ -341,6 +539,7 @@ mod tests {
         v.set_lines(vec![LogLine {
             kind: LineKind::Text,
             text: "abcdefghijkl".into(),
+            step: None,
         }]);
         assert_eq!(v.total_rows(6), 2, "autre contenu : recalculé");
     }
@@ -366,5 +565,357 @@ mod tests {
         assert_eq!(v.total_rows(0), 4);
         assert_eq!(v.window(0, 0), []);
         assert_eq!(v.window(1, 1).len(), 1);
+    }
+
+    // --- sections (une par étape)
+
+    use smithy_core::StepLog;
+
+    fn joblog(steps: &[(&str, Status, usize)]) -> JobLog {
+        JobLog {
+            steps: steps
+                .iter()
+                .map(|(name, status, n)| StepLog {
+                    name: (*name).to_owned(),
+                    status: *status,
+                    lines: (1..=*n).map(|i| format!("{name} {i}")).collect(),
+                })
+                .collect(),
+            notice: None,
+        }
+    }
+
+    fn sectioned(steps: &[(&str, Status, usize)]) -> LogView {
+        let mut v = view(&[]);
+        v.set_log(&joblog(steps));
+        v
+    }
+
+    const W: usize = 80;
+
+    #[test]
+    fn par_defaut_les_etapes_reussies_sont_repliees() {
+        let v = sectioned(&[
+            ("Set up job", Status::Success, 9),
+            ("Tests", Status::Failure, 2),
+            ("Build", Status::Running, 3),
+            ("Lint", Status::Skipped, 1),
+            ("Cleanup", Status::Cancelled, 2),
+        ]);
+        let t = texts(&v.window(W, 50));
+        assert_eq!(
+            t,
+            [
+                "▸ Set up job (9 lignes)",
+                "▾ Tests",
+                "Tests 1",
+                "Tests 2",
+                "▾ Build",
+                "Build 1",
+                "Build 2",
+                "Build 3",
+                "▸ Lint (1 ligne)",
+                "▾ Cleanup",
+                "Cleanup 1",
+                "Cleanup 2",
+            ]
+        );
+    }
+
+    #[test]
+    fn les_lignes_repliees_ne_comptent_pour_aucune_ligne_d_ecran() {
+        let v = sectioned(&[("a", Status::Success, 100), ("b", Status::Failure, 2)]);
+        assert_eq!(
+            v.total_rows(W),
+            1 + 1 + 2,
+            "100 lignes cachées : 0 ligne d'écran"
+        );
+        // Avec repli à 3 colonnes, les lignes cachées ne comptent toujours pas
+        let mut w = sectioned(&[("a", Status::Success, 100), ("b", Status::Failure, 2)]);
+        w.wrap = true;
+        // « ▸ a (100 lignes) » (16 caractères) fait 6 lignes de 3 colonnes ; « ▾ b » et ses
+        // deux lignes, 1 chacune. Les 100 lignes cachées ne comptent pas, le titre si.
+        assert_eq!(w.total_rows(3), 6 + 1 + 1 + 1);
+    }
+
+    #[test]
+    fn la_section_courante_est_celle_de_la_ligne_du_haut() {
+        let mut v = sectioned(&[("a", Status::Failure, 3), ("b", Status::Failure, 3)]);
+        assert_eq!(v.current_step(W), Some(0));
+        v.scroll = 3; // dernière ligne de « a »
+        assert_eq!(v.current_step(W), Some(0));
+        v.scroll = 4; // titre de « b »
+        assert_eq!(v.current_step(W), Some(1));
+        v.scroll = 6;
+        assert_eq!(v.current_step(W), Some(1));
+    }
+
+    #[test]
+    fn seul_le_titre_de_la_section_courante_est_marque() {
+        let mut v = sectioned(&[("a", Status::Failure, 2), ("b", Status::Failure, 2)]);
+        v.scroll = 2; // « a 2 » en haut : la section courante est « a », son titre n'est pas visible
+        let current: Vec<_> = v
+            .window(W, 10)
+            .iter()
+            .map(|r| (r.text, r.current))
+            .collect();
+        assert_eq!(
+            current,
+            [
+                ("a 2", false),
+                ("▾ b", false),
+                ("b 1", false),
+                ("b 2", false)
+            ]
+        );
+        v.scroll = 0;
+        let marked: Vec<_> = v
+            .window(W, 10)
+            .iter()
+            .filter(|r| r.current)
+            .map(|r| r.text)
+            .collect();
+        assert_eq!(
+            marked,
+            ["▾ a"],
+            "le titre de « a », section courante, est marqué"
+        );
+    }
+
+    #[test]
+    fn espace_deplie_et_replie_la_section_courante() {
+        let mut v = sectioned(&[("a", Status::Success, 5), ("b", Status::Success, 5)]);
+        assert_eq!(
+            texts(&v.window(W, 10)),
+            ["▸ a (5 lignes)", "▸ b (5 lignes)"]
+        );
+        v.scroll = 1; // le titre de « b » est en haut : c'est la section courante
+        v.toggle_section(W, 3);
+        assert_eq!(v.scroll, 1, "son titre reste en haut");
+        assert_eq!(texts(&v.window(W, 3)), ["▾ b", "b 1", "b 2"]);
+        v.toggle_section(W, 3);
+        // Tout tient maintenant dans la fenêtre : le défilement est ramené dans les bornes.
+        assert_eq!(v.total_rows(W), 2);
+        assert_eq!(v.scroll, 0);
+        assert_eq!(texts(&v.window(W, 3)), ["▸ a (5 lignes)", "▸ b (5 lignes)"]);
+    }
+
+    #[test]
+    fn replier_depuis_l_interieur_ramene_au_titre() {
+        let mut v = sectioned(&[("a", Status::Failure, 20), ("b", Status::Failure, 1)]);
+        v.scroll = 12; // au milieu de « a »
+        v.toggle_section(W, 5);
+        assert_eq!(v.scroll, 0, "on retombe sur le titre de la section repliée");
+        assert_eq!(texts(&v.window(W, 5)), ["▸ a (20 lignes)", "▾ b", "b 1"]);
+    }
+
+    #[test]
+    fn tout_deplier_puis_tout_replier() {
+        let mut v = sectioned(&[
+            ("a", Status::Success, 2),
+            ("b", Status::Failure, 2),
+            ("c", Status::Success, 2),
+        ]);
+        v.scroll = 2; // « b 1 » en haut : la section courante est « b » (a: 1 ligne, b: 1 titre + 2)
+        v.toggle_all(W, 4); // il en reste de repliées : tout déplier
+        assert!(texts(&v.window(W, 20)).iter().all(|t| !t.starts_with('▸')));
+        assert_eq!(v.total_rows(W), 9);
+        assert!(
+            texts(&v.window(W, 4)).contains(&"▾ b"),
+            "la section courante reste visible"
+        );
+        assert_eq!(v.current_step(W), Some(1));
+        v.toggle_all(W, 4); // tout est déplié : tout replier
+        assert_eq!(
+            texts(&v.window(W, 20)),
+            ["▸ a (2 lignes)", "▸ b (2 lignes)", "▸ c (2 lignes)"]
+        );
+        assert_eq!(v.scroll, 0, "bornée par le nouveau maximum");
+    }
+
+    #[test]
+    fn l_etat_survit_au_rafraichissement_et_les_nouvelles_etapes_suivent_le_defaut() {
+        let mut v = sectioned(&[("a", Status::Success, 2), ("b", Status::Running, 2)]);
+        // L'utilisateur déplie « a » (réussie) : elle le reste après un rafraîchissement.
+        v.scroll = 0;
+        v.toggle_section(W, 20);
+        // « b » finit : elle était ouverte pendant qu'on la lisait, elle ne se referme pas sous nos yeux.
+        // Une nouvelle étape « c » réussie arrive : repliée par défaut.
+        v.set_log(&joblog(&[
+            ("a", Status::Success, 2),
+            ("b", Status::Success, 4),
+            ("c", Status::Success, 7),
+        ]));
+        let t = texts(&v.window(W, 30));
+        assert_eq!(
+            t,
+            [
+                "▾ a",
+                "a 1",
+                "a 2",
+                "▾ b",
+                "b 1",
+                "b 2",
+                "b 3",
+                "b 4",
+                "▸ c (7 lignes)"
+            ]
+        );
+    }
+
+    #[test]
+    fn un_rafraichissement_garde_les_titres_a_jour() {
+        let mut v = sectioned(&[("a", Status::Success, 2)]);
+        assert_eq!(texts(&v.window(W, 5)), ["▸ a (2 lignes)"]);
+        v.set_log(&joblog(&[("a", Status::Success, 9)]));
+        assert_eq!(
+            texts(&v.window(W, 5)),
+            ["▸ a (9 lignes)"],
+            "le nombre de lignes suit"
+        );
+    }
+
+    #[test]
+    fn job_sans_etape_et_vue_sans_section() {
+        let mut v = view(&[]);
+        v.set_log(&JobLog::default());
+        assert!(texts(&v.window(W, 5))[0].contains("pas démarré"));
+        // Rien à plier : aucune action ne doit paniquer ni bouger.
+        v.toggle_section(W, 5);
+        v.toggle_all(W, 5);
+        assert_eq!(v.scroll, 0);
+        let mut plain = view(&["a", "b"]);
+        plain.toggle_section(W, 5);
+        plain.toggle_all(W, 5);
+        assert_eq!(texts(&plain.window(W, 5)), ["a", "b"]);
+    }
+
+    #[test]
+    fn position_initiale_sur_la_premiere_etape_en_echec() {
+        let v = sectioned(&[
+            ("a", Status::Success, 9),
+            ("b", Status::Failure, 2),
+            ("c", Status::Failure, 1),
+        ]);
+        assert_eq!(v.initial_start(false), Some(Start::Line(10)));
+        assert_eq!(
+            v.row_of_line(W, 10),
+            1,
+            "le titre de « b » est la 2e ligne d'écran (« a » repliée)"
+        );
+        let ok = sectioned(&[("a", Status::Success, 1)]);
+        assert_eq!(ok.initial_start(false), None);
+        assert_eq!(ok.initial_start(true), Some(Start::End));
+    }
+
+    #[test]
+    fn sections_et_retour_a_la_ligne_ensemble() {
+        let mut v = sectioned(&[("a", Status::Failure, 1)]);
+        v.wrap = true;
+        v.set_log(&JobLog {
+            steps: vec![StepLog {
+                name: "a".into(),
+                status: Status::Failure,
+                lines: vec!["abcdefghi".into()],
+            }],
+            notice: None,
+        });
+        assert_eq!(texts(&v.window(3, 10)), ["▾ a", "abc", "def", "ghi"]);
+        v.scroll = 2; // « def » : toujours la section « a »
+        assert_eq!(v.current_step(3), Some(0));
+        v.toggle_section(3, 10);
+        assert_eq!(texts(&v.window(3, 10)), ["▸ a", " (1", " li", "gne", ")"]);
+    }
+
+    #[test]
+    fn tab_atteint_chaque_section_meme_quand_tout_tient_a_l_ecran() {
+        // Cas d'un job réussi : tout est replié et rien ne défile, il faut quand même pouvoir
+        // ouvrir la 2e et la 3e étape.
+        let mut v = sectioned(&[
+            ("a", Status::Success, 5),
+            ("b", Status::Success, 5),
+            ("c", Status::Success, 5),
+        ]);
+        assert_eq!(v.total_rows(W), 3);
+        assert_eq!(v.max_scroll(W, 20), 0, "rien à défiler");
+        assert_eq!(v.current_step(W), Some(0));
+        v.select_section(1, W, 20);
+        assert_eq!(v.current_step(W), Some(1));
+        let marked: Vec<_> = v
+            .window(W, 20)
+            .iter()
+            .filter(|r| r.current)
+            .map(|r| r.text)
+            .collect();
+        assert_eq!(
+            marked,
+            ["▸ b (5 lignes)"],
+            "le titre sélectionné est marqué"
+        );
+        v.toggle_section(W, 20); // ouvre « b », pas « a »
+        assert_eq!(
+            texts(&v.window(W, 20)),
+            [
+                "▸ a (5 lignes)",
+                "▾ b",
+                "b 1",
+                "b 2",
+                "b 3",
+                "b 4",
+                "b 5",
+                "▸ c (5 lignes)"
+            ]
+        );
+        assert_eq!(v.current_step(W), Some(1), "la sélection reste sur « b »");
+        v.select_section(1, W, 20);
+        assert_eq!(v.current_step(W), Some(2));
+        v.select_section(1, W, 20);
+        assert_eq!(v.current_step(W), Some(2), "borné à la dernière");
+        v.select_section(-1, W, 20);
+        v.select_section(-1, W, 20);
+        v.select_section(-1, W, 20);
+        assert_eq!(v.current_step(W), Some(0), "borné à la première");
+    }
+
+    #[test]
+    fn defiler_rend_la_selection_a_la_ligne_du_haut() {
+        let mut v = sectioned(&[("a", Status::Failure, 5), ("b", Status::Failure, 5)]);
+        v.select_section(1, W, 3);
+        assert_eq!(v.current_step(W), Some(1));
+        v.scroll_to_row(1, v.max_scroll(W, 3)); // l'utilisateur défile : on repart de la ligne du haut
+        assert_eq!(v.current_step(W), Some(0));
+    }
+
+    #[test]
+    fn tab_ne_fait_defiler_que_si_le_titre_est_hors_de_l_ecran() {
+        let mut v = sectioned(&[
+            ("a", Status::Failure, 2),
+            ("b", Status::Failure, 20),
+            ("c", Status::Failure, 2),
+        ]);
+        // Fenêtre de 6 lignes sur 28 : « b » (titre en 3e ligne) est visible, pas « c ».
+        v.select_section(1, W, 6);
+        assert_eq!(v.scroll, 0, "le titre était déjà visible : rien ne bouge");
+        v.select_section(1, W, 6);
+        // 27 lignes d'écran, fenêtre de 6 : le défilement maximal est 21 (le titre de « c » est en 24).
+        assert_eq!(
+            v.scroll, 21,
+            "« c » est hors écran : on défile, borné au maximum"
+        );
+        v.select_section(-1, W, 6);
+        assert_eq!(v.scroll, 3, "et « b » revient en haut quand on remonte");
+    }
+
+    #[test]
+    fn selection_sans_section_ou_devenue_invalide() {
+        let mut plain = view(&["a"]);
+        plain.select_section(1, W, 5);
+        assert_eq!(plain.current_step(W), None);
+        let mut v = sectioned(&[("a", Status::Failure, 1), ("b", Status::Failure, 1)]);
+        v.select_section(1, W, 10);
+        // Un rafraîchissement qui perd une étape ne doit pas laisser une sélection hors limites.
+        v.set_log(&joblog(&[("a", Status::Failure, 1)]));
+        assert_eq!(v.current_step(W), Some(0));
+        v.toggle_section(W, 10); // ne panique pas
     }
 }

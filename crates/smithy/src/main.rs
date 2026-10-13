@@ -185,7 +185,11 @@ async fn run(
                             }
                             KeyCode::Char('j') | KeyCode::Down => app.logs_scroll(1),
                             KeyCode::Char('k') | KeyCode::Up => app.logs_scroll(-1),
-                            KeyCode::PageDown | KeyCode::Char(' ') => app.logs_page(1),
+                            KeyCode::Char(' ') => app.logs_toggle_section(),
+                            KeyCode::Tab => app.logs_select_section(1),
+                            KeyCode::BackTab => app.logs_select_section(-1),
+                            KeyCode::Char('a') => app.logs_toggle_all(),
+                            KeyCode::PageDown | KeyCode::Char('f') => app.logs_page(1),
                             KeyCode::PageUp | KeyCode::Char('b') => app.logs_page(-1),
                             KeyCode::Char('g') | KeyCode::Home => app.logs_top(),
                             KeyCode::Char('G') | KeyCode::End => app.logs_bottom(),

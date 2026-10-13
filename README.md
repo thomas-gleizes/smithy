@@ -9,7 +9,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 ## Features
 
 - List the repositories you can access and the latest CI runs of the selected one.
-- Read the steps and output of any job, in the terminal (`Enter` on a run): ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
+- Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
 - Sign in from the TUI (username and password, entered once and never stored).
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
@@ -102,12 +102,17 @@ In the log view:
 | Key                   | Action                          |
 |-----------------------|---------------------------------|
 | `j` / `k`, `↓` / `↑`  | Scroll one line                 |
-| `PgDn` / `Space`, `PgUp` / `b` | Scroll one page        |
+| `PgDn` / `f`, `PgUp` / `b` | Scroll one page          |
+| `Tab` / `Shift+Tab`   | Select the next / previous step |
+| `Space`               | Fold / unfold the selected step |
+| `a`                   | Unfold all steps (or fold all if all are open) |
 | `g` / `Home`, `G` / `End` | Top / bottom                |
 | `w`                   | Toggle line wrapping (kept for the session) |
 | `r`                   | Refresh                         |
 | `Esc`, `q`, `Backspace` | Back to the runs              |
 | `Ctrl+C`              | Quit                            |
+
+The selected step is the one you moved to with `Tab`, or otherwise the one at the top of the screen; its title is shown in reverse video. Folding state survives refreshes, and a step that was open while running stays open when it finishes.
 
 Long lines are clipped by default; `w` wraps them at the exact terminal width (characters are cut, not words, so paths and JSON stay intact). Scrolling counts screen rows when wrapped, so a single very long line can be read to its end. Output is capped to the last 50,000 lines per step.
 

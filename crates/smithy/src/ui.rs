@@ -89,10 +89,16 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
             view.window(width, height)
                 .into_iter()
                 .map(|r| match r.kind {
-                    LineKind::Step(st) => Line::from(Span::styled(
-                        r.text,
-                        Style::new().fg(status_style(st).1).bold(),
-                    )),
+                    LineKind::Step(st) => {
+                        let style = Style::new().fg(status_style(st).1).bold();
+                        // La section courante (celle que Espace plie) est en vidéo inverse.
+                        let style = if r.current {
+                            style.add_modifier(Modifier::REVERSED)
+                        } else {
+                            style
+                        };
+                        Line::from(Span::styled(r.text, style))
+                    }
                     LineKind::Text => Line::from(r.text),
                 })
                 .collect()
@@ -129,11 +135,11 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
 /// Tronquée, elle ferait disparaître justement les touches les moins connues.
 fn logs_help(width: usize) -> &'static str {
     [
-        "j/k ↑/↓ défiler · PgUp/PgDn page · g/G début/fin · w retour à la ligne · r rafraîchir · Esc retour",
-        "j/k défiler · PgUp/PgDn · g/G · w retour ligne · r rafraîchir · Esc retour",
-        "j/k · w repli · r rafraîchir · Esc retour",
-        "j/k · w repli · Esc retour",
-        "Esc retour",
+        "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · Tab section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
+        "j/k défiler · Tab section · Espace plier · a tout · w repli · Esc retour",
+        "Tab · Espace plier · w repli · Esc retour",
+        "Tab · Espace · w · Esc",
+        "Esc",
     ]
     .into_iter()
     .find(|h| h.chars().count() <= width)
@@ -420,6 +426,7 @@ mod tests {
         LogLine {
             kind,
             text: text.into(),
+            step: None,
         }
     }
 
@@ -461,14 +468,76 @@ mod tests {
         assert!(text.contains("21-29/50"));
     }
 
+    fn app_with_job(steps: Vec<smithy_core::StepLog>) -> App {
+        let mut app = app_with_logs(LogState::Loading);
+        let v = app.logs.as_mut().unwrap();
+        v.set_log(&smithy_core::JobLog {
+            steps,
+            notice: None,
+        });
+        app
+    }
+
+    fn step(name: &str, status: Status, n: usize) -> smithy_core::StepLog {
+        smithy_core::StepLog {
+            name: name.into(),
+            status,
+            lines: (1..=n).map(|i| format!("{name}-ligne-{i}")).collect(),
+        }
+    }
+
+    #[test]
+    fn sections_repliees_et_depliees_a_l_ecran() {
+        let app = app_with_job(vec![
+            step("Preparation", Status::Success, 9),
+            step("Tests", Status::Failure, 2),
+        ]);
+        let text = render(&app, 100, 14);
+        assert!(text.contains("▸ Preparation (9 lignes)"));
+        assert!(
+            !text.contains("Preparation-ligne-1"),
+            "le contenu replié est caché"
+        );
+        assert!(text.contains("▾ Tests") && text.contains("Tests-ligne-2"));
+    }
+
+    #[test]
+    fn la_section_courante_est_en_video_inverse() {
+        use ratatui::style::Modifier;
+        let app = app_with_job(vec![
+            step("Preparation", Status::Success, 1),
+            step("Tests", Status::Failure, 1),
+        ]);
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let reversed = |symbol: &str| {
+            term.backend()
+                .buffer()
+                .content()
+                .iter()
+                .find(|c| c.symbol() == symbol)
+                .map(|c| c.modifier.contains(Modifier::REVERSED))
+        };
+        // En haut de l'écran : « Preparation » (repliée), c'est la section courante.
+        assert_eq!(reversed("▸"), Some(true));
+        assert_eq!(
+            reversed("▾"),
+            Some(false),
+            "les autres titres ne le sont pas"
+        );
+    }
+
     #[test]
     fn aide_adaptee_a_la_largeur() {
-        for width in [120, 80, 50, 30, 12, 5, 0] {
+        for width in [140, 120, 80, 50, 30, 12, 5, 0] {
             let h = logs_help(width);
             assert!(h.chars().count() <= width.max(4), "{h:?} dépasse {width}");
             assert!(h.contains("Esc"), "la sortie reste toujours indiquée");
         }
-        assert!(logs_help(120).contains("w retour à la ligne"));
+        assert!(
+            logs_help(140).contains("w retour à la ligne"),
+            "l'aide complète fait 133 colonnes"
+        );
         assert!(
             logs_help(45).contains('w'),
             "la touche w survit aux largeurs courantes"
@@ -479,7 +548,7 @@ mod tests {
     fn vue_des_logs_avec_retour_a_la_ligne() {
         let long = format!("DEBUT-{}-FIN", "x".repeat(80));
         let mut app = app_with_logs(LogState::Ready(vec![line(LineKind::Text, &long)]));
-        let off = render(&app, 40, 12);
+        let off = render(&app, 45, 12);
         assert!(
             off.contains("DEBUT") && !off.contains("-FIN"),
             "ligne coupée sans repli"
@@ -487,14 +556,14 @@ mod tests {
         assert!(!off.contains('↩'));
 
         app.logs_toggle_wrap(); // la largeur utile a été publiée par le rendu précédent
-        let on = render(&app, 40, 12);
+        let on = render(&app, 45, 12);
         assert!(
             on.contains("DEBUT") && on.contains("-FIN"),
             "tout est lisible une fois replié"
         );
         assert!(on.contains('↩'), "l'état du repli est signalé");
         assert!(on.contains("w repli"), "l'aide s'adapte à la largeur");
-        assert!(render(&app, 120, 12).contains("w retour à la ligne"));
+        assert!(render(&app, 140, 12).contains("w retour à la ligne"));
         // Replié sur un terminal minuscule : pas de panique
         render(&app, 4, 5);
         render(&app, 1, 1);

@@ -5,7 +5,7 @@ use std::cell::Cell;
 use smithy_core::{Error, JobLog, Pipeline, Repo, Status};
 
 use crate::{
-    logview::{LineKind, LogLine, LogState, LogView},
+    logview::{LogState, LogView, Start},
     session::Session,
 };
 
@@ -142,7 +142,8 @@ impl App {
         let (w, h) = self.view_size();
         if let Some(v) = self.logs.as_mut() {
             let max = v.max_scroll(w, h);
-            v.scroll = v.scroll.saturating_add_signed(delta).min(max);
+            let row = v.scroll.saturating_add_signed(delta);
+            v.scroll_to_row(row, max);
         }
     }
 
@@ -153,14 +154,39 @@ impl App {
 
     pub fn logs_top(&mut self) {
         if let Some(v) = self.logs.as_mut() {
-            v.scroll = 0;
+            v.scroll_to_row(0, 0);
         }
     }
 
     pub fn logs_bottom(&mut self) {
         let (w, h) = self.view_size();
         if let Some(v) = self.logs.as_mut() {
-            v.scroll = v.max_scroll(w, h);
+            let max = v.max_scroll(w, h);
+            v.scroll_to_row(max, max);
+        }
+    }
+
+    /// Espace : plie ou déplie la section (l'étape) en haut de l'écran.
+    pub fn logs_toggle_section(&mut self) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.logs.as_mut() {
+            v.toggle_section(w, h);
+        }
+    }
+
+    /// Tab / Maj+Tab : section suivante (`1`) ou précédente (`-1`).
+    pub fn logs_select_section(&mut self, delta: isize) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.logs.as_mut() {
+            v.select_section(delta, w, h);
+        }
+    }
+
+    /// Touche `a` : tout déplier, ou tout plier si tout est déjà déplié.
+    pub fn logs_toggle_all(&mut self) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.logs.as_mut() {
+            v.toggle_all(w, h);
         }
     }
 
@@ -288,7 +314,6 @@ impl App {
                 match result {
                     Ok(log) => {
                         let live = self.logs_are_live();
-                        let lines = flatten(&log);
                         let notice = log.notice.clone();
                         let (w, h) = self.view_size();
                         let Some(v) = self.logs.as_mut() else {
@@ -296,13 +321,9 @@ impl App {
                         };
                         let first_load = matches!(v.state, LogState::Loading);
                         let was_at_bottom = v.scroll >= v.max_scroll(w, h);
-                        let start = if first_load {
-                            initial_line(&lines, live)
-                        } else {
-                            None
-                        };
                         v.notice = notice;
-                        v.set_lines(lines);
+                        v.set_log(&log);
+                        let start = first_load.then(|| v.initial_start(live)).flatten();
                         v.scroll = match start {
                             // À l'ouverture : l'étape en échec, ou la fin d'un job en cours.
                             Some(Start::Line(i)) => v.row_of_line(w, i),
@@ -374,43 +395,6 @@ impl App {
     }
 }
 
-/// Titres d'étape et lignes de sortie à plat, pour un défilement simple.
-fn flatten(log: &JobLog) -> Vec<LogLine> {
-    if log.steps.is_empty() {
-        return vec![LogLine {
-            kind: LineKind::Text,
-            text: "(aucune étape : le job n'a pas démarré)".to_owned(),
-        }];
-    }
-    let mut out = Vec::new();
-    for step in &log.steps {
-        out.push(LogLine {
-            kind: LineKind::Step(step.status),
-            text: format!("▸ {}", step.name),
-        });
-        out.extend(step.lines.iter().map(|l| LogLine {
-            kind: LineKind::Text,
-            text: l.clone(),
-        }));
-    }
-    out
-}
-
-enum Start {
-    Line(usize),
-    End,
-}
-
-/// Où se placer à l'ouverture : sur la première étape en échec (c'est là qu'on cherche),
-/// sinon en bas si le job tourne encore, sinon en haut (`None`).
-fn initial_line(lines: &[LogLine], live: bool) -> Option<Start> {
-    lines
-        .iter()
-        .position(|l| l.kind == LineKind::Step(Status::Failure))
-        .map(Start::Line)
-        .or(live.then_some(Start::End))
-}
-
 fn clamp_step(idx: usize, len: usize, delta: isize) -> usize {
     if len == 0 {
         return 0;
@@ -421,6 +405,7 @@ fn clamp_step(idx: usize, len: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::logview::{LineKind, LogLine};
     use smithy_core::Status;
 
     fn repo(n: &str) -> Repo {
@@ -522,26 +507,29 @@ mod tests {
             ..Default::default()
         };
         deliver(&mut a, 7, Ok(log));
-        // 1 titre + 9 lignes, puis le titre de l'étape en échec à l'index 10
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 10);
-        assert_eq!(lines(&a)[10].kind, LineKind::Step(Status::Failure));
-        assert_eq!(lines(&a).len(), 1 + 9 + 1 + 30 + 1 + 2);
+        // L'étape réussie est repliée (une seule ligne d'écran) : l'étape en échec est la 2e.
+        assert_eq!(a.logs.as_ref().unwrap().scroll, 1);
+        let all = lines(&a);
+        assert_eq!(all[0].text, "▸ Set up job (9 lignes)");
+        assert_eq!(all[10].kind, LineKind::Step(Status::Failure));
+        assert_eq!(all[10].text, "▾ cargo test");
+        assert_eq!(all.len(), 1 + 9 + 1 + 30 + 1 + 2);
     }
 
     #[test]
     fn job_reussi_ouvert_en_haut_job_en_cours_en_bas() {
-        let log = || JobLog {
-            steps: vec![step("build", Status::Success, 20)],
+        let log = |status| JobLog {
+            steps: vec![step("build", status, 20)],
             ..Default::default()
         };
         let mut done = app_on_run(Status::Success);
         done.open_logs();
-        deliver(&mut done, 7, Ok(log()));
+        deliver(&mut done, 7, Ok(log(Status::Success)));
         assert_eq!(done.logs.as_ref().unwrap().scroll, 0);
 
         let mut live = app_on_run(Status::Running);
         live.open_logs();
-        deliver(&mut live, 7, Ok(log()));
+        deliver(&mut live, 7, Ok(log(Status::Running)));
         assert_eq!(live.logs.as_ref().unwrap().scroll, 21 - 5);
     }
 
@@ -600,7 +588,7 @@ mod tests {
         JobLog {
             steps: vec![smithy_core::StepLog {
                 name: "s".into(),
-                status: Status::Success,
+                status: Status::Running, // ouverte : une étape réussie serait repliée
                 lines: vec!["x".repeat(25), "fin".into()],
             }],
             ..Default::default()
@@ -678,6 +666,53 @@ mod tests {
     }
 
     #[test]
+    fn espace_plie_et_deplie_la_section_courante() {
+        let mut a = app_on_run(Status::Failure);
+        a.viewport.set(3); // 4 lignes d'écran au total : un défilement possible
+        a.open_logs();
+        let log = JobLog {
+            steps: vec![
+                step("Set up job", Status::Success, 9),
+                step("Tests", Status::Failure, 2),
+            ],
+            ..Default::default()
+        };
+        deliver(&mut a, 7, Ok(log));
+        let view = |a: &App| -> Vec<String> {
+            let v = a.logs.as_ref().unwrap();
+            v.window(80, 3).iter().map(|r| r.text.to_owned()).collect()
+        };
+        // Ouvert sur l'étape en échec (la réussie est repliée au-dessus)
+        assert_eq!(a.logs.as_ref().unwrap().scroll, 1);
+        assert_eq!(view(&a), ["▾ Tests", "Tests 1", "Tests 2"]);
+        a.logs_scroll(-1);
+        assert_eq!(view(&a)[0], "▸ Set up job (9 lignes)");
+        a.logs_toggle_section(); // déplier « Set up job »
+        assert_eq!(view(&a)[1], "Set up job 1");
+        assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
+        a.logs_toggle_section(); // et la replier
+        assert_eq!(view(&a)[0], "▸ Set up job (9 lignes)");
+        // `a` : tout déplier (une étape est repliée), puis tout replier
+        a.logs_toggle_all();
+        assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
+        a.logs_toggle_all();
+        assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 2);
+        // Tab : on atteint l'autre section sans défiler (tout tient presque à l'écran)
+        a.viewport.set(10); // tout est replié (dernier `a`) et tient à l'écran
+        a.logs_select_section(1);
+        a.logs_toggle_section();
+        assert_eq!(a.logs.as_ref().unwrap().window(80, 10)[2].text, "Tests 1");
+        a.logs_select_section(-1);
+        a.logs_toggle_section();
+        assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
+        // Aucune vue ouverte : sans effet
+        let mut none = App::new();
+        none.logs_toggle_section();
+        none.logs_toggle_all();
+        none.logs_select_section(1);
+    }
+
+    #[test]
     fn bascule_sans_vue_ouverte() {
         App::new().logs_toggle_wrap();
     }
@@ -698,7 +733,7 @@ mod tests {
             &mut a,
             7,
             Ok(JobLog {
-                steps: vec![step("s", Status::Success, 19)],
+                steps: vec![step("s", Status::Failure, 19)],
                 ..Default::default()
             }),
         ); // 20 lignes
