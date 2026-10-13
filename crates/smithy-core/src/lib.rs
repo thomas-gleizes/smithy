@@ -10,6 +10,8 @@ pub enum Error {
     Network(String),
     #[error("non authentifié (token absent ou invalide)")]
     Unauthorized,
+    #[error("identifiant ou mot de passe incorrect")]
+    BadCredentials,
     #[error("ressource introuvable : {0}")]
     NotFound(String),
     #[error("fonctionnalité non supportée par ce backend : {0}")]

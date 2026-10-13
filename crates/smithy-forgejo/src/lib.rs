@@ -1,6 +1,10 @@
 //! Backend Forgejo. Endpoints validés sur Forgejo 15 : `/user/repos` et
 //! `/repos/{o}/{r}/actions/tasks`. Il n'existe pas d'API REST pour les logs.
 
+mod login;
+
+pub use login::{Login, login};
+
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use smithy_core::{Capabilities, Error, Pipeline, Provider, Repo, Result, Status};

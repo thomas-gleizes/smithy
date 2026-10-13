@@ -9,6 +9,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 ## Features
 
 - List the repositories you can access and the latest CI runs of the selected one.
+- Sign in from the TUI (username and password, entered once and never stored).
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
 - Backends are pluggable through the `Provider` trait; the UI adapts to what a backend supports (`Capabilities`).
@@ -59,7 +60,14 @@ Environment variables override the first server (or define one if the file has n
 | `SMITHY_TOKEN`  | API token (read-only is enough)      |
 | `SMITHY_SERVER` | Name of the server to use            |
 
-Session cookies (needed for CI logs on Forgejo, coming soon) will be kept per server in `~/.local/state/smithy/sessions/` with `0600` permissions. Passwords are never written to disk.
+### Logging in
+
+`token` is optional. Without one (and without a previous login), smithy shows a login form: enter your username and password once. smithy then
+
+- signs in to obtain a **session cookie** (Forgejo only serves CI logs through its web routes, which do not accept API tokens);
+- creates a **read-only API token** named `smithy-<server>-<timestamp>` on your account, so you can revoke it from the Forgejo settings.
+
+Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (directory `0700`, file `0600`). **The password is never written to disk.** A `token` set in the config file or in `SMITHY_TOKEN` takes precedence over the one created at login. Two-factor authentication and SSO are not supported yet.
 
 ## Key bindings
 

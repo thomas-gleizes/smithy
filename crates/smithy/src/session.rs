@@ -18,6 +18,11 @@ use crate::config::valid_name;
 pub struct Session {
     /// URL du serveur au moment du login : si elle change, la session ne vaut plus.
     pub url: String,
+    /// Identifiant saisi au login, pour préremplir la reconnexion.
+    pub username: String,
+    /// Token d'API créé au login (lecture seule) ; absent si le token vient de la config.
+    #[serde(default)]
+    pub token: Option<String>,
     pub cookies: BTreeMap<String, String>,
 }
 
@@ -69,6 +74,7 @@ impl SessionStore {
     }
 
     /// Oublie la session (expirée ou déconnexion). Sans effet si elle n'existe pas.
+    #[allow(dead_code)] // utilisé dès que les logs détectent une session expirée
     pub fn clear(&self, name: &str) -> Result<()> {
         let path = self.file(name)?;
         match fs::remove_file(&path) {
@@ -134,6 +140,8 @@ mod tests {
     fn session(url: &str) -> Session {
         Session {
             url: url.into(),
+            username: "thomas".into(),
+            token: Some("tok".into()),
             cookies: BTreeMap::from([("session".to_owned(), "abc".to_owned())]),
         }
     }
@@ -166,8 +174,8 @@ mod tests {
         fs::write(tmp.0.join("forge.json"), "pas du json").unwrap();
         assert_eq!(store.load("forge", "http://a").unwrap(), None);
         let vide = Session {
-            url: "http://a".into(),
             cookies: BTreeMap::new(),
+            ..session("http://a")
         };
         store.save("forge", &vide).unwrap();
         assert_eq!(store.load("forge", "http://a").unwrap(), None);

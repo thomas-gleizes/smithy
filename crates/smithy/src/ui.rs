@@ -1,13 +1,15 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, Cell, List, ListItem, ListState, Paragraph, Row, Table, TableState},
+    widgets::{
+        Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+    },
 };
 use smithy_core::Status;
 
-use crate::app::{App, Focus};
+use crate::app::{App, Focus, LoginField, LoginForm};
 
 pub fn status_style(s: Status) -> (&'static str, Color) {
     match s {
@@ -114,6 +116,70 @@ pub fn draw(f: &mut Frame, app: &App) {
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(vec![help, second]), rows[1]);
+
+    if let Some(form) = &app.login {
+        draw_login(f, form, &app.server_label);
+    }
+}
+
+fn centered(area: Rect, width: u16, height: u16) -> Rect {
+    let w = width.min(area.width);
+    let h = height.min(area.height);
+    Rect::new(
+        area.x + (area.width - w) / 2,
+        area.y + (area.height - h) / 2,
+        w,
+        h,
+    )
+}
+
+fn draw_login(f: &mut Frame, form: &LoginForm, server: &str) {
+    let area = centered(f.area(), 64, 9);
+    f.render_widget(Clear, area);
+
+    let field = |label: &str, value: String, active: bool| {
+        let cursor = if active && !form.busy { "▏" } else { "" };
+        let style = if active {
+            Style::new().fg(Color::Yellow)
+        } else {
+            Style::new()
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<13}"), style),
+            Span::raw(format!("{value}{cursor}")),
+        ])
+    };
+    let mut lines = vec![
+        field(
+            "Identifiant",
+            form.username.clone(),
+            form.field == LoginField::Username,
+        ),
+        field(
+            "Mot de passe",
+            "•".repeat(form.password.chars().count()),
+            form.field == LoginField::Password,
+        ),
+        Line::from(""),
+    ];
+    lines.push(if form.busy {
+        Line::from(Span::styled("connexion…", Style::new().fg(Color::Cyan)))
+    } else if let Some(e) = &form.error {
+        Line::from(Span::styled(e.clone(), Style::new().fg(Color::Red)))
+    } else {
+        Line::from("")
+    });
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "Entrée valider · Tab changer de champ · Esc quitter",
+        Style::new().fg(Color::DarkGray),
+    )));
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Connexion · {server} "))
+        .border_style(Style::new().fg(Color::Yellow));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[cfg(test)]
@@ -199,6 +265,40 @@ mod tests {
             .collect();
         assert!(text.contains("run : http://x/runs/2"));
         assert!(!text.contains("run : http://x/runs/3"));
+    }
+
+    fn render(app: &App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        term.backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|c| c.symbol())
+            .collect()
+    }
+
+    #[test]
+    fn formulaire_de_connexion_masque_le_mot_de_passe() {
+        let mut app = App::new();
+        app.server_label = "maison (http://forge)".into();
+        app.open_login("thomas");
+        "hunter2".chars().for_each(|c| app.login_type(c));
+        let text = render(&app, 100, 20);
+        assert!(text.contains("Connexion · maison"));
+        assert!(text.contains("thomas"));
+        assert!(text.contains("•••••••"));
+        assert!(!text.contains("hunter2"), "mot de passe affiché en clair");
+
+        app.login.as_mut().unwrap().error = Some("identifiant ou mot de passe incorrect".into());
+        assert!(render(&app, 100, 20).contains("incorrect"));
+    }
+
+    #[test]
+    fn formulaire_sur_tres_petit_terminal() {
+        let mut app = App::new();
+        app.open_login("");
+        render(&app, 10, 3);
     }
 
     #[test]
