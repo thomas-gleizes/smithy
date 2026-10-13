@@ -9,7 +9,10 @@ use ratatui::{
 };
 use smithy_core::Status;
 
-use crate::app::{App, Focus, LineKind, LogState, LogView, LoginField, LoginForm};
+use crate::{
+    app::{App, Focus, LoginField, LoginForm},
+    logview::{LineKind, LogState, LogView},
+};
 
 pub fn status_style(s: Status) -> (&'static str, Color) {
     match s {
@@ -58,7 +61,10 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow));
     let inner = block.inner(rows[0]);
-    app.viewport.set(inner.height as usize);
+    let (width, height) = (inner.width as usize, inner.height as usize);
+    // Le rendu seul connaît la taille utile : il la publie pour le défilement.
+    app.viewport.set(height);
+    app.viewport_width.set(width);
 
     let mut position = String::new();
     let body: Vec<Line> = match &view.state {
@@ -70,28 +76,35 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
             format!("erreur : {e}"),
             Style::new().fg(Color::Red),
         ))],
-        LogState::Ready(lines) => {
-            let end = (view.scroll + inner.height as usize).min(lines.len());
-            position = format!(" {}-{}/{} ", (view.scroll + 1).min(end), end, lines.len());
-            lines[view.scroll.min(lines.len())..end]
-                .iter()
-                .map(|l| match l.kind {
+        LogState::Ready(_) => {
+            let total = view.total_rows(width);
+            let end = (view.scroll + height).min(total);
+            position = format!(
+                " {}{}-{}/{} ",
+                if view.wrap { "↩ " } else { "" },
+                (view.scroll + 1).min(end),
+                end,
+                total
+            );
+            view.window(width, height)
+                .into_iter()
+                .map(|r| match r.kind {
                     LineKind::Step(st) => Line::from(Span::styled(
-                        format!("▸ {}", l.text),
+                        r.text,
                         Style::new().fg(status_style(st).1).bold(),
                     )),
-                    LineKind::Text => Line::from(l.text.as_str()),
+                    LineKind::Text => Line::from(r.text),
                 })
                 .collect()
         }
     };
-    // La position va dans le cadre, à droite : le pied de page peut être tronqué
-    // sur un terminal étroit, pas le cadre.
+    // Position et état du repli dans la bordure du bas, à droite : le long titre du haut les
+    // recouvrirait sur un terminal étroit, et le pied de page peut être tronqué ; la bordure,
+    // non. La réserve éventuelle (⚠) est à gauche, sur la même bordure.
     let mut block = block
         .title(title)
-        .title(Line::from(position).right_aligned());
+        .title_bottom(Line::from(position).right_aligned());
     if let Some(notice) = &view.notice {
-        // En bas du cadre, en jaune : visible sans prendre la place des logs.
         block = block.title_bottom(Line::from(Span::styled(
             format!(" ⚠ {notice} "),
             Style::new().fg(Color::Yellow),
@@ -105,11 +118,26 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
             Style::new().fg(Color::Red),
         )),
         None => Line::from(Span::styled(
-            "j/k ↑/↓ défiler · PgUp/PgDn page · g/G début/fin · r rafraîchir · Esc retour",
+            logs_help(f.area().width as usize),
             Style::new().fg(Color::DarkGray),
         )),
     };
     f.render_widget(Paragraph::new(footer), rows[1]);
+}
+
+/// Aide du pied de page, de la plus complète à la plus courte : la première qui tient.
+/// Tronquée, elle ferait disparaître justement les touches les moins connues.
+fn logs_help(width: usize) -> &'static str {
+    [
+        "j/k ↑/↓ défiler · PgUp/PgDn page · g/G début/fin · w retour à la ligne · r rafraîchir · Esc retour",
+        "j/k défiler · PgUp/PgDn · g/G · w retour ligne · r rafraîchir · Esc retour",
+        "j/k · w repli · r rafraîchir · Esc retour",
+        "j/k · w repli · Esc retour",
+        "Esc retour",
+    ]
+    .into_iter()
+    .find(|h| h.chars().count() <= width)
+    .unwrap_or("Esc")
 }
 
 fn draw_lists(f: &mut Frame, app: &App) {
@@ -263,7 +291,7 @@ fn draw_login(f: &mut Frame, form: &LoginForm, server: &str) {
 mod tests {
     use super::*;
     use crate::app::Msg;
-    use crate::app::{LineKind, LogState};
+    use crate::logview::{LineKind, LogLine, LogState};
     use ratatui::{Terminal, backend::TestBackend};
     use smithy_core::{Pipeline, Repo};
 
@@ -388,8 +416,8 @@ mod tests {
         app
     }
 
-    fn line(kind: LineKind, text: &str) -> crate::app::LogLine {
-        crate::app::LogLine {
+    fn line(kind: LineKind, text: &str) -> LogLine {
+        LogLine {
             kind,
             text: text.into(),
         }
@@ -398,7 +426,7 @@ mod tests {
     #[test]
     fn vue_des_logs() {
         let lines = vec![
-            line(LineKind::Step(Status::Failure), "cargo test"),
+            line(LineKind::Step(Status::Failure), "▸ cargo test"),
             line(LineKind::Text, "boum"),
             line(LineKind::Text, "autre ligne"),
         ];
@@ -431,6 +459,45 @@ mod tests {
         assert!(text.contains("ligne-21") && text.contains("ligne-29"));
         assert!(!text.contains("ligne-20") && !text.contains("ligne-30"));
         assert!(text.contains("21-29/50"));
+    }
+
+    #[test]
+    fn aide_adaptee_a_la_largeur() {
+        for width in [120, 80, 50, 30, 12, 5, 0] {
+            let h = logs_help(width);
+            assert!(h.chars().count() <= width.max(4), "{h:?} dépasse {width}");
+            assert!(h.contains("Esc"), "la sortie reste toujours indiquée");
+        }
+        assert!(logs_help(120).contains("w retour à la ligne"));
+        assert!(
+            logs_help(45).contains('w'),
+            "la touche w survit aux largeurs courantes"
+        );
+    }
+
+    #[test]
+    fn vue_des_logs_avec_retour_a_la_ligne() {
+        let long = format!("DEBUT-{}-FIN", "x".repeat(80));
+        let mut app = app_with_logs(LogState::Ready(vec![line(LineKind::Text, &long)]));
+        let off = render(&app, 40, 12);
+        assert!(
+            off.contains("DEBUT") && !off.contains("-FIN"),
+            "ligne coupée sans repli"
+        );
+        assert!(!off.contains('↩'));
+
+        app.logs_toggle_wrap(); // la largeur utile a été publiée par le rendu précédent
+        let on = render(&app, 40, 12);
+        assert!(
+            on.contains("DEBUT") && on.contains("-FIN"),
+            "tout est lisible une fois replié"
+        );
+        assert!(on.contains('↩'), "l'état du repli est signalé");
+        assert!(on.contains("w repli"), "l'aide s'adapte à la largeur");
+        assert!(render(&app, 120, 12).contains("w retour à la ligne"));
+        // Replié sur un terminal minuscule : pas de panique
+        render(&app, 4, 5);
+        render(&app, 1, 1);
     }
 
     #[test]

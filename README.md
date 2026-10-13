@@ -104,11 +104,12 @@ In the log view:
 | `j` / `k`, `↓` / `↑`  | Scroll one line                 |
 | `PgDn` / `Space`, `PgUp` / `b` | Scroll one page        |
 | `g` / `Home`, `G` / `End` | Top / bottom                |
+| `w`                   | Toggle line wrapping (kept for the session) |
 | `r`                   | Refresh                         |
 | `Esc`, `q`, `Backspace` | Back to the runs              |
 | `Ctrl+C`              | Quit                            |
 
-Long lines are clipped, not wrapped. Output is capped to the last 50,000 lines per step.
+Long lines are clipped by default; `w` wraps them at the exact terminal width (characters are cut, not words, so paths and JSON stay intact). Scrolling counts screen rows when wrapped, so a single very long line can be read to its end. Output is capped to the last 50,000 lines per step.
 
 ## Development
 

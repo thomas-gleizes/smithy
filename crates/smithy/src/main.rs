@@ -1,7 +1,9 @@
 mod app;
 mod config;
+mod logview;
 mod session;
 mod ui;
+mod wrap;
 
 use std::{
     collections::BTreeMap,
@@ -187,6 +189,7 @@ async fn run(
                             KeyCode::PageUp | KeyCode::Char('b') => app.logs_page(-1),
                             KeyCode::Char('g') | KeyCode::Home => app.logs_top(),
                             KeyCode::Char('G') | KeyCode::End => app.logs_bottom(),
+                            KeyCode::Char('w') => app.logs_toggle_wrap(),
                             KeyCode::Char('r') => need_logs = app.refetch_logs(),
                             _ => {}
                         }

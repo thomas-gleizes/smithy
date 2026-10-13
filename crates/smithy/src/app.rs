@@ -4,7 +4,10 @@ use std::cell::Cell;
 
 use smithy_core::{Error, JobLog, Pipeline, Repo, Status};
 
-use crate::session::Session;
+use crate::{
+    logview::{LineKind, LogLine, LogState, LogView},
+    session::Session,
+};
 
 pub enum Msg {
     /// Logs d'un job ; `pipeline_id` sert à ignorer une réponse périmée.
@@ -26,38 +29,6 @@ pub enum Msg {
 pub enum Focus {
     Repos,
     Pipelines,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum LineKind {
-    /// Titre d'étape, coloré selon son statut.
-    Step(Status),
-    Text,
-}
-
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct LogLine {
-    pub kind: LineKind,
-    pub text: String,
-}
-
-#[derive(Debug)]
-pub enum LogState {
-    Loading,
-    Ready(Vec<LogLine>),
-    Failed(String),
-}
-
-/// Vue plein écran de la sortie d'un job.
-#[derive(Debug)]
-pub struct LogView {
-    pub repo: Repo,
-    pub pipeline: Pipeline,
-    pub state: LogState,
-    /// Première ligne affichée.
-    pub scroll: usize,
-    /// Réserve du backend (ex. version du serveur non vérifiée).
-    pub notice: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -92,8 +63,11 @@ pub struct App {
     pub logs: Option<LogView>,
     /// Le backend sait-il fournir des logs ? (`Capabilities::logs`)
     pub logs_supported: bool,
-    /// Hauteur utile de la vue des logs, écrite par le rendu qui seul la connaît.
+    /// Dernier choix de retour à la ligne, appliqué aux vues de logs suivantes (le temps de la session).
+    pub logs_wrap: bool,
+    /// Hauteur et largeur utiles de la vue des logs, écrites par le rendu qui seul les connaît.
     pub viewport: Cell<usize>,
+    pub viewport_width: Cell<usize>,
 }
 
 impl App {
@@ -110,7 +84,9 @@ impl App {
             server_label: String::new(),
             logs: None,
             logs_supported: false,
+            logs_wrap: false,
             viewport: Cell::new(20),
+            viewport_width: Cell::new(80),
         }
     }
 
@@ -127,13 +103,9 @@ impl App {
         }
         let repo = self.selected_repo()?.clone();
         let pipeline = self.selected_pipeline()?.clone();
-        self.logs = Some(LogView {
-            repo: repo.clone(),
-            pipeline: pipeline.clone(),
-            state: LogState::Loading,
-            scroll: 0,
-            notice: None,
-        });
+        let mut view = LogView::new(repo.clone(), pipeline.clone());
+        view.wrap = self.logs_wrap;
+        self.logs = Some(view);
         Some((repo, pipeline))
     }
 
@@ -162,15 +134,14 @@ impl App {
         matches!(current, Status::Running | Status::Pending)
     }
 
-    fn logs_max_scroll(&self) -> usize {
-        self.logs
-            .as_ref()
-            .map_or(0, |v| max_scroll(&v.state, self.viewport.get().max(1)))
+    fn view_size(&self) -> (usize, usize) {
+        (self.viewport_width.get().max(1), self.viewport.get().max(1))
     }
 
     pub fn logs_scroll(&mut self, delta: isize) {
-        let max = self.logs_max_scroll();
+        let (w, h) = self.view_size();
         if let Some(v) = self.logs.as_mut() {
+            let max = v.max_scroll(w, h);
             v.scroll = v.scroll.saturating_add_signed(delta).min(max);
         }
     }
@@ -187,9 +158,18 @@ impl App {
     }
 
     pub fn logs_bottom(&mut self) {
-        let max = self.logs_max_scroll();
+        let (w, h) = self.view_size();
         if let Some(v) = self.logs.as_mut() {
-            v.scroll = max;
+            v.scroll = v.max_scroll(w, h);
+        }
+    }
+
+    /// Retour à la ligne (touche `w`) : la même ligne de log reste en haut de l'écran.
+    pub fn logs_toggle_wrap(&mut self) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.logs.as_mut() {
+            v.toggle_wrap(w, h);
+            self.logs_wrap = v.wrap;
         }
     }
 
@@ -310,22 +290,29 @@ impl App {
                         let live = self.logs_are_live();
                         let lines = flatten(&log);
                         let notice = log.notice.clone();
-                        let viewport = self.viewport.get().max(1);
+                        let (w, h) = self.view_size();
                         let Some(v) = self.logs.as_mut() else {
                             return false;
                         };
                         let first_load = matches!(v.state, LogState::Loading);
-                        let was_at_bottom = v.scroll >= max_scroll(&v.state, viewport);
-                        let target = if first_load {
-                            initial_scroll(&lines, live)
-                        } else if live && was_at_bottom {
-                            usize::MAX // on suit la fin d'un job en cours
+                        let was_at_bottom = v.scroll >= v.max_scroll(w, h);
+                        let start = if first_load {
+                            initial_line(&lines, live)
                         } else {
-                            v.scroll
+                            None
                         };
                         v.notice = notice;
-                        v.state = LogState::Ready(lines);
-                        v.scroll = target.min(max_scroll(&v.state, viewport));
+                        v.set_lines(lines);
+                        v.scroll = match start {
+                            // À l'ouverture : l'étape en échec, ou la fin d'un job en cours.
+                            Some(Start::Line(i)) => v.row_of_line(w, i),
+                            Some(Start::End) => usize::MAX,
+                            None if first_load => 0,
+                            // Ensuite : on suit la fin d'un job en cours si on y était.
+                            None if live && was_at_bottom => usize::MAX,
+                            None => v.scroll,
+                        }
+                        .min(v.max_scroll(w, h));
                     }
                     Err(e) => {
                         let ready = self
@@ -399,7 +386,7 @@ fn flatten(log: &JobLog) -> Vec<LogLine> {
     for step in &log.steps {
         out.push(LogLine {
             kind: LineKind::Step(step.status),
-            text: step.name.clone(),
+            text: format!("▸ {}", step.name),
         });
         out.extend(step.lines.iter().map(|l| LogLine {
             kind: LineKind::Text,
@@ -409,26 +396,19 @@ fn flatten(log: &JobLog) -> Vec<LogLine> {
     out
 }
 
-fn max_scroll(state: &LogState, viewport: usize) -> usize {
-    match state {
-        LogState::Ready(lines) => lines.len().saturating_sub(viewport),
-        _ => 0,
-    }
+enum Start {
+    Line(usize),
+    End,
 }
 
 /// Où se placer à l'ouverture : sur la première étape en échec (c'est là qu'on cherche),
-/// sinon en bas si le job tourne encore, sinon en haut.
-fn initial_scroll(lines: &[LogLine], live: bool) -> usize {
-    if let Some(i) = lines
+/// sinon en bas si le job tourne encore, sinon en haut (`None`).
+fn initial_line(lines: &[LogLine], live: bool) -> Option<Start> {
+    lines
         .iter()
         .position(|l| l.kind == LineKind::Step(Status::Failure))
-    {
-        i
-    } else if live {
-        usize::MAX
-    } else {
-        0
-    }
+        .map(Start::Line)
+        .or(live.then_some(Start::End))
 }
 
 fn clamp_step(idx: usize, len: usize, delta: isize) -> usize {
@@ -614,6 +594,92 @@ mod tests {
         // Un rafraîchissement sans réserve l'efface
         deliver(&mut a, 7, Ok(JobLog::default()));
         assert_eq!(a.logs.as_ref().unwrap().notice, None);
+    }
+
+    fn long_log() -> JobLog {
+        JobLog {
+            steps: vec![smithy_core::StepLog {
+                name: "s".into(),
+                status: Status::Success,
+                lines: vec!["x".repeat(25), "fin".into()],
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn retour_a_la_ligne_agrandit_le_defilement() {
+        let mut a = app_on_run(Status::Success);
+        a.viewport.set(3);
+        a.viewport_width.set(10);
+        a.open_logs();
+        deliver(&mut a, 7, Ok(long_log())); // « ▸ s », 25 x, « fin » : 3 lignes
+        a.logs_bottom();
+        assert_eq!(a.logs.as_ref().unwrap().scroll, 0, "tout tient sans repli");
+
+        a.logs_toggle_wrap();
+        assert!(a.logs.as_ref().unwrap().wrap);
+        a.logs_bottom(); // 1 + 3 (25 caractères sur 10 colonnes) + 1 = 5 lignes d'écran
+        assert_eq!(a.logs.as_ref().unwrap().scroll, 2);
+        let v = a.logs.as_ref().unwrap();
+        assert_eq!(v.window(10, 3).last().map(|r| r.text), Some("fin"));
+
+        a.logs_toggle_wrap();
+        assert!(!a.logs.as_ref().unwrap().wrap);
+    }
+
+    #[test]
+    fn le_retour_a_la_ligne_survit_au_rafraichissement() {
+        let mut a = app_on_run(Status::Success);
+        a.viewport.set(3);
+        a.viewport_width.set(10);
+        a.open_logs();
+        deliver(&mut a, 7, Ok(long_log()));
+        a.logs_toggle_wrap();
+        deliver(&mut a, 7, Ok(long_log()));
+        assert!(a.logs.as_ref().unwrap().wrap);
+    }
+
+    #[test]
+    fn un_job_en_cours_suit_la_fin_en_mode_replie() {
+        let mut a = app_on_run(Status::Running);
+        a.viewport.set(3);
+        a.viewport_width.set(10);
+        a.open_logs();
+        deliver(&mut a, 7, Ok(long_log()));
+        a.logs_toggle_wrap();
+        a.logs_bottom();
+        let more = JobLog {
+            steps: vec![smithy_core::StepLog {
+                name: "s".into(),
+                status: Status::Running,
+                lines: vec!["x".repeat(25), "fin".into(), "encore".into()],
+            }],
+            ..Default::default()
+        };
+        deliver(&mut a, 7, Ok(more));
+        let v = a.logs.as_ref().unwrap();
+        assert_eq!(v.window(10, 3).last().map(|r| r.text), Some("encore"));
+    }
+
+    #[test]
+    fn le_choix_de_repli_est_garde_pour_les_vues_suivantes() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        assert!(!a.logs.as_ref().unwrap().wrap, "désactivé par défaut");
+        a.logs_toggle_wrap();
+        a.close_logs();
+        a.open_logs();
+        assert!(a.logs.as_ref().unwrap().wrap, "conservé à la réouverture");
+        a.logs_toggle_wrap();
+        a.close_logs();
+        a.open_logs();
+        assert!(!a.logs.as_ref().unwrap().wrap);
+    }
+
+    #[test]
+    fn bascule_sans_vue_ouverte() {
+        App::new().logs_toggle_wrap();
     }
 
     #[test]
