@@ -1,4 +1,5 @@
 mod app;
+mod browser;
 mod config;
 mod logview;
 mod session;
@@ -19,6 +20,7 @@ use smithy_forgejo::Forgejo;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use app::{App, Msg};
+use browser::{Browser, FILE_LIMIT_BYTES, Request, Screen};
 use config::{Server, ServerKind};
 use session::{Session, SessionStore};
 
@@ -86,6 +88,119 @@ fn fetch_logs<P: Provider + 'static>(
     });
 }
 
+/// Touches de l'explorateur de code : un écran à la fois (dossier, sélecteur de branche, fichier).
+fn browser_key(app: &mut App, code: KeyCode) {
+    let Some(screen) = app.browser.as_ref().map(Browser::screen) else {
+        return;
+    };
+    match screen {
+        Screen::File => match code {
+            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
+                if let Some(b) = app.browser.as_mut() {
+                    b.up();
+                }
+            }
+            KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
+            KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
+            KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
+            KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
+            KeyCode::Char('g') | KeyCode::Home => app.text_top(),
+            KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
+            KeyCode::Char('w') => app.text_toggle_wrap(),
+            KeyCode::Char('r') => {
+                if let Some(b) = app.browser.as_mut() {
+                    b.refresh();
+                }
+            }
+            _ => {}
+        },
+        Screen::Branches => {
+            let Some(b) = app.browser.as_mut() else {
+                return;
+            };
+            match code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    b.back();
+                }
+                KeyCode::Char('j') | KeyCode::Down => b.move_selection(1),
+                KeyCode::Char('k') | KeyCode::Up => b.move_selection(-1),
+                KeyCode::Home | KeyCode::Char('g') => b.select_first(),
+                KeyCode::End | KeyCode::Char('G') => b.select_last(),
+                KeyCode::Enter | KeyCode::Right => b.enter(),
+                KeyCode::Char('r') => b.refresh(),
+                _ => {}
+            }
+        }
+        Screen::Dir => match code {
+            KeyCode::Esc | KeyCode::Char('q') => {
+                if app.browser.as_mut().is_some_and(Browser::back) {
+                    app.close_browser();
+                }
+            }
+            KeyCode::PageDown | KeyCode::Char('f') => app.browser_page(1),
+            KeyCode::PageUp | KeyCode::Char('b') => app.browser_page(-1),
+            _ => {
+                let Some(b) = app.browser.as_mut() else {
+                    return;
+                };
+                match code {
+                    KeyCode::Char('j') | KeyCode::Down => b.move_selection(1),
+                    KeyCode::Char('k') | KeyCode::Up => b.move_selection(-1),
+                    KeyCode::Home | KeyCode::Char('g') => b.select_first(),
+                    KeyCode::End | KeyCode::Char('G') => b.select_last(),
+                    KeyCode::Enter | KeyCode::Right => b.enter(),
+                    KeyCode::Left | KeyCode::Backspace => b.up(),
+                    KeyCode::Char('B') => b.open_branches(),
+                    KeyCode::Char('r') => b.refresh(),
+                    _ => {}
+                }
+            }
+        },
+    }
+}
+
+/// Lance une requête de l'explorateur ; la réponse revient par le canal comme les autres.
+fn run_request<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>, req: Request) {
+    let (p, tx) = (p.clone(), tx.clone());
+    tokio::spawn(async move {
+        let msg = match req {
+            Request::Branches(repo) => {
+                let result = p.list_branches(&repo).await;
+                Msg::Branches { repo, result }
+            }
+            Request::Dir {
+                repo,
+                reference,
+                path,
+            } => {
+                let result = p.read_dir(&repo, &reference, &path).await;
+                Msg::Dir {
+                    repo,
+                    reference,
+                    path,
+                    result,
+                }
+            }
+            Request::File {
+                repo,
+                reference,
+                path,
+            } => {
+                let result = p
+                    .read_file(&repo, &reference, &path, FILE_LIMIT_BYTES)
+                    .await;
+                Msg::File {
+                    repo,
+                    reference,
+                    path,
+                    result,
+                }
+            }
+        };
+        let _ = tx.send(msg);
+    });
+}
+
 /// Un seul mot de passe, jamais conservé : il donne le cookie de session et, au premier
 /// login seulement, un token. Si `known_token` existe déjà, on ne fait que renouveler le
 /// cookie : sinon chaque expiration de session laisserait un token de plus sur le compte.
@@ -142,6 +257,7 @@ async fn run(
     match &provider {
         Some(p) => {
             app.logs_supported = p.capabilities().logs;
+            app.browse_supported = p.capabilities().browse;
             fetch_repos(p, &tx);
         }
         None => app.open_login(&username),
@@ -183,23 +299,26 @@ async fn run(
                             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                                 app.close_logs()
                             }
-                            KeyCode::Char('j') | KeyCode::Down => app.logs_scroll(1),
-                            KeyCode::Char('k') | KeyCode::Up => app.logs_scroll(-1),
-                            KeyCode::Char(' ') => app.logs_toggle_section(),
-                            KeyCode::Right => app.logs_select_section(1),
-                            KeyCode::Left => app.logs_select_section(-1),
-                            KeyCode::Char('a') => app.logs_toggle_all(),
-                            KeyCode::PageDown | KeyCode::Char('f') => app.logs_page(1),
-                            KeyCode::PageUp | KeyCode::Char('b') => app.logs_page(-1),
-                            KeyCode::Char('g') | KeyCode::Home => app.logs_top(),
-                            KeyCode::Char('G') | KeyCode::End => app.logs_bottom(),
-                            KeyCode::Char('w') => app.logs_toggle_wrap(),
+                            KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
+                            KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
+                            KeyCode::Char(' ') => app.text_toggle_section(),
+                            KeyCode::Right => app.text_select_section(1),
+                            KeyCode::Left => app.text_select_section(-1),
+                            KeyCode::Char('a') => app.text_toggle_all(),
+                            KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
+                            KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
+                            KeyCode::Char('g') | KeyCode::Home => app.text_top(),
+                            KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
+                            KeyCode::Char('w') => app.text_toggle_wrap(),
                             KeyCode::Char('r') => need_logs = app.refetch_logs(),
                             _ => {}
                         }
+                    } else if app.browser.is_some() {
+                        browser_key(&mut app, k.code);
                     } else {
                         match k.code {
                             KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                            KeyCode::Char('e') => app.open_browser(),
                             KeyCode::Char('j') | KeyCode::Down => need_pipelines = app.step(1),
                             KeyCode::Char('k') | KeyCode::Up => need_pipelines = app.step(-1),
                             KeyCode::Tab => app.toggle_focus(),
@@ -225,6 +344,7 @@ async fn run(
                     if let Some(token) = server.token.clone().or_else(|| session.token.clone()) {
                         let p = build_provider(&server, token, session.cookies.clone());
                         app.logs_supported = p.capabilities().logs;
+                        app.browse_supported = p.capabilities().browse;
                         provider = Some(p);
                         need_repos = true;
                         // Des logs étaient demandés quand la session a expiré : on les relance.
@@ -263,6 +383,9 @@ async fn run(
             }
             if let Some(req) = need_logs {
                 fetch_logs(p, &tx, req);
+            }
+            for req in app.take_requests() {
+                run_request(p, &tx, req);
             }
         }
     }

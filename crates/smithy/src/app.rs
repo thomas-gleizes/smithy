@@ -2,14 +2,33 @@
 
 use std::cell::Cell;
 
-use smithy_core::{Error, JobLog, Pipeline, Repo, Status};
+use smithy_core::{Branch, Entry, Error, FileContent, JobLog, Pipeline, Repo, Status};
 
 use crate::{
-    logview::{LogState, LogView, Start},
+    browser::{Browser, Mode, Request},
+    logview::{LogState, LogView, Start, TextView},
     session::Session,
 };
 
 pub enum Msg {
+    /// Explorateur : branches, contenu d'un dossier, contenu d'un fichier. Chaque réponse porte
+    /// ce qu'on a demandé, pour que l'explorateur écarte celles qui sont devenues périmées.
+    Branches {
+        repo: Repo,
+        result: Result<Vec<Branch>, Error>,
+    },
+    Dir {
+        repo: Repo,
+        reference: String,
+        path: String,
+        result: Result<Vec<Entry>, Error>,
+    },
+    File {
+        repo: Repo,
+        reference: String,
+        path: String,
+        result: Result<FileContent, Error>,
+    },
     /// Logs d'un job ; `pipeline_id` sert à ignorer une réponse périmée.
     Logs {
         repo: Repo,
@@ -63,6 +82,10 @@ pub struct App {
     pub logs: Option<LogView>,
     /// Le backend sait-il fournir des logs ? (`Capabilities::logs`)
     pub logs_supported: bool,
+    /// Explorateur de code ouvert sur le dépôt sélectionné, le cas échéant (jamais avec `logs`).
+    pub browser: Option<Browser>,
+    /// Le backend sait-il parcourir le code ? (`Capabilities::browse`)
+    pub browse_supported: bool,
     /// Dernier choix de retour à la ligne, appliqué aux vues de logs suivantes (le temps de la session).
     pub logs_wrap: bool,
     /// Hauteur et largeur utiles de la vue des logs, écrites par le rendu qui seul les connaît.
@@ -84,6 +107,8 @@ impl App {
             server_label: String::new(),
             logs: None,
             logs_supported: false,
+            browser: None,
+            browse_supported: false,
             logs_wrap: false,
             viewport: Cell::new(20),
             viewport_width: Cell::new(80),
@@ -107,6 +132,48 @@ impl App {
         view.wrap = self.logs_wrap;
         self.logs = Some(view);
         Some((repo, pipeline))
+    }
+
+    /// Touche `e` : explore le code du dépôt sélectionné.
+    pub fn open_browser(&mut self) {
+        if !self.browse_supported {
+            self.error = Some("ce backend ne permet pas d'explorer le code".to_owned());
+            return;
+        }
+        if let Some(repo) = self.selected_repo().cloned() {
+            self.browser = Some(Browser::open(repo));
+        }
+    }
+
+    pub fn close_browser(&mut self) {
+        self.browser = None;
+    }
+
+    /// Requêtes que l'explorateur demande de lancer.
+    pub fn take_requests(&mut self) -> Vec<Request> {
+        self.browser
+            .as_mut()
+            .map(Browser::take_requests)
+            .unwrap_or_default()
+    }
+
+    /// Page précédente (`-1`) ou suivante (`1`) de la liste de l'explorateur.
+    pub fn browser_page(&mut self, pages: isize) {
+        let page = self.viewport.get().saturating_sub(1).max(1) as isize;
+        if let Some(b) = self.browser.as_mut() {
+            b.move_selection(pages * page);
+        }
+    }
+
+    /// Le volet de texte à l'écran : la sortie d'un job, ou le fichier ouvert dans l'explorateur.
+    fn active_text_mut(&mut self) -> Option<&mut TextView> {
+        if let Some(b) = self.browser.as_mut() {
+            return match &mut b.mode {
+                Mode::File(fv) => Some(&mut fv.text),
+                _ => None,
+            };
+        }
+        self.logs.as_deref_mut()
     }
 
     pub fn close_logs(&mut self) {
@@ -138,62 +205,62 @@ impl App {
         (self.viewport_width.get().max(1), self.viewport.get().max(1))
     }
 
-    pub fn logs_scroll(&mut self, delta: isize) {
+    pub fn text_scroll(&mut self, delta: isize) {
         let (w, h) = self.view_size();
-        if let Some(v) = self.logs.as_mut() {
+        if let Some(v) = self.active_text_mut() {
             let max = v.max_scroll(w, h);
             let row = v.scroll.saturating_add_signed(delta);
             v.scroll_to_row(row, max);
         }
     }
 
-    pub fn logs_page(&mut self, pages: isize) {
+    pub fn text_page(&mut self, pages: isize) {
         let page = self.viewport.get().saturating_sub(1).max(1) as isize;
-        self.logs_scroll(pages * page);
+        self.text_scroll(pages * page);
     }
 
-    pub fn logs_top(&mut self) {
-        if let Some(v) = self.logs.as_mut() {
+    pub fn text_top(&mut self) {
+        if let Some(v) = self.active_text_mut() {
             v.scroll_to_row(0, 0);
         }
     }
 
-    pub fn logs_bottom(&mut self) {
+    pub fn text_bottom(&mut self) {
         let (w, h) = self.view_size();
-        if let Some(v) = self.logs.as_mut() {
+        if let Some(v) = self.active_text_mut() {
             let max = v.max_scroll(w, h);
             v.scroll_to_row(max, max);
         }
     }
 
     /// Espace : plie ou déplie la section (l'étape) en haut de l'écran.
-    pub fn logs_toggle_section(&mut self) {
+    pub fn text_toggle_section(&mut self) {
         let (w, h) = self.view_size();
-        if let Some(v) = self.logs.as_mut() {
+        if let Some(v) = self.active_text_mut() {
             v.toggle_section(w, h);
         }
     }
 
     /// Flèches droite / gauche : section suivante (`1`) ou précédente (`-1`).
-    pub fn logs_select_section(&mut self, delta: isize) {
+    pub fn text_select_section(&mut self, delta: isize) {
         let (w, h) = self.view_size();
-        if let Some(v) = self.logs.as_mut() {
+        if let Some(v) = self.active_text_mut() {
             v.select_section(delta, w, h);
         }
     }
 
     /// Touche `a` : tout déplier, ou tout plier si tout est déjà déplié.
-    pub fn logs_toggle_all(&mut self) {
+    pub fn text_toggle_all(&mut self) {
         let (w, h) = self.view_size();
-        if let Some(v) = self.logs.as_mut() {
+        if let Some(v) = self.active_text_mut() {
             v.toggle_all(w, h);
         }
     }
 
     /// Retour à la ligne (touche `w`) : la même ligne de log reste en haut de l'écran.
-    pub fn logs_toggle_wrap(&mut self) {
+    pub fn text_toggle_wrap(&mut self) {
         let (w, h) = self.view_size();
-        if let Some(v) = self.logs.as_mut() {
+        if let Some(v) = self.active_text_mut() {
             v.toggle_wrap(w, h);
             self.logs_wrap = v.wrap;
         }
@@ -298,6 +365,34 @@ impl App {
     /// pipelines du dépôt sélectionné.
     pub fn apply(&mut self, msg: Msg) -> bool {
         match msg {
+            Msg::Branches { repo, result } => {
+                if let Some(b) = self.browser.as_mut() {
+                    b.on_branches(&repo, result);
+                }
+                false
+            }
+            Msg::Dir {
+                repo,
+                reference,
+                path,
+                result,
+            } => {
+                if let Some(b) = self.browser.as_mut() {
+                    b.on_dir(&repo, &reference, &path, result);
+                }
+                false
+            }
+            Msg::File {
+                repo,
+                reference,
+                path,
+                result,
+            } => {
+                if let Some(b) = self.browser.as_mut() {
+                    b.on_file(&repo, &reference, &path, result);
+                }
+                false
+            }
             Msg::Logs {
                 repo,
                 pipeline_id,
@@ -405,6 +500,7 @@ fn clamp_step(idx: usize, len: usize, delta: isize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::browser::Mode;
     use crate::logview::{LineKind, LogLine};
     use smithy_core::Status;
 
@@ -544,7 +640,7 @@ mod tests {
         deliver(&mut a, 7, Ok(log(20)));
         deliver(&mut a, 7, Ok(log(30))); // on était en bas : on suit
         assert_eq!(a.logs.as_ref().unwrap().scroll, 31 - 5);
-        a.logs_scroll(-3);
+        a.text_scroll(-3);
         let pos = a.logs.as_ref().unwrap().scroll;
         deliver(&mut a, 7, Ok(log(40))); // on a remonté : on reste
         assert_eq!(a.logs.as_ref().unwrap().scroll, pos);
@@ -602,17 +698,17 @@ mod tests {
         a.viewport_width.set(10);
         a.open_logs();
         deliver(&mut a, 7, Ok(long_log())); // « ▸ s », 25 x, « fin » : 3 lignes
-        a.logs_bottom();
+        a.text_bottom();
         assert_eq!(a.logs.as_ref().unwrap().scroll, 0, "tout tient sans repli");
 
-        a.logs_toggle_wrap();
+        a.text_toggle_wrap();
         assert!(a.logs.as_ref().unwrap().wrap);
-        a.logs_bottom(); // 1 + 3 (25 caractères sur 10 colonnes) + 1 = 5 lignes d'écran
+        a.text_bottom(); // 1 + 3 (25 caractères sur 10 colonnes) + 1 = 5 lignes d'écran
         assert_eq!(a.logs.as_ref().unwrap().scroll, 2);
         let v = a.logs.as_ref().unwrap();
         assert_eq!(v.window(10, 3).last().map(|r| r.text), Some("fin"));
 
-        a.logs_toggle_wrap();
+        a.text_toggle_wrap();
         assert!(!a.logs.as_ref().unwrap().wrap);
     }
 
@@ -623,7 +719,7 @@ mod tests {
         a.viewport_width.set(10);
         a.open_logs();
         deliver(&mut a, 7, Ok(long_log()));
-        a.logs_toggle_wrap();
+        a.text_toggle_wrap();
         deliver(&mut a, 7, Ok(long_log()));
         assert!(a.logs.as_ref().unwrap().wrap);
     }
@@ -635,8 +731,8 @@ mod tests {
         a.viewport_width.set(10);
         a.open_logs();
         deliver(&mut a, 7, Ok(long_log()));
-        a.logs_toggle_wrap();
-        a.logs_bottom();
+        a.text_toggle_wrap();
+        a.text_bottom();
         let more = JobLog {
             steps: vec![smithy_core::StepLog {
                 name: "s".into(),
@@ -655,11 +751,11 @@ mod tests {
         let mut a = app_on_run(Status::Success);
         a.open_logs();
         assert!(!a.logs.as_ref().unwrap().wrap, "désactivé par défaut");
-        a.logs_toggle_wrap();
+        a.text_toggle_wrap();
         a.close_logs();
         a.open_logs();
         assert!(a.logs.as_ref().unwrap().wrap, "conservé à la réouverture");
-        a.logs_toggle_wrap();
+        a.text_toggle_wrap();
         a.close_logs();
         a.open_logs();
         assert!(!a.logs.as_ref().unwrap().wrap);
@@ -685,36 +781,182 @@ mod tests {
         // Ouvert sur l'étape en échec (la réussie est repliée au-dessus)
         assert_eq!(a.logs.as_ref().unwrap().scroll, 1);
         assert_eq!(view(&a), ["▾ Tests", "Tests 1", "Tests 2"]);
-        a.logs_scroll(-1);
+        a.text_scroll(-1);
         assert_eq!(view(&a)[0], "▸ Set up job (9 lignes)");
-        a.logs_toggle_section(); // déplier « Set up job »
+        a.text_toggle_section(); // déplier « Set up job »
         assert_eq!(view(&a)[1], "Set up job 1");
         assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
-        a.logs_toggle_section(); // et la replier
+        a.text_toggle_section(); // et la replier
         assert_eq!(view(&a)[0], "▸ Set up job (9 lignes)");
         // `a` : tout déplier (une étape est repliée), puis tout replier
-        a.logs_toggle_all();
+        a.text_toggle_all();
         assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
-        a.logs_toggle_all();
+        a.text_toggle_all();
         assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 2);
         // Flèches : on atteint l'autre section sans défiler (tout tient presque à l'écran)
         a.viewport.set(10); // tout est replié (dernier `a`) et tient à l'écran
-        a.logs_select_section(1);
-        a.logs_toggle_section();
+        a.text_select_section(1);
+        a.text_toggle_section();
         assert_eq!(a.logs.as_ref().unwrap().window(80, 10)[2].text, "Tests 1");
-        a.logs_select_section(-1);
-        a.logs_toggle_section();
+        a.text_select_section(-1);
+        a.text_toggle_section();
         assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
         // Aucune vue ouverte : sans effet
         let mut none = App::new();
-        none.logs_toggle_section();
-        none.logs_toggle_all();
-        none.logs_select_section(1);
+        none.text_toggle_section();
+        none.text_toggle_all();
+        none.text_select_section(1);
+    }
+
+    // --- explorateur de code
+
+    use smithy_core::{Branch, Entry, EntryKind};
+
+    fn explorer() -> App {
+        let mut a = app_on_run(Status::Success);
+        a.browse_supported = true;
+        a.open_browser();
+        a
+    }
+
+    fn feed(a: &mut App) {
+        let r = repo("a");
+        a.apply(Msg::Branches {
+            repo: r.clone(),
+            result: Ok(vec![Branch {
+                name: "main".into(),
+                default: true,
+            }]),
+        });
+        a.apply(Msg::Dir {
+            repo: r,
+            reference: "main".into(),
+            path: String::new(),
+            result: Ok(vec![
+                Entry {
+                    name: "src".into(),
+                    path: "src".into(),
+                    kind: EntryKind::Dir,
+                    size: 0,
+                },
+                Entry {
+                    name: "a.txt".into(),
+                    path: "a.txt".into(),
+                    kind: EntryKind::File,
+                    size: 3,
+                },
+            ]),
+        });
+    }
+
+    #[test]
+    fn ouverture_de_l_explorateur_et_file_de_requetes() {
+        let mut a = explorer();
+        assert!(a.browser.is_some());
+        let reqs = a.take_requests();
+        assert_eq!(reqs, [crate::browser::Request::Branches(repo("a"))]);
+        assert!(a.take_requests().is_empty(), "la file est vidée");
+        feed(&mut a);
+        let reqs = a.take_requests();
+        assert!(
+            matches!(&reqs[..], [crate::browser::Request::Dir { reference, .. }] if reference == "main")
+        );
+        a.close_browser();
+        assert!(a.browser.is_none());
+        assert!(
+            a.take_requests().is_empty(),
+            "sans explorateur, rien à demander"
+        );
+    }
+
+    #[test]
+    fn explorateur_refuse_si_le_backend_ne_sait_pas() {
+        let mut a = app_on_run(Status::Success);
+        a.open_browser();
+        assert!(a.browser.is_none());
+        assert!(a.error.is_some());
+        let mut none = App::new();
+        none.browse_supported = true;
+        none.open_browser(); // aucun dépôt sélectionné
+        assert!(none.browser.is_none());
+    }
+
+    #[test]
+    fn les_reponses_sans_explorateur_sont_ignorees() {
+        let mut a = app_on_run(Status::Success);
+        feed(&mut a);
+        a.apply(Msg::File {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "a.txt".into(),
+            result: Err(Error::Network("x".into())),
+        });
+        assert!(a.browser.is_none());
+    }
+
+    #[test]
+    fn fichier_de_l_explorateur_defile_et_se_replie() {
+        let mut a = explorer();
+        feed(&mut a);
+        a.viewport.set(3);
+        a.viewport_width.set(10);
+        {
+            let b = a.browser.as_mut().unwrap();
+            b.move_selection(1); // « a.txt » (dossiers d'abord)
+            b.enter();
+        }
+        a.apply(Msg::File {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "a.txt".into(),
+            result: Ok(FileContent {
+                size: 40,
+                text: Some(format!("{}\nfin\n", "x".repeat(25))),
+                truncated: false,
+            }),
+        });
+        let rows = |a: &App, w: usize| match &a.browser.as_ref().unwrap().mode {
+            Mode::File(fv) => fv.text.total_rows(w),
+            _ => 0,
+        };
+        assert_eq!(rows(&a, 10), 2, "sans repli : 2 lignes");
+        a.text_toggle_wrap();
+        assert_eq!(
+            rows(&a, 10),
+            4,
+            "25 caractères sur 10 colonnes : 3 lignes d'écran + « fin »"
+        );
+        assert!(a.logs_wrap, "le choix est partagé avec la vue des logs");
+        a.text_bottom();
+        let Mode::File(fv) = &a.browser.as_ref().unwrap().mode else {
+            panic!()
+        };
+        assert_eq!(fv.text.scroll, 1);
+        // Dans la liste d'un dossier, ces actions sont sans effet
+        a.browser.as_mut().unwrap().up();
+        a.text_scroll(5);
+        a.text_toggle_wrap();
+    }
+
+    #[test]
+    fn pages_de_l_explorateur() {
+        let mut a = explorer();
+        feed(&mut a);
+        a.viewport.set(1);
+        a.browser_page(1);
+        assert_eq!(
+            a.browser.as_ref().unwrap().selected,
+            1,
+            "une page = au moins 1 entrée"
+        );
+        a.browser_page(-1);
+        assert_eq!(a.browser.as_ref().unwrap().selected, 0);
+        App::new().browser_page(1);
     }
 
     #[test]
     fn bascule_sans_vue_ouverte() {
-        App::new().logs_toggle_wrap();
+        App::new().text_toggle_wrap();
     }
 
     #[test]
@@ -737,19 +979,19 @@ mod tests {
                 ..Default::default()
             }),
         ); // 20 lignes
-        a.logs_scroll(-1);
+        a.text_scroll(-1);
         assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
-        a.logs_scroll(100);
+        a.text_scroll(100);
         assert_eq!(a.logs.as_ref().unwrap().scroll, 15);
-        a.logs_top();
-        a.logs_page(1);
+        a.text_top();
+        a.text_page(1);
         assert_eq!(a.logs.as_ref().unwrap().scroll, 4, "une page = hauteur - 1");
-        a.logs_page(-5);
+        a.text_page(-5);
         assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
-        a.logs_bottom();
+        a.text_bottom();
         assert_eq!(a.logs.as_ref().unwrap().scroll, 15);
         // Pas de panique sans vue ni contenu
-        App::new().logs_scroll(3);
+        App::new().text_scroll(3);
     }
 
     #[test]

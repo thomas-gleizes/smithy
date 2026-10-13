@@ -1,6 +1,6 @@
 # smithy
 
-A terminal UI (TUI) to browse the CI of your git forges, written in Rust with [ratatui](https://ratatui.rs).
+A terminal UI (TUI) to browse the CI and the code of your git forges, written in Rust with [ratatui](https://ratatui.rs).
 
 Built for machines without a desktop (e.g. a server behind a VPN): a single static-ish binary, `rustls` only (no OpenSSL), read-only access.
 
@@ -10,6 +10,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 
 - List the repositories you can access and the latest CI runs of the selected one.
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
+- Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible.
 - Sign in from the TUI (username and password, entered once and never stored).
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
@@ -94,8 +95,24 @@ Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (dire
 | `j` / `k`, `↓` / `↑` | Move selection         |
 | `Tab`             | Switch panel              |
 | `Enter`           | Open the logs of the selected run (on the repository list: go to its runs) |
+| `e`               | Explore the code of the selected repository |
 | `r`               | Refresh                   |
 | `q`, `Esc`, `Ctrl+C` | Quit                   |
+
+In the code explorer:
+
+| Key                   | Action                          |
+|-----------------------|---------------------------------|
+| `j` / `k`, `↓` / `↑`  | Move the selection              |
+| `→` / `Enter`         | Open the folder or file         |
+| `←` / `Backspace`     | Go up one folder (or close the file) |
+| `PgDn` / `f`, `PgUp` / `b` | Page down / up             |
+| `g` / `Home`, `G` / `End` | First / last entry          |
+| `B`                   | Choose a branch (the default one comes first) |
+| `r`                   | Refresh                         |
+| `Esc`, `q`            | Close the file or the picker, then the explorer |
+
+A file opens in the same viewer as the logs: `j`/`k`, `f`/`b`, `g`/`G` and `w` (wrap) work the same way. Symbolic links and submodules are listed but not opened. The explorer only needs the read-only API token (no session cookie) and works on every Forgejo version from 10 to 15 (the content API is the same).
 
 In the log view:
 
@@ -141,6 +158,9 @@ A new forge is a new crate implementing `Provider`.
 - [ ] CI workflow running `make check`
 - [ ] Filters and search (status, branch, workflow, repository)
 - [x] Job steps and logs for Forgejo
+- [x] Code explorer (branches, folders, files)
+- [ ] Syntax highlighting in the explorer
+- [ ] File search by name in the explorer, tags and commits as references
 - [ ] Open the run URL from the TUI
 - [ ] GitHub backend (jobs and logs)
 - [x] Multiple instances in the config file (selection from the TUI still to come)

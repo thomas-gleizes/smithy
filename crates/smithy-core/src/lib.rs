@@ -119,16 +119,105 @@ pub fn clean_log_line(raw: &str) -> String {
     out
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Branch {
+    pub name: String,
+    /// Branche par défaut du dépôt.
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntryKind {
+    Dir,
+    File,
+    /// Lien symbolique : affiché, pas ouvert.
+    Symlink,
+    /// Sous-module : affiché, pas ouvert.
+    Submodule,
+}
+
+/// Une entrée d'un dossier du dépôt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Entry {
+    pub name: String,
+    /// Chemin depuis la racine du dépôt.
+    pub path: String,
+    pub kind: EntryKind,
+    /// Octets ; 0 pour un dossier.
+    pub size: u64,
+}
+
+/// Contenu d'un fichier, lu avec un plafond d'octets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileContent {
+    /// Taille réelle du fichier si le serveur l'a annoncée, sinon les octets lus.
+    pub size: u64,
+    /// `None` pour un fichier binaire (octet nul dans les premiers Kio).
+    pub text: Option<String>,
+    /// Seul le début a été lu (le plafond est atteint).
+    pub truncated: bool,
+}
+
+/// Rend une ligne de fichier affichable sans en perdre le contenu : retire le `\r` final d'une fin
+/// de ligne Windows, étend les tabulations, et montre chaque autre caractère de contrôle par son
+/// image Unicode (`\x1b` devient `␛`) au lieu de l'avaler ou de le laisser agir sur le terminal.
+/// À ne pas confondre avec [`clean_log_line`], qui garde ce qui suit le dernier `\r` (barres de
+/// progression) et supprimerait du contenu d'un fichier.
+pub fn clean_text_line(raw: &str) -> String {
+    let raw = raw.strip_suffix('\r').unwrap_or(raw);
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '\t' => out.push_str("    "),
+            '\x7f' => out.push('\u{2421}'),
+            c if (c as u32) < 0x20 => out.push(char::from_u32(0x2400 + c as u32).unwrap_or('?')),
+            // Contrôles C1 (0x80-0x9f) : certains terminaux les interprètent.
+            c if ('\u{80}'..='\u{9f}').contains(&c) => out.push('\u{fffd}'),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// Fonctionnalités optionnelles qu'un backend peut ou non offrir.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capabilities {
     pub logs: bool,
+    /// Branches, dossiers et fichiers du dépôt (l'explorateur).
+    pub browse: bool,
 }
 
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
     fn list_repos(&self) -> impl Future<Output = Result<Vec<Repo>>> + Send;
     fn list_pipelines(&self, repo: &Repo) -> impl Future<Output = Result<Vec<Pipeline>>> + Send;
+
+    /// Branches du dépôt, la par défaut en premier. Réservé aux backends dont
+    /// `capabilities().browse` est vrai, comme [`Provider::read_dir`] et [`Provider::read_file`].
+    fn list_branches(&self, _repo: &Repo) -> impl Future<Output = Result<Vec<Branch>>> + Send {
+        async { Err(Error::Unsupported("explorateur")) }
+    }
+
+    /// Contenu d'un dossier (`path` vide = racine) à une référence (branche, étiquette, commit).
+    fn read_dir(
+        &self,
+        _repo: &Repo,
+        _reference: &str,
+        _path: &str,
+    ) -> impl Future<Output = Result<Vec<Entry>>> + Send {
+        async { Err(Error::Unsupported("explorateur")) }
+    }
+
+    /// Un fichier, lu sur au plus `max_bytes` octets.
+    fn read_file(
+        &self,
+        _repo: &Repo,
+        _reference: &str,
+        _path: &str,
+        _max_bytes: usize,
+    ) -> impl Future<Output = Result<FileContent>> + Send {
+        async { Err(Error::Unsupported("explorateur")) }
+    }
 
     /// Étapes et sortie du job de `pipeline`. Réservé aux backends dont
     /// `capabilities().logs` est vrai.
@@ -144,6 +233,30 @@ pub trait Provider: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nettoyage_des_lignes_de_fichier() {
+        assert_eq!(clean_text_line("ligne\r"), "ligne", "fin de ligne Windows");
+        assert_eq!(clean_text_line("a\tb"), "a    b");
+        // Aucun contenu perdu : les contrôles deviennent visibles
+        assert_eq!(
+            clean_text_line("x\ry"),
+            "x\u{240d}y",
+            "\\r au milieu d'une ligne conservé"
+        );
+        assert_eq!(
+            clean_text_line("\x1b[31mrouge\x1b[0m"),
+            "\u{241b}[31mrouge\u{241b}[0m"
+        );
+        assert_eq!(
+            clean_text_line("a\0b\x07\x7f"),
+            "a\u{2400}b\u{2407}\u{2421}"
+        );
+        // Unicode, accents et espaces intacts
+        assert_eq!(clean_text_line("été — 日本語  "), "été — 日本語  ");
+        assert_eq!(clean_text_line(""), "");
+        assert_eq!(clean_text_line("\u{85}"), "\u{fffd}", "contrôle C1");
+    }
 
     #[test]
     fn nettoyage_des_lignes_de_log() {

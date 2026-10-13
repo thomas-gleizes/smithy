@@ -2,6 +2,7 @@
 //! `/repos/{o}/{r}/actions/tasks`. Les logs, eux, passent par les routes web (voir `logs`),
 //! qui demandent un cookie de session (voir `login`).
 
+mod browse;
 mod login;
 mod logs;
 mod version;
@@ -11,7 +12,10 @@ pub use version::{Decision, Flavor, Support, Version, decide};
 
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
-use smithy_core::{Capabilities, Error, JobLog, Pipeline, Provider, Repo, Result, Status};
+use smithy_core::{
+    Branch, Capabilities, Entry, Error, FileContent, JobLog, Pipeline, Provider, Repo, Result,
+    Status,
+};
 use std::collections::BTreeMap;
 
 const PAGE_SIZE: usize = 50;
@@ -178,7 +182,10 @@ impl From<ApiRun> for Pipeline {
 
 impl Provider for Forgejo {
     fn capabilities(&self) -> Capabilities {
-        Capabilities { logs: true }
+        Capabilities {
+            logs: true,
+            browse: true,
+        }
     }
 
     async fn list_repos(&self) -> Result<Vec<Repo>> {
@@ -214,6 +221,24 @@ impl Provider for Forgejo {
 
     async fn job_log(&self, repo: &Repo, pipeline: &Pipeline) -> Result<JobLog> {
         self.fetch_job_log(repo, pipeline).await
+    }
+
+    async fn list_branches(&self, repo: &Repo) -> Result<Vec<Branch>> {
+        self.fetch_branches(repo).await
+    }
+
+    async fn read_dir(&self, repo: &Repo, reference: &str, path: &str) -> Result<Vec<Entry>> {
+        self.fetch_dir(repo, reference, path).await
+    }
+
+    async fn read_file(
+        &self,
+        repo: &Repo,
+        reference: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> Result<FileContent> {
+        self.fetch_file(repo, reference, path, max_bytes).await
     }
 }
 

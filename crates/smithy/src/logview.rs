@@ -1,4 +1,5 @@
-//! Vue plein écran de la sortie d'un job : sections par étape, défilement et retour à la ligne.
+//! Volet de texte plein écran (`TextView`) : sections par étape, défilement et retour à la
+//! ligne. Il sert à la sortie d'un job (`LogView`) comme au contenu d'un fichier de l'explorateur.
 //!
 //! Le défilement se compte en **lignes d'écran** et non en lignes de log : une seule ligne
 //! (un blob JSON de 5000 caractères) peut dépasser la hauteur du terminal une fois repliée,
@@ -43,6 +44,43 @@ pub struct Row<'a> {
     pub continuation: bool,
     /// Titre de la section courante (celle que `Espace` plie ou déplie).
     pub current: bool,
+}
+
+impl Default for TextView {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Vue plein écran de la sortie d'un job : un volet de texte et le job qu'il montre.
+#[derive(Debug)]
+pub struct LogView {
+    pub repo: Repo,
+    pub pipeline: Pipeline,
+    view: TextView,
+}
+
+impl LogView {
+    pub fn new(repo: Repo, pipeline: Pipeline) -> Self {
+        Self {
+            repo,
+            pipeline,
+            view: TextView::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for LogView {
+    type Target = TextView;
+    fn deref(&self) -> &TextView {
+        &self.view
+    }
+}
+
+impl std::ops::DerefMut for LogView {
+    fn deref_mut(&mut self) -> &mut TextView {
+        &mut self.view
+    }
 }
 
 /// Où se placer à l'ouverture.
@@ -94,15 +132,13 @@ struct RowIndex {
     starts: Vec<usize>,
 }
 
-/// Vue plein écran de la sortie d'un job.
+/// Volet de texte : des lignes, éventuellement groupées en sections, et leur défilement.
 #[derive(Debug)]
-pub struct LogView {
-    pub repo: Repo,
-    pub pipeline: Pipeline,
+pub struct TextView {
     pub state: LogState,
     /// Première ligne d'écran affichée.
     pub scroll: usize,
-    /// Réserve du backend (ex. version du serveur non vérifiée).
+    /// Réserve à afficher à côté du texte (ex. version du serveur non vérifiée, fichier tronqué).
     pub notice: Option<String>,
     /// Retour à la ligne actif.
     pub wrap: bool,
@@ -114,11 +150,9 @@ pub struct LogView {
     index: RefCell<Option<RowIndex>>,
 }
 
-impl LogView {
-    pub fn new(repo: Repo, pipeline: Pipeline) -> Self {
+impl TextView {
+    pub fn new() -> Self {
         Self {
-            repo,
-            pipeline,
             state: LogState::Loading,
             scroll: 0,
             notice: None,
@@ -127,6 +161,23 @@ impl LogView {
             selected: None,
             index: RefCell::new(None),
         }
+    }
+
+    /// Texte sans section (un fichier) : les lignes telles quelles.
+    pub fn set_plain(&mut self, lines: Vec<String>) {
+        self.sections.clear();
+        self.selected = None;
+        self.state = LogState::Ready(
+            lines
+                .into_iter()
+                .map(|text| LogLine {
+                    kind: LineKind::Text,
+                    text,
+                    step: None,
+                })
+                .collect(),
+        );
+        *self.index.borrow_mut() = None;
     }
 
     /// Remplace le contenu. L'état plié/déplié des étapes déjà vues est conservé ; une étape
@@ -882,7 +933,8 @@ mod tests {
         let mut v = sectioned(&[("a", Status::Failure, 5), ("b", Status::Failure, 5)]);
         v.select_section(1, W, 3);
         assert_eq!(v.current_step(W), Some(1));
-        v.scroll_to_row(1, v.max_scroll(W, 3)); // l'utilisateur défile : on repart de la ligne du haut
+        let max = v.max_scroll(W, 3);
+        v.scroll_to_row(1, max); // l'utilisateur défile : on repart de la ligne du haut
         assert_eq!(v.current_step(W), Some(0));
     }
 

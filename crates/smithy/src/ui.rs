@@ -7,11 +7,12 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
     },
 };
-use smithy_core::Status;
+use smithy_core::{EntryKind, Status};
 
 use crate::{
     app::{App, Focus, LoginField, LoginForm},
-    logview::{LineKind, LogState, LogView},
+    browser::{Browser, DirState, Mode, fmt_size},
+    logview::{LineKind, LogState, LogView, TextView},
 };
 
 pub fn status_style(s: Status) -> (&'static str, Color) {
@@ -37,6 +38,8 @@ fn border(focused: bool) -> Style {
 pub fn draw(f: &mut Frame, app: &App) {
     if let Some(view) = &app.logs {
         draw_logs(f, app, view);
+    } else if let Some(b) = &app.browser {
+        draw_browser(f, app, b);
     } else {
         draw_lists(f, app);
     }
@@ -57,10 +60,17 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
         )),
         Span::styled(format!("{status} "), Style::new().fg(color)),
     ]);
+    draw_text_pane(f, app, rows[0], title, view);
+    draw_footer(f, app, rows[1], logs_help(f.area().width as usize), None);
+}
+
+/// Volet de texte plein cadre : sortie d'un job ou contenu d'un fichier, avec sa position et sa
+/// réserve éventuelle dans la bordure du bas.
+fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, view: &TextView) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow));
-    let inner = block.inner(rows[0]);
+    let inner = block.inner(area);
     let (width, height) = (inner.width as usize, inner.height as usize);
     // Le rendu seul connaît la taille utile : il la publie pour le défilement.
     app.viewport.set(height);
@@ -116,34 +126,237 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
             Style::new().fg(Color::Yellow),
         )));
     }
-    f.render_widget(Paragraph::new(body).block(block), rows[0]);
+    f.render_widget(Paragraph::new(body).block(block), area);
+}
 
-    let footer = match &app.error {
-        Some(e) => Line::from(Span::styled(
+/// Pied de page : l'erreur en rouge, sinon un message d'information en jaune, sinon l'aide.
+fn draw_footer(f: &mut Frame, app: &App, area: Rect, help: &str, info: Option<&str>) {
+    let footer = match (&app.error, info) {
+        (Some(e), _) => Line::from(Span::styled(
             format!("erreur : {e}"),
             Style::new().fg(Color::Red),
         )),
-        None => Line::from(Span::styled(
-            logs_help(f.area().width as usize),
+        (None, Some(i)) => Line::from(Span::styled(i.to_owned(), Style::new().fg(Color::Yellow))),
+        (None, None) => Line::from(Span::styled(
+            help.to_owned(),
             Style::new().fg(Color::DarkGray),
         )),
     };
-    f.render_widget(Paragraph::new(footer), rows[1]);
+    f.render_widget(Paragraph::new(footer), area);
 }
 
-/// Aide du pied de page, de la plus complète à la plus courte : la première qui tient.
-/// Tronquée, elle ferait disparaître justement les touches les moins connues.
+/// La première aide qui tient dans `width` colonnes ; tronquée, elle ferait disparaître
+/// justement les touches les moins connues. `variants` va de la plus complète à la plus courte.
+fn pick_help<'a>(width: usize, variants: &[&'a str]) -> &'a str {
+    variants
+        .iter()
+        .copied()
+        .find(|h| h.chars().count() <= width)
+        .unwrap_or("Esc")
+}
+
 fn logs_help(width: usize) -> &'static str {
-    [
-        "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
-        "j/k défiler · ←/→ section · Espace plier · a tout · w repli · Esc retour",
-        "←/→ · Espace plier · w repli · Esc retour",
-        "←/→ · Espace · w · Esc",
-        "Esc",
-    ]
-    .into_iter()
-    .find(|h| h.chars().count() <= width)
-    .unwrap_or("Esc")
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
+            "j/k défiler · ←/→ section · Espace plier · a tout · w repli · Esc retour",
+            "←/→ · Espace plier · w repli · Esc retour",
+            "←/→ · Espace · w · Esc",
+            "Esc",
+        ],
+    )
+}
+
+fn dir_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ naviguer · →/↵ ouvrir · ←/⌫ remonter · B branche · r actualiser · Esc retour",
+            "j/k · →/↵ ouvrir · ← remonter · B branche · Esc retour",
+            "→ ouvrir · ← haut · B branche · Esc",
+            "→ · ← · B · Esc",
+            "Esc",
+        ],
+    )
+}
+
+fn file_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · w retour à la ligne · r actualiser · Esc/← retour",
+            "j/k défiler · g/G · w retour à la ligne · Esc retour",
+            "j/k · w repli · Esc retour",
+            "w · Esc",
+            "Esc",
+        ],
+    )
+}
+
+fn branches_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &["j/k choisir · ↵ ouvrir · Esc annuler", "↵ · Esc", "Esc"],
+    )
+}
+
+/// Taille d'un octet à l'écran : `Nom` à gauche, `Taille` à droite.
+fn draw_browser(f: &mut Frame, app: &App, b: &Browser) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
+    let width = f.area().width as usize;
+    let reference = if b.reference.is_empty() {
+        "…"
+    } else {
+        &b.reference
+    };
+    if let Mode::File(fv) = &b.mode {
+        let title = Line::from(format!(
+            " Explorateur · {} @ {} · /{} ",
+            b.repo.full_name(),
+            reference,
+            fv.path
+        ));
+        draw_text_pane(f, app, rows[0], title, &fv.text);
+        draw_footer(f, app, rows[1], file_help(width), None);
+        return;
+    }
+    let title = format!(
+        " Explorateur · {} @ {} · /{} ",
+        b.repo.full_name(),
+        reference,
+        b.path
+    );
+    draw_dir(f, app, b, rows[0], title);
+    let help = if matches!(b.mode, Mode::Branches { .. }) {
+        branches_help(width)
+    } else {
+        dir_help(width)
+    };
+    draw_footer(f, app, rows[1], help, b.info.as_deref());
+    if let Mode::Branches { selected } = b.mode {
+        draw_branch_picker(f, b, selected);
+    }
+}
+
+fn draw_dir(f: &mut Frame, app: &App, b: &Browser, area: Rect, title: String) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(area);
+    // Une ligne d'en-tête : la hauteur utile pour la sélection en est réduite d'autant.
+    app.viewport.set((inner.height as usize).saturating_sub(1));
+    match &b.dir {
+        DirState::Loading => draw_message(f, area, block, "chargement…".to_owned(), Color::Cyan),
+        DirState::Failed(e) => draw_message(f, area, block, format!("erreur : {e}"), Color::Red),
+        DirState::Ready(entries) if entries.is_empty() => draw_message(
+            f,
+            area,
+            block,
+            if b.empty_repo {
+                "(dépôt vide : aucune branche)".to_owned()
+            } else {
+                "(dossier vide)".to_owned()
+            },
+            Color::DarkGray,
+        ),
+        DirState::Ready(entries) => {
+            let table_rows: Vec<Row> = entries
+                .iter()
+                .map(|e| {
+                    let (label, style) = match e.kind {
+                        EntryKind::Dir => (
+                            format!("▸ {}/", e.name),
+                            Style::new().fg(Color::Cyan).bold(),
+                        ),
+                        EntryKind::File => (format!("  {}", e.name), Style::new()),
+                        EntryKind::Symlink => (
+                            format!("  {} (lien)", e.name),
+                            Style::new().fg(Color::DarkGray),
+                        ),
+                        EntryKind::Submodule => (
+                            format!("  {} (sous-module)", e.name),
+                            Style::new().fg(Color::DarkGray),
+                        ),
+                    };
+                    let size = if e.kind == EntryKind::File {
+                        fmt_size(e.size)
+                    } else {
+                        String::new()
+                    };
+                    Row::new(vec![
+                        Cell::from(Span::styled(label, style)),
+                        Cell::from(Line::from(size).right_aligned()),
+                    ])
+                })
+                .collect();
+            let table = Table::new(table_rows, [Constraint::Min(10), Constraint::Length(10)])
+                .header(Row::new(["Nom", "Taille"]).style(Style::new().bold()))
+                .block(block.title_bottom(
+                    Line::from(format!(" {}/{} ", b.selected + 1, entries.len())).right_aligned(),
+                ))
+                .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+            // Le décalage est mémorisé d'une image à l'autre : sinon la sélection resterait
+            // collée au bas de l'écran à chaque déplacement vers le haut.
+            let mut ts = TableState::default().with_offset(b.list_offset.get());
+            ts.select(Some(b.selected));
+            f.render_stateful_widget(table, area, &mut ts);
+            b.list_offset.set(ts.offset());
+        }
+    }
+}
+
+/// Un message seul dans le cadre (chargement, erreur, dossier vide).
+fn draw_message(f: &mut Frame, area: Rect, block: Block, text: String, color: Color) {
+    let line = Line::from(Span::styled(text, Style::new().fg(color)));
+    f.render_widget(Paragraph::new(line).block(block), area);
+}
+
+fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
+    let (items, state): (Vec<ListItem>, bool) = match (&b.branches, &b.branches_error) {
+        (Some(list), _) => (
+            list.iter()
+                .map(|br| {
+                    let current = if br.name == b.reference { "● " } else { "  " };
+                    let default = if br.default { " (défaut)" } else { "" };
+                    ListItem::new(format!("{current}{}{default}", br.name))
+                })
+                .collect(),
+            true,
+        ),
+        (None, Some(e)) => (
+            vec![ListItem::new(Span::styled(
+                format!("erreur : {e}"),
+                Style::new().fg(Color::Red),
+            ))],
+            false,
+        ),
+        (None, None) => (
+            vec![ListItem::new(Span::styled(
+                "chargement…",
+                Style::new().fg(Color::Cyan),
+            ))],
+            false,
+        ),
+    };
+    let height = (items.len() as u16).clamp(1, 14) + 2;
+    let area = centered(f.area(), 56, height);
+    f.render_widget(Clear, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Branche ")
+                .border_style(Style::new().fg(Color::Yellow)),
+        )
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut ls = ListState::default().with_offset(b.picker_offset.get());
+    if state {
+        ls.select(Some(selected));
+    }
+    f.render_stateful_widget(list, area, &mut ls);
+    b.picker_offset.set(ls.offset());
 }
 
 fn draw_lists(f: &mut Frame, app: &App) {
@@ -227,7 +440,7 @@ fn draw_lists(f: &mut Frame, app: &App) {
         Line::from("")
     };
     let help = Line::from(Span::styled(
-        "j/k ↑/↓ naviguer · ↵ logs · tab changer de panneau · r rafraîchir · q quitter",
+        "j/k ↑/↓ naviguer · ↵ logs · e explorer le code · tab changer de panneau · r rafraîchir · q quitter",
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(vec![help, second]), rows[1]);
@@ -461,7 +674,7 @@ mod tests {
         let mut app = app_with_logs(LogState::Ready(lines));
         let _ = render(&app, 80, 12); // le rendu publie la hauteur utile (12 - 2 bordures - 1 pied)
         assert_eq!(app.viewport.get(), 9);
-        app.logs_scroll(20);
+        app.text_scroll(20);
         let text = render(&app, 80, 12);
         assert!(text.contains("ligne-21") && text.contains("ligne-29"));
         assert!(!text.contains("ligne-20") && !text.contains("ligne-30"));
@@ -527,6 +740,250 @@ mod tests {
         );
     }
 
+    // --- explorateur de code
+
+    use crate::browser::Browser;
+    use smithy_core::{Branch, Entry, FileContent};
+
+    fn tree_repo() -> Repo {
+        Repo {
+            owner: "smithy".into(),
+            name: "tree".into(),
+        }
+    }
+
+    fn explorer_app() -> App {
+        let mut app = App::new();
+        app.browse_supported = true;
+        app.apply(Msg::Repos(Ok(vec![tree_repo()])));
+        app.open_browser();
+        app
+    }
+
+    fn feed_dir(app: &mut App, path: &str, entries: Vec<Entry>) {
+        let b = app.browser.as_mut().unwrap();
+        b.on_branches(
+            &tree_repo(),
+            Ok(vec![
+                Branch {
+                    name: "main".into(),
+                    default: true,
+                },
+                Branch {
+                    name: "feature/x".into(),
+                    default: false,
+                },
+            ]),
+        );
+        b.on_dir(&tree_repo(), "main", path, Ok(entries));
+    }
+
+    fn e(name: &str, kind: EntryKind, size: u64) -> Entry {
+        Entry {
+            name: name.into(),
+            path: name.into(),
+            kind,
+            size,
+        }
+    }
+
+    fn browser(app: &App) -> &Browser {
+        app.browser.as_ref().unwrap()
+    }
+
+    #[test]
+    fn explorateur_liste_dossiers_puis_fichiers_avec_tailles() {
+        let mut app = explorer_app();
+        feed_dir(
+            &mut app,
+            "",
+            vec![
+                e("README.md", EntryKind::File, 1_536),
+                e("src", EntryKind::Dir, 0),
+                e("lien", EntryKind::Symlink, 4),
+                e("mod", EntryKind::Submodule, 0),
+            ],
+        );
+        let text = render(&app, 100, 14);
+        for needle in [
+            "Explorateur",
+            "smithy/tree @ main",
+            "▸ src/",
+            "README.md",
+            "1,5 Kio",
+            "lien (lien)",
+            "mod (sous-module)",
+            "Nom",
+            "Taille",
+            "1/4",
+        ] {
+            assert!(text.contains(needle), "absent : {needle}\n{text}");
+        }
+        let (src, readme) = (
+            text.find("▸ src/").unwrap(),
+            text.find("README.md").unwrap(),
+        );
+        assert!(src < readme, "les dossiers viennent d'abord");
+        assert!(text.contains("B branche"), "aide du dossier");
+        assert!(!text.contains("Logs ·"));
+    }
+
+    #[test]
+    fn explorateur_chemin_etats_et_messages() {
+        let mut app = explorer_app();
+        assert!(render(&app, 100, 10).contains("chargement"));
+        assert!(
+            render(&app, 100, 10).contains("@ …"),
+            "branche inconnue pendant le chargement"
+        );
+        feed_dir(&mut app, "", vec![]);
+        assert!(render(&app, 100, 10).contains("(dossier vide)"));
+        app.browser.as_mut().unwrap().empty_repo = true;
+        assert!(render(&app, 100, 10).contains("dépôt vide"));
+        let b = app.browser.as_mut().unwrap();
+        b.on_dir(
+            &tree_repo(),
+            "main",
+            "",
+            Err(smithy_core::Error::NotFound("x".into())),
+        );
+        assert!(render(&app, 100, 10).contains("erreur"));
+        // Message d'information (lien symbolique) : en pied de page à la place de l'aide
+        app.browser.as_mut().unwrap().info = Some("lien : lien symbolique, non ouvert".into());
+        let t = render(&app, 100, 10);
+        assert!(t.contains("non ouvert") && !t.contains("B branche"));
+    }
+
+    #[test]
+    fn explorateur_affiche_le_dossier_courant() {
+        let mut app = explorer_app();
+        feed_dir(&mut app, "", vec![e("src", EntryKind::Dir, 0)]);
+        {
+            let b = app.browser.as_mut().unwrap();
+            b.path = "src/deep".into();
+            b.on_dir(
+                &tree_repo(),
+                "main",
+                "src/deep",
+                Ok(vec![e("x.rs", EntryKind::File, 3)]),
+            );
+        }
+        assert!(render(&app, 100, 10).contains("@ main · /src/deep"));
+    }
+
+    #[test]
+    fn explorateur_selecteur_de_branche() {
+        let mut app = explorer_app();
+        feed_dir(&mut app, "", vec![e("a.txt", EntryKind::File, 1)]);
+        app.browser.as_mut().unwrap().open_branches();
+        let t = render(&app, 100, 14);
+        assert!(
+            t.contains("Branche") && t.contains("● main (défaut)") && t.contains("feature/x"),
+            "{t}"
+        );
+        assert!(t.contains("j/k choisir"));
+        // Liste pas encore chargée, puis en erreur
+        app.browser.as_mut().unwrap().branches = None;
+        assert!(render(&app, 100, 14).contains("chargement"));
+        app.browser.as_mut().unwrap().branches_error = Some("coupé".into());
+        assert!(render(&app, 100, 14).contains("erreur : coupé"));
+    }
+
+    #[test]
+    fn explorateur_beaucoup_de_branches_et_d_entrees_defilent() {
+        let mut app = explorer_app();
+        let entries: Vec<_> = (0..200)
+            .map(|i| e(&format!("f{i:03}.txt"), EntryKind::File, i))
+            .collect();
+        feed_dir(&mut app, "", entries);
+        for _ in 0..150 {
+            app.browser.as_mut().unwrap().move_selection(1);
+            render(&app, 80, 12);
+        }
+        let t = render(&app, 80, 12);
+        assert!(
+            t.contains("f150.txt") && !t.contains("f000.txt"),
+            "la sélection reste visible"
+        );
+        assert!(t.contains("151/200"));
+        // On remonte d'une entrée : la liste ne saute pas (décalage mémorisé)
+        let before = browser(&app).list_offset.get();
+        app.browser.as_mut().unwrap().move_selection(-1);
+        render(&app, 80, 12);
+        assert_eq!(browser(&app).list_offset.get(), before);
+    }
+
+    #[test]
+    fn explorateur_fichier() {
+        let mut app = explorer_app();
+        feed_dir(&mut app, "", vec![e("a.txt", EntryKind::File, 30)]);
+        app.browser.as_mut().unwrap().enter();
+        assert!(render(&app, 100, 10).contains("chargement"));
+        app.browser.as_mut().unwrap().on_file(
+            &tree_repo(),
+            "main",
+            "a.txt",
+            Ok(FileContent {
+                size: 3 * 1024 * 1024,
+                text: Some("première ligne\nseconde\n".into()),
+                truncated: true,
+            }),
+        );
+        let t = render(&app, 100, 10);
+        for needle in [
+            "a.txt",
+            "première ligne",
+            "seconde",
+            "⚠",
+            "tronqué",
+            "1-2/2",
+            "w retour à la ligne",
+        ] {
+            assert!(t.contains(needle), "absent : {needle}\n{t}");
+        }
+        assert!(!t.contains("Nom"), "plus de liste de dossier");
+        // Erreur, et très petits terminaux
+        app.browser.as_mut().unwrap().on_file(
+            &tree_repo(),
+            "main",
+            "a.txt",
+            Err(smithy_core::Error::Network("coupé".into())),
+        );
+        assert!(render(&app, 100, 10).contains("erreur : "));
+        for (w, h) in [(1, 1), (10, 3), (30, 4)] {
+            render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn explorateur_tres_petit_terminal() {
+        let mut app = explorer_app();
+        feed_dir(
+            &mut app,
+            "",
+            vec![e("a.txt", EntryKind::File, 1), e("d", EntryKind::Dir, 0)],
+        );
+        for (w, h) in [(1, 1), (5, 2), (12, 4)] {
+            render(&app, w, h);
+        }
+        app.browser.as_mut().unwrap().open_branches();
+        for (w, h) in [(1, 1), (8, 3), (20, 6)] {
+            render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn aides_de_l_explorateur_adaptees_a_la_largeur() {
+        for w in [120, 80, 50, 30, 12, 5, 0] {
+            for h in [dir_help(w), file_help(w), branches_help(w)] {
+                assert!(h.chars().count() <= w.max(3), "{h:?} dépasse {w}");
+                assert!(h.contains("Esc"));
+            }
+        }
+        assert!(dir_help(120).contains("B branche") && dir_help(120).contains("remonter"));
+        assert!(file_help(120).contains("w retour à la ligne"));
+    }
+
     #[test]
     fn aide_adaptee_a_la_largeur() {
         for width in [140, 120, 80, 50, 30, 12, 5, 0] {
@@ -555,7 +1012,7 @@ mod tests {
         );
         assert!(!off.contains('↩'));
 
-        app.logs_toggle_wrap(); // la largeur utile a été publiée par le rendu précédent
+        app.text_toggle_wrap(); // la largeur utile a été publiée par le rendu précédent
         let on = render(&app, 45, 12);
         assert!(
             on.contains("DEBUT") && on.contains("-FIN"),
