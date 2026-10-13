@@ -1,18 +1,31 @@
 #!/usr/bin/env bash
 # Boucle de test locale : Forgejo jetable + utilisateur + token + dépôt de démo.
 #   ./dev.sh up      démarre et initialise (idempotent), écrit dev/.env.local
+#                    (FORGEJO_VERSION=10 ./dev.sh up : autre version, isolée de la 15)
 #   ./dev.sh reset   détruit conteneur et volume
 #   ./dev.sh env     affiche SMITHY_URL / SMITHY_TOKEN
+#   ./dev.sh probe   seed + sonde des routes de logs (voir probe-logs.py), JSON sur stdout
 set -euo pipefail
 cd "$(dirname "$0")"
 
+# Autre version de Forgejo (FORGEJO_VERSION=10 ./dev.sh up) : projet Compose, volume, port
+# (3300 + majeure, ex. 3310) et fichier d'environnement propres, pour ne pas toucher à la
+# version par défaut. Le runner suit la version de Forgejo (RUNNER_VERSION pour forcer).
+DEFAULT_VERSION=15
+VERSION="${FORGEJO_VERSION:-$DEFAULT_VERSION}"
+if [[ "$VERSION" != "$DEFAULT_VERSION" ]]; then
+  export COMPOSE_PROJECT_NAME="smithy-dev-v${VERSION//[^A-Za-z0-9]/-}"
+  export FORGEJO_PORT="${FORGEJO_PORT:-$((3300 + ${VERSION%%.*}))}"
+  ENV_FILE=".env.v${VERSION}.local"
+else
+  ENV_FILE=".env.local"
+fi
 PORT="${FORGEJO_PORT:-3300}"
 URL="http://localhost:${PORT}"
 USER_NAME="smithy"
 USER_PASS="smithy-dev-password"
 REPO="demo"
 PRIVATE_REPO="secret"
-ENV_FILE=".env.local"
 
 fg() { docker compose exec -T -u git forgejo forgejo "$@"; }
 api() { curl -fsS -u "${USER_NAME}:${USER_PASS}" -H 'Content-Type: application/json' "$@"; }
@@ -118,10 +131,28 @@ jobs:
   echo "workflows poussés ; runs visibles sur ${URL}/${USER_NAME}/${REPO}/actions"
 }
 
+# Attend que les runs du dépôt privé soient terminés (3 jobs : build, test, big).
+wait_runs() {
+  local i
+  for i in $(seq 1 60); do
+    local n
+    n=$(curl -fsS -H "Authorization: token $(. "./$ENV_FILE"; echo "$SMITHY_TOKEN")" \
+      "${URL}/api/v1/repos/${USER_NAME}/${PRIVATE_REPO}/actions/tasks" 2>/dev/null |
+      python3 -c 'import sys,json; r=json.load(sys.stdin).get("workflow_runs",[]); print(sum(1 for x in r if x["status"] in ("success","failure")))' 2>/dev/null || echo 0)
+    [[ "$n" -ge 3 ]] && return 0
+    sleep 2
+  done
+  echo "runs non terminés après 120 s (runner incompatible avec cette version ?)" >&2
+  return 1
+}
+
 case "${1:-up}" in
   up) up ;;
   seed) seed ;;
   reset) docker compose down -v --remove-orphans; rm -f "$ENV_FILE" ;;
+  wait) wait_runs ;;
+  probe) seed >/dev/null && wait_runs && set -a && . "./$ENV_FILE" && set +a &&
+         python3 -I ./probe-logs.py "$SMITHY_URL" "$USER_NAME" "$USER_PASS" "$SMITHY_TOKEN" ;;
   env) cat "$ENV_FILE" ;;
-  *) echo "usage: $0 up|seed|reset|env" >&2; exit 2 ;;
+  *) echo "usage: $0 up|seed|reset|env|wait|probe" >&2; exit 2 ;;
 esac

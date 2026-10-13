@@ -87,9 +87,16 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
     };
     // La position va dans le cadre, à droite : le pied de page peut être tronqué
     // sur un terminal étroit, pas le cadre.
-    let block = block
+    let mut block = block
         .title(title)
         .title(Line::from(position).right_aligned());
+    if let Some(notice) = &view.notice {
+        // En bas du cadre, en jaune : visible sans prendre la place des logs.
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" ⚠ {notice} "),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
     f.render_widget(Paragraph::new(body).block(block), rows[0]);
 
     let footer = match &app.error {
@@ -439,6 +446,15 @@ mod tests {
         )]));
         render(&long, 12, 4);
         render(&long, 1, 1);
+    }
+
+    #[test]
+    fn reserve_de_version_affichee() {
+        let mut app = app_with_logs(LogState::Ready(vec![line(LineKind::Text, "ok")]));
+        app.logs.as_mut().unwrap().notice = Some("Forgejo 14.0.0 : version non vérifiée".into());
+        let text = render(&app, 100, 10);
+        assert!(text.contains("⚠") && text.contains("non vérifiée"));
+        assert!(!render(&app_with_logs(LogState::Loading), 100, 10).contains("⚠"));
     }
 
     #[test]

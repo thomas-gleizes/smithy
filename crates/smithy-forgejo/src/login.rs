@@ -50,36 +50,60 @@ pub async fn login(
         .expect("configuration du client HTTP statique et valide");
     let net = |e: reqwest::Error| Error::Network(e.without_url().to_string());
 
-    // 1. Cookie de session, via le formulaire web.
-    let resp = client
-        .post(format!("{base}/user/login"))
-        .form(&[
-            ("user_name", username),
-            ("password", password),
-            ("remember", "on"),
-        ])
+    // 1. Cookie de session, via le formulaire web. Forgejo 10 à 12 y mettent un jeton
+    //    CSRF (champ `_csrf` + cookie du même nom) ; la 15 n'en a pas. On fait comme
+    //    un navigateur : lire le formulaire, renvoyer ce qu'il contient.
+    let form_page = client
+        .get(format!("{base}/user/login"))
         .send()
         .await
         .map_err(net)?;
-    if !resp.status().is_redirection() {
-        // Un échec réaffiche le formulaire (200) au lieu de rediriger.
-        return match resp.status() {
-            StatusCode::OK => Err(Error::BadCredentials),
-            s => Err(Error::Network(format!("HTTP {s} sur /user/login"))),
-        };
+    let csrf_cookie = parse_cookies(form_page.headers()).remove("_csrf");
+    let form_html = form_page.text().await.map_err(net)?;
+    let csrf_field = form_html
+        .split("name=\"_csrf\" value=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .filter(|t| !t.is_empty());
+
+    let mut fields = vec![
+        ("user_name", username),
+        ("password", password),
+        ("remember", "on"),
+    ];
+    if let Some(t) = csrf_field {
+        fields.push(("_csrf", t));
     }
+    let mut req = client.post(format!("{base}/user/login")).form(&fields);
+    if let Some(c) = &csrf_cookie {
+        req = req.header(header::COOKIE, format!("_csrf={c}"));
+    }
+    let resp = req.send().await.map_err(net)?;
     let location = resp
         .headers()
         .get(header::LOCATION)
         .and_then(|v| v.to_str().ok())
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .to_owned();
+    // Un échec réaffiche le formulaire (200 en 15) ou y renvoie (303 en 10 à 12) :
+    // seule une redirection ailleurs que vers le login est un succès.
+    if !resp.status().is_redirection() || location.contains("/user/login") {
+        return match resp.status() {
+            s if s.is_redirection() || s == StatusCode::OK => Err(Error::BadCredentials),
+            s => Err(Error::Network(format!("HTTP {s} sur /user/login"))),
+        };
+    }
     if location.contains("two_factor") || location.contains("twofa") {
         return Err(Error::Unsupported("authentification à deux facteurs"));
     }
-    let cookies = parse_cookies(resp.headers());
-    if !cookies.contains_key("session") {
+    // Les noms varient selon la version (`session`, `i_like_gitea`, `gitea_incredible`…) :
+    // on garde tout, sauf la langue et le jeton CSRF, qui ne sont pas des identifiants.
+    let mut cookies = parse_cookies(resp.headers());
+    cookies.remove("_csrf");
+    cookies.remove("lang");
+    if cookies.is_empty() {
         return Err(Error::Decode(
-            "login accepté mais sans cookie de session".into(),
+            "login accepté mais aucun cookie de session reçu".into(),
         ));
     }
 
@@ -233,6 +257,62 @@ mod tests {
         );
     }
 
+    /// Forgejo 10 à 12 : jeton CSRF dans le formulaire et en cookie, échec en redirection.
+    async fn mount_legacy_login(server: &MockServer, ok: bool) {
+        Mock::given(method("GET"))
+            .and(path("/user/login"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .append_header("Set-Cookie", "_csrf=ck123; Path=/; Max-Age=86400")
+                    .set_body_string(r#"<form><input type="hidden" name="_csrf" value="tok456">"#),
+            )
+            .mount(server)
+            .await;
+        let answer = if ok {
+            ResponseTemplate::new(303)
+                .insert_header("Location", "/")
+                .append_header("Set-Cookie", "i_like_gitea=sess; Path=/; HttpOnly")
+                .append_header(
+                    "Set-Cookie",
+                    "gitea_incredible=rem; Path=/; Max-Age=2678400",
+                )
+                .append_header("Set-Cookie", "_csrf=; Path=/; Max-Age=0")
+                .append_header("Set-Cookie", "lang=fr-FR; Path=/")
+        } else {
+            ResponseTemplate::new(303).insert_header("Location", "/user/login")
+        };
+        Mock::given(method("POST"))
+            .and(path("/user/login"))
+            .and(wiremock::matchers::header("Cookie", "_csrf=ck123"))
+            .and(body_string_contains("_csrf=tok456"))
+            .respond_with(answer)
+            .mount(server)
+            .await;
+    }
+
+    #[tokio::test]
+    async fn login_forgejo_10_a_12() {
+        let server = MockServer::start().await;
+        mount_legacy_login(&server, true).await;
+        api_ok(&server).await;
+        let l = login(&server.uri(), "a@b.c", "pw", None).await.unwrap();
+        // Les noms de cookies de cette famille sont gardés ; langue et CSRF écartés.
+        assert_eq!(
+            l.cookies.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["gitea_incredible", "i_like_gitea"]
+        );
+    }
+
+    #[tokio::test]
+    async fn echec_en_redirection_vers_le_login() {
+        let server = MockServer::start().await;
+        mount_legacy_login(&server, false).await;
+        let r = login(&server.uri(), "u", "faux", Some("t")).await;
+        assert!(matches!(r, Err(Error::BadCredentials)), "{r:?}");
+        let seen = server.received_requests().await.unwrap();
+        assert!(seen.iter().all(|r| !r.url.path().starts_with("/api/")));
+    }
+
     #[tokio::test]
     async fn mauvais_mot_de_passe_ne_cree_rien() {
         let server = MockServer::start().await;
@@ -246,7 +326,10 @@ mod tests {
         assert!(matches!(r, Err(Error::BadCredentials)), "{r:?}");
         // Aucune requête API (et donc aucun token orphelin) n'a été envoyée.
         let seen = server.received_requests().await.unwrap();
-        assert_eq!(seen.len(), 1);
+        assert!(
+            seen.iter().all(|r| !r.url.path().starts_with("/api/")),
+            "{seen:?}"
+        );
     }
 
     #[tokio::test]

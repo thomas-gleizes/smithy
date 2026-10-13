@@ -15,6 +15,21 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 - Automatic refresh every 5 seconds, manual refresh with `r`.
 - Backends are pluggable through the `Provider` trait; the UI adapts to what a backend supports (`Capabilities`).
 
+### Forgejo versions
+
+The logs come from Forgejo's internal web routes, which change between versions. smithy detects the server version (`/api/v1/version`) and picks the matching adapter. Listing runs and repositories uses the stable REST API and does not depend on this.
+
+| Forgejo        | Logs                | Notes |
+|----------------|---------------------|-------|
+| 10, 11, 12     | Supported (verified) | CSRF token, no `attempt` segment |
+| 13, 14         | Partial (not verified) | smithy tries the 15 behaviour and says so in the log view |
+| 15             | Supported (verified) | |
+| 16 and later   | Partial (not verified) | |
+| 9 and earlier  | Not supported       | Not verified before 10: the log view shows why |
+| Gitea          | Not supported       | Forgejo only |
+
+An unverified version is never silently trusted: the log view shows a ⚠ notice, and a failing route is reported as such. To verify a version yourself: `FORGEJO_VERSION=13 ./dev/dev.sh probe` starts an isolated instance and prints what changed.
+
 ### Supported forges
 
 | Forge        | Status                                              |

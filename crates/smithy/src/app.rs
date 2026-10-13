@@ -56,6 +56,8 @@ pub struct LogView {
     pub state: LogState,
     /// Première ligne affichée.
     pub scroll: usize,
+    /// Réserve du backend (ex. version du serveur non vérifiée).
+    pub notice: Option<String>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -130,6 +132,7 @@ impl App {
             pipeline: pipeline.clone(),
             state: LogState::Loading,
             scroll: 0,
+            notice: None,
         });
         Some((repo, pipeline))
     }
@@ -306,6 +309,7 @@ impl App {
                     Ok(log) => {
                         let live = self.logs_are_live();
                         let lines = flatten(&log);
+                        let notice = log.notice.clone();
                         let viewport = self.viewport.get().max(1);
                         let Some(v) = self.logs.as_mut() else {
                             return false;
@@ -319,6 +323,7 @@ impl App {
                         } else {
                             v.scroll
                         };
+                        v.notice = notice;
                         v.state = LogState::Ready(lines);
                         v.scroll = target.min(max_scroll(&v.state, viewport));
                     }
@@ -534,6 +539,7 @@ mod tests {
                 step("cargo test", Status::Failure, 30),
                 step("Complete job", Status::Failure, 2),
             ],
+            ..Default::default()
         };
         deliver(&mut a, 7, Ok(log));
         // 1 titre + 9 lignes, puis le titre de l'étape en échec à l'index 10
@@ -546,6 +552,7 @@ mod tests {
     fn job_reussi_ouvert_en_haut_job_en_cours_en_bas() {
         let log = || JobLog {
             steps: vec![step("build", Status::Success, 20)],
+            ..Default::default()
         };
         let mut done = app_on_run(Status::Success);
         done.open_logs();
@@ -564,6 +571,7 @@ mod tests {
         a.open_logs();
         let log = |n| JobLog {
             steps: vec![step("build", Status::Running, n)],
+            ..Default::default()
         };
         deliver(&mut a, 7, Ok(log(20)));
         deliver(&mut a, 7, Ok(log(30))); // on était en bas : on suit
@@ -591,6 +599,24 @@ mod tests {
     }
 
     #[test]
+    fn la_reserve_du_backend_est_conservee() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        let log = JobLog {
+            steps: vec![step("s", Status::Success, 1)],
+            notice: Some("version non vérifiée".into()),
+        };
+        deliver(&mut a, 7, Ok(log));
+        assert_eq!(
+            a.logs.as_ref().unwrap().notice.as_deref(),
+            Some("version non vérifiée")
+        );
+        // Un rafraîchissement sans réserve l'efface
+        deliver(&mut a, 7, Ok(JobLog::default()));
+        assert_eq!(a.logs.as_ref().unwrap().notice, None);
+    }
+
+    #[test]
     fn job_sans_etape() {
         let mut a = app_on_run(Status::Cancelled);
         a.open_logs();
@@ -607,6 +633,7 @@ mod tests {
             7,
             Ok(JobLog {
                 steps: vec![step("s", Status::Success, 19)],
+                ..Default::default()
             }),
         ); // 20 lignes
         a.logs_scroll(-1);
@@ -640,6 +667,7 @@ mod tests {
             7,
             Ok(JobLog {
                 steps: vec![step("s", Status::Success, 1)],
+                ..Default::default()
             }),
         );
         // Échec d'un rafraîchissement : le contenu reste, l'erreur va dans le bandeau

@@ -4,8 +4,10 @@
 
 mod login;
 mod logs;
+mod version;
 
 pub use login::{Login, login};
+pub use version::{Decision, Flavor, Support, Version, decide};
 
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
@@ -23,6 +25,8 @@ pub struct Forgejo {
     web: reqwest::Client,
     /// Cookies de session (obtenus par `login`) ; vides tant que l'utilisateur ne s'est pas connecté.
     cookies: BTreeMap<String, String>,
+    /// Version du serveur et adaptateur retenu ; détectés au premier besoin, une seule fois.
+    decision: tokio::sync::OnceCell<Decision>,
 }
 
 impl Forgejo {
@@ -42,7 +46,22 @@ impl Forgejo {
                 .build()
                 .expect(expect),
             cookies: BTreeMap::new(),
+            decision: tokio::sync::OnceCell::new(),
         }
+    }
+
+    /// Version du serveur, adaptateur à utiliser et niveau de support des logs.
+    /// Une version illisible ou un serveur muet donnent un support partiel, pas une erreur.
+    pub async fn decision(&self) -> Result<&Decision> {
+        self.decision
+            .get_or_try_init(|| async {
+                match self.get::<ApiVersion>("/version", &[]).await {
+                    Ok(v) => Ok(decide(&v.version)),
+                    Err(Error::NotFound(_) | Error::Decode(_)) => Ok(decide("")),
+                    Err(e) => Err(e),
+                }
+            })
+            .await
     }
 
     pub fn with_cookies(mut self, cookies: BTreeMap<String, String>) -> Self {
@@ -71,6 +90,12 @@ impl Forgejo {
             s => Err(Error::Network(format!("HTTP {s} sur {path}"))),
         }
     }
+}
+
+#[derive(Deserialize)]
+struct ApiVersion {
+    #[serde(default)]
+    version: String,
 }
 
 #[derive(Deserialize)]

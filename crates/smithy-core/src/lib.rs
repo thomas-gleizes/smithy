@@ -18,6 +18,9 @@ pub enum Error {
     NotFound(String),
     #[error("fonctionnalité non supportée par ce backend : {0}")]
     Unsupported(&'static str),
+    /// La version du serveur est connue pour ne pas fonctionner (voir la table de support du backend).
+    #[error("version du serveur non supportée : {0}")]
+    UnsupportedVersion(String),
     #[error("réponse inattendue : {0}")]
     Decode(String),
 }
@@ -75,6 +78,8 @@ pub struct StepLog {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct JobLog {
     pub steps: Vec<StepLog>,
+    /// Réserve à afficher à côté des logs (ex. version du serveur non vérifiée).
+    pub notice: Option<String>,
 }
 
 /// Rend une ligne de log affichable dans un terminal : retire les séquences d'échappement
