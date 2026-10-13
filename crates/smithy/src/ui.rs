@@ -9,7 +9,7 @@ use ratatui::{
 };
 use smithy_core::Status;
 
-use crate::app::{App, Focus, LoginField, LoginForm};
+use crate::app::{App, Focus, LineKind, LogState, LogView, LoginField, LoginForm};
 
 pub fn status_style(s: Status) -> (&'static str, Color) {
     match s {
@@ -32,6 +32,80 @@ fn border(focused: bool) -> Style {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    if let Some(view) = &app.logs {
+        draw_logs(f, app, view);
+    } else {
+        draw_lists(f, app);
+    }
+    if let Some(form) = &app.login {
+        draw_login(f, form, &app.server_label);
+    }
+}
+
+fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
+    let (status, color) = status_style(view.pipeline.status);
+    let title = Line::from(vec![
+        Span::raw(format!(
+            " Logs · {} · {} · {} · ",
+            view.repo.full_name(),
+            view.pipeline.workflow,
+            view.pipeline.job
+        )),
+        Span::styled(format!("{status} "), Style::new().fg(color)),
+    ]);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(rows[0]);
+    app.viewport.set(inner.height as usize);
+
+    let mut position = String::new();
+    let body: Vec<Line> = match &view.state {
+        LogState::Loading => vec![Line::from(Span::styled(
+            "chargement…",
+            Style::new().fg(Color::Cyan),
+        ))],
+        LogState::Failed(e) => vec![Line::from(Span::styled(
+            format!("erreur : {e}"),
+            Style::new().fg(Color::Red),
+        ))],
+        LogState::Ready(lines) => {
+            let end = (view.scroll + inner.height as usize).min(lines.len());
+            position = format!(" {}-{}/{} ", (view.scroll + 1).min(end), end, lines.len());
+            lines[view.scroll.min(lines.len())..end]
+                .iter()
+                .map(|l| match l.kind {
+                    LineKind::Step(st) => Line::from(Span::styled(
+                        format!("▸ {}", l.text),
+                        Style::new().fg(status_style(st).1).bold(),
+                    )),
+                    LineKind::Text => Line::from(l.text.as_str()),
+                })
+                .collect()
+        }
+    };
+    // La position va dans le cadre, à droite : le pied de page peut être tronqué
+    // sur un terminal étroit, pas le cadre.
+    let block = block
+        .title(title)
+        .title(Line::from(position).right_aligned());
+    f.render_widget(Paragraph::new(body).block(block), rows[0]);
+
+    let footer = match &app.error {
+        Some(e) => Line::from(Span::styled(
+            format!("erreur : {e}"),
+            Style::new().fg(Color::Red),
+        )),
+        None => Line::from(Span::styled(
+            "j/k ↑/↓ défiler · PgUp/PgDn page · g/G début/fin · r rafraîchir · Esc retour",
+            Style::new().fg(Color::DarkGray),
+        )),
+    };
+    f.render_widget(Paragraph::new(footer), rows[1]);
+}
+
+fn draw_lists(f: &mut Frame, app: &App) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(f.area());
     let cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -112,14 +186,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         Line::from("")
     };
     let help = Line::from(Span::styled(
-        "j/k ↑/↓ naviguer · tab changer de panneau · r rafraîchir · q quitter",
+        "j/k ↑/↓ naviguer · ↵ logs · tab changer de panneau · r rafraîchir · q quitter",
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(vec![help, second]), rows[1]);
-
-    if let Some(form) = &app.login {
-        draw_login(f, form, &app.server_label);
-    }
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -186,6 +256,7 @@ fn draw_login(f: &mut Frame, form: &LoginForm, server: &str) {
 mod tests {
     use super::*;
     use crate::app::Msg;
+    use crate::app::{LineKind, LogState};
     use ratatui::{Terminal, backend::TestBackend};
     use smithy_core::{Pipeline, Repo};
 
@@ -201,6 +272,8 @@ mod tests {
             repo,
             result: Ok(vec![Pipeline {
                 id: 1,
+                number: 2,
+                job: "build".into(),
                 workflow: "fail.yml".into(),
                 title: "ci: workflow rouge".into(),
                 branch: "main".into(),
@@ -238,6 +311,8 @@ mod tests {
         };
         let pipe = |id: u64| Pipeline {
             id,
+            number: id,
+            job: "build".into(),
             workflow: "ci.yml".into(),
             title: "t".into(),
             branch: "main".into(),
@@ -276,6 +351,102 @@ mod tests {
             .iter()
             .map(|c| c.symbol())
             .collect()
+    }
+
+    fn app_with_logs(state: LogState) -> App {
+        let repo = Repo {
+            owner: "smithy".into(),
+            name: "demo".into(),
+        };
+        let mut app = App::new();
+        app.logs_supported = true;
+        app.apply(Msg::Repos(Ok(vec![repo.clone()])));
+        app.apply(Msg::Pipelines {
+            repo: repo.clone(),
+            result: Ok(vec![Pipeline {
+                id: 1,
+                number: 3,
+                job: "test".into(),
+                workflow: "fail.yml".into(),
+                title: "t".into(),
+                branch: "main".into(),
+                commit: "abc".into(),
+                status: Status::Failure,
+                url: None,
+            }]),
+        });
+        app.focus = Focus::Pipelines;
+        app.open_logs();
+        app.logs.as_mut().unwrap().state = state;
+        app
+    }
+
+    fn line(kind: LineKind, text: &str) -> crate::app::LogLine {
+        crate::app::LogLine {
+            kind,
+            text: text.into(),
+        }
+    }
+
+    #[test]
+    fn vue_des_logs() {
+        let lines = vec![
+            line(LineKind::Step(Status::Failure), "cargo test"),
+            line(LineKind::Text, "boum"),
+            line(LineKind::Text, "autre ligne"),
+        ];
+        let app = app_with_logs(LogState::Ready(lines));
+        let text = render(&app, 100, 12);
+        for needle in [
+            "smithy/demo",
+            "fail.yml",
+            "test",
+            "▸ cargo test",
+            "boum",
+            "1-3/3",
+            "Esc retour",
+        ] {
+            assert!(text.contains(needle), "absent : {needle}");
+        }
+        assert!(!text.contains("Dépôts"), "la liste ne doit plus s'afficher");
+    }
+
+    #[test]
+    fn vue_des_logs_defilee_et_hauteur_publiee() {
+        let lines: Vec<_> = (1..=50)
+            .map(|i| line(LineKind::Text, &format!("ligne-{i:02}")))
+            .collect();
+        let mut app = app_with_logs(LogState::Ready(lines));
+        let _ = render(&app, 80, 12); // le rendu publie la hauteur utile (12 - 2 bordures - 1 pied)
+        assert_eq!(app.viewport.get(), 9);
+        app.logs_scroll(20);
+        let text = render(&app, 80, 12);
+        assert!(text.contains("ligne-21") && text.contains("ligne-29"));
+        assert!(!text.contains("ligne-20") && !text.contains("ligne-30"));
+        assert!(text.contains("21-29/50"));
+    }
+
+    #[test]
+    fn vue_des_logs_chargement_et_erreur() {
+        let loading = app_with_logs(LogState::Loading);
+        assert!(render(&loading, 80, 10).contains("chargement"));
+        let failed = app_with_logs(LogState::Failed("session expirée".into()));
+        assert!(render(&failed, 80, 10).contains("erreur : session expirée"));
+        // Très petit terminal, ligne plus large que l'écran : pas de panique
+        let long = app_with_logs(LogState::Ready(vec![line(
+            LineKind::Text,
+            &"x".repeat(500),
+        )]));
+        render(&long, 12, 4);
+        render(&long, 1, 1);
+    }
+
+    #[test]
+    fn formulaire_par_dessus_les_logs() {
+        let mut app = app_with_logs(LogState::Failed("session expirée".into()));
+        app.open_login("thomas");
+        let text = render(&app, 100, 20);
+        assert!(text.contains("Connexion") && text.contains("Logs"));
     }
 
     #[test]

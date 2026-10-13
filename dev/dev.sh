@@ -83,6 +83,16 @@ jobs:
       - name: Tests
         run: printf "\033[31mrouge\033[0m puis \033[1;33mjaune\033[0m\n" && exit 1
 ' "ci: workflow riche"
+  # Sortie volumineuse : valide la pagination des logs.
+  put_file_in "$PRIVATE_REPO" .forgejo/workflows/big.yml 'name: big
+on: [push]
+jobs:
+  big:
+    runs-on: docker
+    steps:
+      - name: Beaucoup de lignes
+        run: for i in $(seq 1 6000); do echo "ligne longue numéro $i avec du texte pour faire du volume"; done
+' "ci: workflow volumineux"
 }
 
 # Pousse des workflows de démo : chaque commit déclenche un run vert et un run rouge.

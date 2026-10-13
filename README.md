@@ -9,6 +9,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 ## Features
 
 - List the repositories you can access and the latest CI runs of the selected one.
+- Read the steps and output of any job, in the terminal (`Enter` on a run): ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
 - Sign in from the TUI (username and password, entered once and never stored).
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
@@ -18,7 +19,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 
 | Forge        | Status                                              |
 |--------------|-----------------------------------------------------|
-| Forgejo      | Implemented (no job list or logs: not in the REST API, the run URL is shown instead) |
+| Forgejo      | Implemented, including job steps and logs (through Forgejo's web routes, which need a login: see below) |
 | GitHub       | Planned                                             |
 | GitLab       | Planned                                             |
 | Bitbucket    | Planned                                             |
@@ -67,7 +68,7 @@ Environment variables override the first server (or define one if the file has n
 - signs in to obtain a **session cookie** (Forgejo only serves CI logs through its web routes, which do not accept API tokens);
 - creates a **read-only API token** named `smithy-<server>-<timestamp>` on your account, so you can revoke it from the Forgejo settings.
 
-Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (directory `0700`, file `0600`). **The password is never written to disk.** A `token` set in the config file or in `SMITHY_TOKEN` takes precedence over the one created at login. Two-factor authentication and SSO are not supported yet.
+Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (directory `0700`, file `0600`). **The password is never written to disk.** A `token` set in the config file or in `SMITHY_TOKEN` takes precedence over the one created at login. When the session cookie expires, smithy reopens the form (username prefilled) and only renews the cookie: no new token is created. With a `token` in the config but no login yet, the form opens the first time you ask for logs. Two-factor authentication and SSO are not supported yet.
 
 ## Key bindings
 
@@ -75,8 +76,22 @@ Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (dire
 |-------------------|---------------------------|
 | `j` / `k`, `↓` / `↑` | Move selection         |
 | `Tab`             | Switch panel              |
+| `Enter`           | Open the logs of the selected run (on the repository list: go to its runs) |
 | `r`               | Refresh                   |
 | `q`, `Esc`, `Ctrl+C` | Quit                   |
+
+In the log view:
+
+| Key                   | Action                          |
+|-----------------------|---------------------------------|
+| `j` / `k`, `↓` / `↑`  | Scroll one line                 |
+| `PgDn` / `Space`, `PgUp` / `b` | Scroll one page        |
+| `g` / `Home`, `G` / `End` | Top / bottom                |
+| `r`                   | Refresh                         |
+| `Esc`, `q`, `Backspace` | Back to the runs              |
+| `Ctrl+C`              | Quit                            |
+
+Long lines are clipped, not wrapped. Output is capped to the last 50,000 lines per step.
 
 ## Development
 
@@ -102,6 +117,7 @@ A new forge is a new crate implementing `Provider`.
 
 - [ ] CI workflow running `make check`
 - [ ] Filters and search (status, branch, workflow, repository)
+- [x] Job steps and logs for Forgejo
 - [ ] Open the run URL from the TUI
 - [ ] GitHub backend (jobs and logs)
 - [x] Multiple instances in the config file (selection from the TUI still to come)

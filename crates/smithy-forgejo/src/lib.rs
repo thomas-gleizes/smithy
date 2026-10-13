@@ -1,13 +1,16 @@
-//! Backend Forgejo. Endpoints validés sur Forgejo 15 : `/user/repos` et
-//! `/repos/{o}/{r}/actions/tasks`. Il n'existe pas d'API REST pour les logs.
+//! Backend Forgejo. API REST validée sur Forgejo 15 : `/user/repos` et
+//! `/repos/{o}/{r}/actions/tasks`. Les logs, eux, passent par les routes web (voir `logs`),
+//! qui demandent un cookie de session (voir `login`).
 
 mod login;
+mod logs;
 
 pub use login::{Login, login};
 
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
-use smithy_core::{Capabilities, Error, Pipeline, Provider, Repo, Result, Status};
+use smithy_core::{Capabilities, Error, JobLog, Pipeline, Provider, Repo, Result, Status};
+use std::collections::BTreeMap;
 
 const PAGE_SIZE: usize = 50;
 const MAX_PAGES: usize = 20;
@@ -16,20 +19,35 @@ pub struct Forgejo {
     base_url: String,
     token: String,
     client: reqwest::Client,
+    /// Pour les routes web : on ne suit pas les redirections, c'est le signe d'une session perdue.
+    web: reqwest::Client,
+    /// Cookies de session (obtenus par `login`) ; vides tant que l'utilisateur ne s'est pas connecté.
+    cookies: BTreeMap<String, String>,
 }
 
 impl Forgejo {
     pub fn new(base_url: impl Into<String>, token: impl Into<String>) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(10))
-            .user_agent(concat!("smithy/", env!("CARGO_PKG_VERSION")))
-            .build()
-            .expect("configuration du client HTTP statique et valide");
+        let builder = || {
+            reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .user_agent(concat!("smithy/", env!("CARGO_PKG_VERSION")))
+        };
+        let expect = "configuration du client HTTP statique et valide";
         Self {
             base_url: base_url.into().trim_end_matches('/').to_owned(),
             token: token.into(),
-            client,
+            client: builder().build().expect(expect),
+            web: builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .expect(expect),
+            cookies: BTreeMap::new(),
         }
+    }
+
+    pub fn with_cookies(mut self, cookies: BTreeMap<String, String>) -> Self {
+        self.cookies = cookies;
+        self
     }
 
     fn api(&self, path: &str) -> String {
@@ -76,6 +94,10 @@ struct ApiTasks {
 struct ApiRun {
     id: u64,
     #[serde(default)]
+    name: String,
+    #[serde(default)]
+    run_number: u64,
+    #[serde(default)]
     workflow_id: String,
     #[serde(default)]
     display_title: String,
@@ -101,10 +123,24 @@ fn map_status(s: &str) -> Status {
     }
 }
 
+/// Numéro du run, lu dans l'URL (`…/actions/runs/3`) si l'API ne le donne pas.
+fn run_number(run_number: u64, url: &str) -> u64 {
+    if run_number != 0 {
+        return run_number;
+    }
+    url.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(0)
+}
+
 impl From<ApiRun> for Pipeline {
     fn from(r: ApiRun) -> Self {
         Pipeline {
             id: r.id,
+            number: run_number(r.run_number, &r.url),
+            job: r.name,
             workflow: r.workflow_id,
             title: r.display_title,
             branch: r.head_branch,
@@ -117,7 +153,7 @@ impl From<ApiRun> for Pipeline {
 
 impl Provider for Forgejo {
     fn capabilities(&self) -> Capabilities {
-        Capabilities { logs: false }
+        Capabilities { logs: true }
     }
 
     async fn list_repos(&self) -> Result<Vec<Repo>> {
@@ -149,6 +185,10 @@ impl Provider for Forgejo {
             .into_iter()
             .map(Pipeline::from)
             .collect())
+    }
+
+    async fn job_log(&self, repo: &Repo, pipeline: &Pipeline) -> Result<JobLog> {
+        self.fetch_job_log(repo, pipeline).await
     }
 }
 
@@ -208,6 +248,12 @@ mod tests {
         assert_eq!(p[0].status, Status::Success);
         assert_eq!(p[0].workflow, "ok.yml");
         assert_eq!(p[0].url.as_deref(), Some("http://x/runs/3"));
+        assert_eq!((p[0].number, p[0].job.as_str()), (3, "build"));
+        // Sans `run_number`, le numéro est lu dans l'URL ; sinon 0 (inconnu).
+        assert_eq!(run_number(0, "http://x/o/r/actions/runs/12"), 12);
+        assert_eq!(run_number(0, "http://x/o/r/actions/runs/12/"), 12);
+        assert_eq!(run_number(0, ""), 0);
+        assert_eq!(p[1].number, 0);
         assert_eq!(p[1].status, Status::Failure);
         assert_eq!(p[1].url, None);
     }

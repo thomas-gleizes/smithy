@@ -17,7 +17,8 @@ const TOKEN_SCOPES: [&str; 2] = ["read:repository", "read:user"];
 pub struct Login {
     /// Identifiant canonique (l'utilisateur a pu saisir son e-mail).
     pub username: String,
-    pub token: String,
+    /// `None` si l'appelant a demandé de ne pas en créer.
+    pub token: Option<String>,
     pub cookies: BTreeMap<String, String>,
 }
 
@@ -31,11 +32,13 @@ struct ApiToken {
     sha1: String,
 }
 
+/// `token_name` : nom du token en lecture seule à créer ; `None` pour ne renouveler que le
+/// cookie (reconnexion, quand un token existe déjà : sinon ils s'empilent sur le compte).
 pub async fn login(
     base_url: &str,
     username: &str,
     password: &str,
-    token_name: &str,
+    token_name: Option<&str>,
 ) -> Result<Login> {
     let base = base_url.trim_end_matches('/');
     // Pas de redirection suivie : un 303 vers `/` est précisément le signe du succès.
@@ -90,18 +93,24 @@ pub async fn login(
     .await?;
 
     // 3. Token en lecture seule.
-    let token: ApiToken = api_json(
-        client
-            .post(format!("{base}/api/v1/users/{}/tokens", user.login))
-            .basic_auth(username, Some(password))
-            .json(&serde_json::json!({"name": token_name, "scopes": TOKEN_SCOPES})),
-        "création du token",
-    )
-    .await?;
+    let token = match token_name {
+        Some(name) => {
+            let t: ApiToken = api_json(
+                client
+                    .post(format!("{base}/api/v1/users/{}/tokens", user.login))
+                    .basic_auth(username, Some(password))
+                    .json(&serde_json::json!({"name": name, "scopes": TOKEN_SCOPES})),
+                "création du token",
+            )
+            .await?;
+            Some(t.sha1)
+        }
+        None => None,
+    };
 
     Ok(Login {
         username: user.login,
-        token: token.sha1,
+        token,
         cookies,
     })
 }
@@ -191,13 +200,37 @@ mod tests {
             .mount(&server)
             .await;
 
-        let l = login(&format!("{}/", server.uri()), "a@b.c", "pw", "smithy-test")
-            .await
-            .unwrap();
+        let l = login(
+            &format!("{}/", server.uri()),
+            "a@b.c",
+            "pw",
+            Some("smithy-test"),
+        )
+        .await
+        .unwrap();
         assert_eq!(l.username, "thomas");
-        assert_eq!(l.token, "tok123");
+        assert_eq!(l.token.as_deref(), Some("tok123"));
         assert_eq!(l.cookies["session"], "second");
         assert_eq!(l.cookies["persistent"], "long");
+    }
+
+    #[tokio::test]
+    async fn reconnexion_sans_nouveau_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/user/login"))
+            .respond_with(redirect("/"))
+            .mount(&server)
+            .await;
+        api_ok(&server).await;
+        let l = login(&server.uri(), "a@b.c", "pw", None).await.unwrap();
+        assert_eq!(l.token, None);
+        assert_eq!(l.cookies["session"], "second");
+        let seen = server.received_requests().await.unwrap();
+        assert!(
+            seen.iter().all(|r| !r.url.path().ends_with("/tokens")),
+            "aucun token ne doit être créé"
+        );
     }
 
     #[tokio::test]
@@ -209,7 +242,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(200).set_body_string("<form>"))
             .mount(&server)
             .await;
-        let r = login(&server.uri(), "u", "faux", "t").await;
+        let r = login(&server.uri(), "u", "faux", Some("t")).await;
         assert!(matches!(r, Err(Error::BadCredentials)), "{r:?}");
         // Aucune requête API (et donc aucun token orphelin) n'a été envoyée.
         let seen = server.received_requests().await.unwrap();
@@ -224,7 +257,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(303).insert_header("Location", "/user/two_factor"))
             .mount(&server)
             .await;
-        let r = login(&server.uri(), "u", "pw", "t").await;
+        let r = login(&server.uri(), "u", "pw", Some("t")).await;
         assert!(matches!(r, Err(Error::Unsupported(_))), "{r:?}");
     }
 
@@ -248,7 +281,7 @@ mod tests {
             .respond_with(ResponseTemplate::new(403))
             .mount(&server)
             .await;
-        let r = login(&server.uri(), "thomas", "pw", "t").await;
+        let r = login(&server.uri(), "thomas", "pw", Some("t")).await;
         assert!(
             matches!(r, Err(Error::Network(ref m)) if m.contains("refusé")),
             "{r:?}"
