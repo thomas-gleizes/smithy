@@ -101,7 +101,6 @@ Tabs, on every page (except while typing a filter):
 | `Tab` / `Shift+Tab`   | Next / previous tab (wraps around) |
 | `T`                   | List the tabs (`j`/`k`, `Enter` to go, `x` to close, `Esc`) |
 | `x`                   | Close the current tab (the last one becomes a fresh home page) |
-
 | `S`                   | Change the **server of the current tab** (list of the configured servers; `Enter` to choose) |
 
 Tabs are independent: each keeps its own page stack, selection, scroll position **and server**. `S` lists the configured servers (● marks the current one, *connecté* those already signed in). Choosing one keeps the tab at the same rank but restarts it on that server's home page; the other tabs are left alone, even if they were showing the same repository name on another server. A server you are not signed in to opens its login form first (`Esc` cancels and leaves the tab as it was). With several servers configured, tab titles are prefixed by their server (`work · repo · CI`). A running job keeps being followed in a background tab on its own server. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
