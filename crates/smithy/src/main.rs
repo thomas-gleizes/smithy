@@ -380,6 +380,121 @@ fn announce(app: &mut App, b: &Backend) {
     }
 }
 
+fn entries(servers: &[Server]) -> Vec<app::ServerEntry> {
+    servers
+        .iter()
+        .map(|s| app::ServerEntry {
+            name: s.name.clone(),
+            url: s.url.clone(),
+        })
+        .collect()
+}
+
+/// Les serveurs connus de l'application, dans l'ordre de la liste.
+fn current_servers(app: &App, backends: &HashMap<String, Backend>) -> Vec<Server> {
+    app.servers
+        .iter()
+        .filter_map(|e| backends.get(&e.name).map(|b| b.server.clone()))
+        .collect()
+}
+
+/// Les serveurs que le fichier ne connaît pas (définis par `SMITHY_URL`) sont ajoutés en tête,
+/// sans token, pour qu'écrire le fichier ne les fasse pas disparaître ni ne copie un secret.
+fn file_with_env_servers(known: &[Server]) -> Result<Vec<Server>, String> {
+    let mut file = config::file_servers().map_err(|e| e.to_string())?;
+    for s in known.iter().rev() {
+        if !file.iter().any(|f| f.name == s.name) {
+            file.insert(
+                0,
+                Server {
+                    token: None,
+                    ..s.clone()
+                },
+            );
+        }
+    }
+    Ok(file)
+}
+
+/// Ajoute ou modifie un serveur : écrit d'abord la config (rien ne change si ça échoue), puis
+/// met à jour le registre des fournisseurs et l'état de l'application.
+fn save_server(
+    app: &mut App,
+    backends: &mut HashMap<String, Backend>,
+    store: Option<&SessionStore>,
+    draft: app::ServerDraft,
+) -> Result<(), String> {
+    let known = current_servers(app, backends);
+    let old = draft
+        .original
+        .as_ref()
+        .and_then(|n| known.iter().find(|s| &s.name == n));
+    let server = Server {
+        name: draft.name.clone(),
+        kind: ServerKind::Forgejo,
+        url: draft.url.clone(),
+        token: draft
+            .token
+            .clone()
+            .or_else(|| old.and_then(|o| o.token.clone())),
+    };
+    let mut file = file_with_env_servers(&known)?;
+    // Dans le fichier, on ne réécrit que ce que l'utilisateur vient de saisir.
+    let file_server = Server {
+        token: draft.token.clone().or_else(|| {
+            file.iter()
+                .find(|f| f.name == server.name)
+                .and_then(|f| f.token.clone())
+        }),
+        ..server.clone()
+    };
+    match file.iter_mut().find(|f| f.name == server.name) {
+        Some(f) => *f = file_server,
+        None => file.push(file_server),
+    }
+    config::save_servers(&file).map_err(|e| format!("config non enregistrée : {e:#}"))?;
+
+    let mut list = known;
+    match list.iter_mut().find(|s| s.name == server.name) {
+        Some(s) => *s = server.clone(),
+        None => list.push(server.clone()),
+    }
+    backends.insert(server.name.clone(), Backend::load(server.clone(), store));
+    match backends[&server.name].provider {
+        Some(_) => announce(app, &backends[&server.name]),
+        None => app.forget_caps(&server.name),
+    }
+    app.server_form_done(entries(&list), &server.name);
+    // L'onglet affiché est sur ce serveur et il n'est plus connecté (URL changée) : login.
+    if server.name == app.server_name && !app.is_connected(&server.name) && app.login.is_none() {
+        app.open_login(&server.name, &backends[&server.name].username, false);
+    }
+    Ok(())
+}
+
+/// Retire un serveur de la config, du registre et de la liste ; sa session sauvegardée est effacée.
+fn delete_server(
+    app: &mut App,
+    backends: &mut HashMap<String, Backend>,
+    store: Option<&SessionStore>,
+    name: &str,
+) -> Result<(), String> {
+    let known = current_servers(app, backends);
+    let mut file = config::file_servers().map_err(|e| e.to_string())?;
+    if file.iter().any(|f| f.name == name) {
+        file.retain(|f| f.name != name);
+        config::save_servers(&file).map_err(|e| format!("config non enregistrée : {e:#}"))?;
+    }
+    backends.remove(name);
+    if let Some(Err(e)) = store.map(|s| s.clear(name)) {
+        app.error = Some(format!("session non effacée : {e}"));
+    }
+    app.forget_caps(name);
+    let list: Vec<Server> = known.into_iter().filter(|s| s.name != name).collect();
+    app.server_delete_done(entries(&list));
+    Ok(())
+}
+
 async fn run(
     terminal: &mut DefaultTerminal,
     servers: Vec<Server>,
@@ -451,22 +566,63 @@ async fn run(
                             KeyCode::Char(c) if !ctrl => app.login_type(c),
                             _ => {}
                         }
-                    } else if app.server_picker.is_some() {
+                    } else if app.server_form.is_some() {
                         match k.code {
-                            KeyCode::Esc | KeyCode::Char('q' | 'S') => app.server_picker = None,
-                            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
-                                app.server_picker_move(1)
-                            }
-                            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
-                                app.server_picker_move(-1)
-                            }
+                            KeyCode::Esc => app.server_form_cancel(),
                             KeyCode::Enter => {
-                                // Pas encore connecté : le login d'abord, la bascule ensuite.
-                                if let Some(name) = app.server_picker_choose() {
-                                    app.open_login(&name, &backends[&name].username, true);
+                                if let Some(draft) = app.server_form_enter() {
+                                    if let Err(e) =
+                                        save_server(&mut app, &mut backends, store.as_ref(), draft)
+                                    {
+                                        app.server_form_fail(e);
+                                    }
                                 }
                             }
+                            KeyCode::Tab | KeyCode::Down => app.server_form_move(1),
+                            KeyCode::BackTab | KeyCode::Up => app.server_form_move(-1),
+                            KeyCode::Backspace => app.server_form_backspace(),
+                            KeyCode::Char(c) if !ctrl => app.server_form_type(c),
                             _ => {}
+                        }
+                    } else if app.server_picker.is_some() {
+                        if app.server_delete.is_some() {
+                            match k.code {
+                                KeyCode::Char('y' | 'o') => {
+                                    if let Some(name) = app.server_delete_confirm() {
+                                        if let Err(e) = delete_server(
+                                            &mut app,
+                                            &mut backends,
+                                            store.as_ref(),
+                                            &name,
+                                        ) {
+                                            app.server_note = Some(e);
+                                        }
+                                    }
+                                }
+                                _ => app.server_delete_cancel(),
+                            }
+                        } else {
+                            match k.code {
+                                KeyCode::Esc | KeyCode::Char('q' | 'S') => {
+                                    app.close_server_picker()
+                                }
+                                KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                                    app.server_picker_move(1)
+                                }
+                                KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                                    app.server_picker_move(-1)
+                                }
+                                KeyCode::Char('a') => app.server_form_add(),
+                                KeyCode::Char('e') => app.server_form_edit(),
+                                KeyCode::Char('d') => app.server_delete_ask(),
+                                KeyCode::Enter => {
+                                    // Pas encore connecté : le login d'abord, la bascule ensuite.
+                                    if let Some(name) = app.server_picker_choose() {
+                                        app.open_login(&name, &backends[&name].username, true);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     } else if app.tab_picker.is_some() {
                         tab_picker_key(&mut app, k.code);

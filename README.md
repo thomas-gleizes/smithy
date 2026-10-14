@@ -103,7 +103,9 @@ Tabs, on every page (except while typing a filter):
 | `x`                   | Close the current tab (the last one becomes a fresh home page) |
 | `S`                   | Change the **server of the current tab** (list of the configured servers; `Enter` to choose) |
 
-Tabs are independent: each keeps its own page stack, selection, scroll position **and server**. `S` lists the configured servers (● marks the current one, *connecté* those already signed in). Choosing one keeps the tab at the same rank but restarts it on that server's home page; the other tabs are left alone, even if they were showing the same repository name on another server. A server you are not signed in to opens its login form first (`Esc` cancels and leaves the tab as it was). With several servers configured, tab titles are prefixed by their server (`work · repo · CI`). A running job keeps being followed in a background tab on its own server. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
+Tabs are independent: each keeps its own page stack, selection, scroll position **and server**. `S` lists the configured servers (● marks the current one, *connecté* those already signed in). Choosing one keeps the tab at the same rank but restarts it on that server's home page; the other tabs are left alone, even if they were showing the same repository name on another server. A server you are not signed in to opens its login form first (`Esc` cancels and leaves the tab as it was).
+
+**Managing servers from the app**: in the `S` list, `a` adds a server (name, URL, optional token), `e` edits the selected one (URL and token; the name is fixed, and an empty token keeps the current one), `d` deletes it after a `y` confirmation. Changes are written to `config.toml` (rewritten in the `[[server]]` format, comments are not kept, mode `0600`); deleting also removes the saved login of that server. A server used by a tab, or the last one, cannot be deleted. Servers that only come from `SMITHY_URL` are written without their token. The list also opens with a single server, so a second one can be added right away. With several servers configured, tab titles are prefixed by their server (`work · repo · CI`). A running job keeps being followed in a background tab on its own server. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
 
 On the home page:
 
@@ -181,6 +183,7 @@ A new forge is a new crate implementing `Provider`.
 - [ ] Organisations on the home page (needs an extra `read:organization` token scope)
 - [x] Independent tabs, each with its own page stack
 - [x] One server per tab (several servers at once, switched from the tab with `S`)
+- [x] Add, edit and delete servers from the app
 - [ ] Restore the open tabs at startup
 - [ ] Pull requests, notifications and runners
 - [ ] Filters and search (status, branch, workflow, repository)

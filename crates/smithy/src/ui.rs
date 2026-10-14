@@ -10,7 +10,7 @@ use ratatui::{
 use smithy_core::{EntryKind, RepoInfo, Status};
 
 use crate::{
-    app::{App, LoginField, LoginForm, TabMarker, TabTitle},
+    app::{App, LoginField, LoginForm, ServerField, ServerForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
@@ -61,8 +61,11 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(selected) = app.server_picker {
         draw_server_picker(f, app, selected);
     }
+    if let Some(form) = &app.server_form {
+        draw_server_form(f, form);
+    }
     if let Some(form) = &app.login {
-        let quits = !form.switch_to && !app.is_connected(&form.server);
+        let quits = app.login_quits(form);
         draw_login(f, form, quits);
     }
 }
@@ -235,20 +238,92 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
         })
         .collect();
     let height = (items.len() as u16).clamp(1, 12) + 2;
-    let area = centered(f.area(), 70, height);
+    let area = centered(f.area(), 84, height);
     f.render_widget(Clear, area);
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Serveurs (cet onglet) ")
+        .border_style(Style::new().fg(Color::Yellow));
+    if let Some(name) = &app.server_delete {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" Supprimer « {name} » ? y oui · autre touche : non "),
+            Style::new().fg(Color::Red).bold(),
+        )));
+    } else if let Some(note) = &app.server_note {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" {note} "),
+            Style::new().fg(Color::Red),
+        )));
+    } else {
+        block = block.title_bottom(
+            Line::from(" ↵ choisir · a ajouter · e modifier · d supprimer · Échap ")
+                .right_aligned(),
+        );
+    }
     let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Serveurs (cet onglet) ")
-                .title_bottom(Line::from(" ↵ choisir · Échap ").right_aligned())
-                .border_style(Style::new().fg(Color::Yellow)),
-        )
+        .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
     let mut ls = ListState::default();
     ls.select(Some(selected));
     f.render_stateful_widget(list, area, &mut ls);
+}
+
+fn draw_server_form(f: &mut Frame, form: &ServerForm) {
+    let area = centered(f.area(), 70, 11);
+    f.render_widget(Clear, area);
+    let editing = form.original.is_some();
+    let field = |label: &str, value: String, which: ServerField, locked: bool| {
+        let active = form.field == which;
+        let cursor = if active { "▏" } else { "" };
+        let style = if active {
+            Style::new().fg(Color::Yellow)
+        } else if locked {
+            Style::new().fg(Color::DarkGray)
+        } else {
+            Style::new()
+        };
+        Line::from(vec![
+            Span::styled(format!("{label:<8}"), style),
+            Span::raw(format!("{value}{cursor}")),
+        ])
+    };
+    let token_hint = if editing {
+        "(vide : inchangé)"
+    } else {
+        "(facultatif : sinon connexion par mot de passe)"
+    };
+    let mut lines = vec![
+        field("Nom", form.name.clone(), ServerField::Name, editing),
+        field("URL", form.url.clone(), ServerField::Url, false),
+        field(
+            "Token",
+            "•".repeat(form.token.chars().count()),
+            ServerField::Token,
+            false,
+        ),
+        Line::from(Span::styled(
+            format!("        {token_hint}"),
+            Style::new().fg(Color::DarkGray),
+        )),
+        Line::from(""),
+    ];
+    lines.push(match &form.error {
+        Some(e) => Line::from(Span::styled(e.clone(), Style::new().fg(Color::Red))),
+        None => Line::from(""),
+    });
+    lines.push(Line::from(Span::styled(
+        "Entrée suivant / enregistrer · Tab changer de champ · Esc annuler",
+        Style::new().fg(Color::DarkGray),
+    )));
+    let title = match &form.original {
+        Some(n) => format!(" Modifier le serveur · {n} "),
+        None => " Nouveau serveur ".to_owned(),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::new().fg(Color::Yellow));
+    f.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 fn draw_tab_picker(f: &mut Frame, app: &App, selected: usize) {
@@ -2425,8 +2500,48 @@ mod tests {
         let text = render(&app, 100, 20);
         assert!(text.contains("Connexion · B (http://B.example)"), "{text}");
         assert!(text.contains("Esc annuler") && !text.contains("Esc quitter"));
-        // Connexion de démarrage d'un serveur pas encore connecté : Échap quitte
+        // Un renouvellement de session alors que A est connecté : Échap annule
         app.open_login("B", "", false);
+        assert!(render(&app, 100, 20).contains("Esc annuler"));
+        // Connexion de démarrage, aucun serveur connecté : Échap quitte
+        app.forget_caps("A");
         assert!(render(&app, 100, 20).contains("Esc quitter"));
+    }
+
+    #[test]
+    fn formulaire_et_confirmation_des_serveurs() {
+        let mut app = two_servers();
+        app.open_server_picker();
+        let text = render(&app, 110, 20);
+        assert!(
+            text.contains("a ajouter")
+                && text.contains("e modifier")
+                && text.contains("d supprimer"),
+            "{text}"
+        );
+        app.server_form_add();
+        "dix".chars().for_each(|c| app.server_form_type(c));
+        let text = render(&app, 110, 20);
+        assert!(
+            text.contains("Nouveau serveur") && text.contains("dix") && text.contains("https://"),
+            "{text}"
+        );
+        app.server_form_fail("nom invalide".into());
+        assert!(render(&app, 110, 20).contains("nom invalide"));
+        app.server_form_cancel();
+        app.server_picker_move(1);
+        app.server_form_edit();
+        let text = render(&app, 110, 20);
+        assert!(
+            text.contains("Modifier le serveur · B") && text.contains("inchangé"),
+            "{text}"
+        );
+        app.server_form_cancel();
+        app.server_delete_ask();
+        assert!(render(&app, 110, 20).contains("Supprimer « B » ?"));
+        app.server_delete_cancel();
+        app.server_picker_move(-1);
+        app.server_delete_ask();
+        assert!(render(&app, 110, 20).contains("utilisé par un onglet"));
     }
 }

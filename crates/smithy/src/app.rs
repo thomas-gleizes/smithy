@@ -115,6 +115,35 @@ pub struct ServerEntry {
     pub url: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ServerField {
+    Name,
+    Url,
+    Token,
+}
+
+/// Formulaire d'ajout (`original` vide) ou de modification d'un serveur. Le nom ne change pas
+/// à la modification : il sert de clé aux sessions, à l'historique et aux onglets.
+#[derive(Debug)]
+pub struct ServerForm {
+    pub original: Option<String>,
+    pub name: String,
+    pub url: String,
+    /// Vide = pas de token (ajout) ou token inchangé (modification).
+    pub token: String,
+    pub field: ServerField,
+    pub error: Option<String>,
+}
+
+/// Ce que le formulaire demande à `main` de faire (écrire la config, créer le fournisseur).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerDraft {
+    pub original: Option<String>,
+    pub name: String,
+    pub url: String,
+    pub token: Option<String>,
+}
+
 /// Formulaire de connexion. Le mot de passe n'y reste que le temps de la saisie.
 #[derive(Debug)]
 pub struct LoginForm {
@@ -141,6 +170,12 @@ pub struct App {
     pub servers: Vec<ServerEntry>,
     /// Liste des serveurs ouverte par-dessus l'interface (indice de la ligne choisie).
     pub server_picker: Option<usize>,
+    /// Formulaire d'ajout / de modification d'un serveur, par-dessus la liste.
+    pub server_form: Option<ServerForm>,
+    /// Suppression en attente de confirmation (nom du serveur).
+    pub server_delete: Option<String>,
+    /// Message affiché dans la liste des serveurs (refus, confirmation).
+    pub server_note: Option<String>,
     /// Ce que sait faire chaque serveur **connecté** : `(logs, explorateur)`. Absent = pas de
     /// fournisseur (il faut se connecter avant de pouvoir y aller).
     caps: std::collections::HashMap<String, (bool, bool)>,
@@ -190,6 +225,9 @@ impl App {
             login: None,
             servers: Vec::new(),
             server_picker: None,
+            server_form: None,
+            server_delete: None,
+            server_note: None,
             caps: std::collections::HashMap::new(),
             stack: vec![Page::Home(home)],
             tabs: vec![Vec::new()],
@@ -992,10 +1030,189 @@ impl App {
     }
 
     pub fn open_server_picker(&mut self) {
-        if self.servers.len() > 1 {
-            let at = self.servers.iter().position(|s| s.name == self.server_name);
-            self.server_picker = Some(at.unwrap_or(0));
+        let at = self.servers.iter().position(|s| s.name == self.server_name);
+        self.server_picker = Some(at.unwrap_or(0));
+        self.server_note = None;
+    }
+
+    pub fn close_server_picker(&mut self) {
+        self.server_picker = None;
+        self.server_delete = None;
+        self.server_note = None;
+    }
+
+    /// Le serveur est-il celui d'un onglet ouvert ?
+    fn server_in_use(&self, name: &str) -> bool {
+        self.server_name == name || self.tab_servers.iter().any(|s| s == name)
+    }
+
+    /// Oublie ce qu'on savait d'un serveur (il n'est plus connecté).
+    pub fn forget_caps(&mut self, server: &str) {
+        self.caps.remove(server);
+        self.sync_server();
+    }
+
+    // --- ajout, modification et suppression
+
+    /// `a` dans la liste : formulaire vide.
+    pub fn server_form_add(&mut self) {
+        self.server_note = None;
+        self.server_form = Some(ServerForm {
+            original: None,
+            name: String::new(),
+            url: "https://".to_owned(),
+            token: String::new(),
+            field: ServerField::Name,
+            error: None,
+        });
+    }
+
+    /// `e` dans la liste : formulaire prérempli avec le serveur choisi (le nom n'est pas modifiable).
+    pub fn server_form_edit(&mut self) {
+        self.server_note = None;
+        let Some(entry) = self
+            .server_picker
+            .and_then(|i| self.servers.get(i))
+            .cloned()
+        else {
+            return;
+        };
+        self.server_form = Some(ServerForm {
+            original: Some(entry.name.clone()),
+            name: entry.name,
+            url: entry.url,
+            token: String::new(),
+            field: ServerField::Url,
+            error: None,
+        });
+    }
+
+    fn server_form_field(&mut self) -> Option<&mut String> {
+        let f = self.server_form.as_mut()?;
+        Some(match f.field {
+            ServerField::Name => &mut f.name,
+            ServerField::Url => &mut f.url,
+            ServerField::Token => &mut f.token,
+        })
+    }
+
+    pub fn server_form_type(&mut self, c: char) {
+        if let Some(v) = self.server_form_field() {
+            v.push(c);
         }
+    }
+
+    pub fn server_form_backspace(&mut self) {
+        if let Some(v) = self.server_form_field() {
+            v.pop();
+        }
+    }
+
+    /// Tab / flèches : champ suivant (`1`) ou précédent (`-1`) ; le nom est sauté à la modification.
+    pub fn server_form_move(&mut self, delta: isize) {
+        let Some(f) = self.server_form.as_mut() else {
+            return;
+        };
+        let all = [ServerField::Name, ServerField::Url, ServerField::Token];
+        let usable: Vec<ServerField> = all
+            .into_iter()
+            .filter(|x| f.original.is_none() || *x != ServerField::Name)
+            .collect();
+        let at = usable.iter().position(|x| *x == f.field).unwrap_or(0) as isize;
+        f.field = usable[(at + delta).rem_euclid(usable.len() as isize) as usize];
+    }
+
+    /// Entrée : passe au champ suivant, ou valide sur le dernier. Renvoie ce qu'il faut
+    /// enregistrer si la saisie est correcte ; sinon l'erreur reste dans le formulaire.
+    pub fn server_form_enter(&mut self) -> Option<ServerDraft> {
+        let f = self.server_form.as_mut()?;
+        if f.field != ServerField::Token {
+            self.server_form_move(1);
+            return None;
+        }
+        let others: Vec<&str> = self
+            .servers
+            .iter()
+            .map(|s| s.name.as_str())
+            .filter(|n| Some(*n) != f.original.as_deref())
+            .collect();
+        let (name, url) = (f.name.trim().to_owned(), f.url.trim().trim_end_matches('/'));
+        if let Err(e) = crate::config::check_server(&name, url, &others) {
+            // Le curseur retourne sur le champ fautif (le nom n'est modifiable qu'à l'ajout).
+            let on_name = f.original.is_none() && (e.starts_with("nom") || e.starts_with("le nom"));
+            f.field = if on_name {
+                ServerField::Name
+            } else {
+                ServerField::Url
+            };
+            f.error = Some(e);
+            return None;
+        }
+        let token = f.token.trim();
+        Some(ServerDraft {
+            original: f.original.clone(),
+            name,
+            url: url.to_owned(),
+            token: (!token.is_empty()).then(|| token.to_owned()),
+        })
+    }
+
+    /// `main` n'a pas pu enregistrer (disque, droits) : le formulaire reste ouvert.
+    pub fn server_form_fail(&mut self, error: String) {
+        if let Some(f) = self.server_form.as_mut() {
+            f.error = Some(error);
+        }
+    }
+
+    /// Enregistrement réussi : le formulaire se ferme, la liste reste sur ce serveur.
+    pub fn server_form_done(&mut self, servers: Vec<ServerEntry>, name: &str) {
+        self.server_form = None;
+        self.servers = servers;
+        if let Some(i) = self.servers.iter().position(|s| s.name == name) {
+            self.server_picker = Some(i);
+        }
+    }
+
+    pub fn server_form_cancel(&mut self) {
+        self.server_form = None;
+    }
+
+    /// `d` dans la liste : demande confirmation, sauf si la suppression est refusée.
+    pub fn server_delete_ask(&mut self) {
+        self.server_note = None;
+        let Some(name) = self
+            .server_picker
+            .and_then(|i| self.servers.get(i))
+            .map(|s| s.name.clone())
+        else {
+            return;
+        };
+        if self.servers.len() <= 1 {
+            self.server_note = Some("impossible de supprimer le dernier serveur".to_owned());
+        } else if self.server_in_use(&name) {
+            self.server_note = Some(format!(
+                "« {name} » est utilisé par un onglet : changez-le de serveur d'abord"
+            ));
+        } else {
+            self.server_delete = Some(name);
+        }
+    }
+
+    /// `o` / `y` : confirme. Renvoie le serveur à supprimer pour que `main` le retire de la config.
+    pub fn server_delete_confirm(&mut self) -> Option<String> {
+        self.server_delete.take()
+    }
+
+    /// Après la suppression par `main` : la liste est mise à jour.
+    pub fn server_delete_done(&mut self, servers: Vec<ServerEntry>) {
+        self.servers = servers;
+        let max = self.servers.len().saturating_sub(1);
+        self.server_picker = self.server_picker.map(|i| i.min(max));
+        self.server_note = None;
+    }
+
+    pub fn server_delete_cancel(&mut self) {
+        self.server_delete = None;
     }
 
     pub fn server_picker_move(&mut self, delta: isize) {
@@ -1028,7 +1245,13 @@ impl App {
         let Some(form) = self.login.take() else {
             return false;
         };
-        !form.switch_to && !self.is_connected(&form.server)
+        self.login_quits(&form)
+    }
+
+    /// Échap sur ce formulaire quitterait-il ? Seulement si aucun serveur n'est connecté :
+    /// il n'y aurait alors rien à afficher.
+    pub fn login_quits(&self, form: &LoginForm) -> bool {
+        !form.switch_to && self.caps.is_empty()
     }
 
     // --- liste des onglets (touche `T`)
@@ -2754,7 +2977,12 @@ mod tests {
     fn selecteur_de_serveur() {
         let mut a = fresh();
         a.open_server_picker();
-        assert_eq!(a.server_picker, None, "un seul serveur : rien à choisir");
+        assert_eq!(
+            a.server_picker,
+            Some(0),
+            "la liste s'ouvre même sans serveur : on peut en ajouter"
+        );
+        a.close_server_picker();
         a.set_servers(vec![entry("A"), entry("B"), entry("C")]);
         a.set_initial_server("A");
         a.set_caps("A", true, true);
@@ -2838,8 +3066,143 @@ mod tests {
         assert_eq!(a.server_name, "A");
         // Renouvellement de session d'un serveur connecté : ferme
         a.set_caps("A", true, true);
+        // Serveur courant déconnecté (URL modifiée) mais un autre est connecté : ferme
+        a.set_caps("B", true, true);
+        a.forget_caps("A");
+        a.open_login("A", "t", false);
+        assert!(!a.login_escape());
+        a.set_caps("A", true, true);
         a.open_login("A", "t", false);
         assert!(!a.login_escape());
         assert!(!a.login_escape(), "sans formulaire : rien");
+    }
+
+    // --- ajout, modification, suppression
+
+    fn type_str(a: &mut App, text: &str) {
+        text.chars().for_each(|c| a.server_form_type(c));
+    }
+
+    #[test]
+    fn ajout_d_un_serveur() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A")]);
+        a.set_initial_server("A");
+        a.open_server_picker();
+        a.server_form_add();
+        let f = a.server_form.as_ref().unwrap();
+        assert_eq!((f.field, f.url.as_str()), (ServerField::Name, "https://"));
+        // Nom déjà pris : erreur, curseur sur le nom
+        type_str(&mut a, "A");
+        assert_eq!(a.server_form_enter(), None); // -> URL
+        assert_eq!(a.server_form_enter(), None); // -> Token
+        assert_eq!(a.server_form_enter(), None); // valide : refusé
+        let f = a.server_form.as_ref().unwrap();
+        assert!(f.error.as_deref().unwrap().contains("déjà"));
+        assert_eq!(f.field, ServerField::Name);
+        // Corrige, URL invalide
+        a.server_form_backspace();
+        type_str(&mut a, "B");
+        a.server_form_enter();
+        a.server_form_enter();
+        assert_eq!(a.server_form_enter(), None); // « https:// » seul
+        assert!(a.server_form.as_ref().unwrap().error.is_some());
+        assert_eq!(a.server_form.as_ref().unwrap().field, ServerField::Url);
+        // URL correcte (la barre finale est retirée), token facultatif
+        type_str(&mut a, "x.example/");
+        a.server_form_move(1);
+        let draft = a.server_form_enter().unwrap();
+        assert_eq!(
+            draft,
+            ServerDraft {
+                original: None,
+                name: "B".into(),
+                url: "https://x.example".into(),
+                token: None
+            }
+        );
+        // main enregistre puis annonce la fin : la liste se met à jour, le formulaire se ferme
+        a.server_form_done(vec![entry("A"), entry("B")], "B");
+        assert!(a.server_form.is_none());
+        assert_eq!((a.servers.len(), a.server_picker), (2, Some(1)));
+    }
+
+    #[test]
+    fn modification_d_un_serveur_nom_fixe_token_vide_inchange() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        a.open_server_picker();
+        a.server_picker_move(1);
+        a.server_form_edit();
+        let f = a.server_form.as_ref().unwrap();
+        assert_eq!(
+            (f.original.as_deref(), f.field),
+            (Some("B"), ServerField::Url)
+        );
+        // Le nom est sauté par Tab
+        a.server_form_move(-1);
+        assert_eq!(a.server_form.as_ref().unwrap().field, ServerField::Token);
+        a.server_form_move(1);
+        assert_eq!(a.server_form.as_ref().unwrap().field, ServerField::Url);
+        // Son propre nom n'est pas un doublon
+        a.server_form_backspace();
+        type_str(&mut a, "ZZ");
+        a.server_form_move(1);
+        let d = a.server_form_enter().unwrap();
+        assert_eq!(
+            (
+                d.original.as_deref(),
+                d.name.as_str(),
+                d.url.as_str(),
+                d.token
+            ),
+            (Some("B"), "B", "http://ZZ", None)
+        );
+    }
+
+    #[test]
+    fn suppression_refusee_si_utilise_ou_dernier() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B"), entry("C")]);
+        a.set_initial_server("A");
+        a.open_server_picker();
+        // A est le serveur d'un onglet
+        a.server_delete_ask();
+        assert!(a.server_delete.is_none() && a.server_note.as_deref().unwrap().contains("onglet"));
+        // B est libre : confirmation demandée, annulable
+        a.server_picker_move(1);
+        a.server_delete_ask();
+        assert_eq!(a.server_delete.as_deref(), Some("B"));
+        assert!(a.server_note.is_none());
+        a.server_delete_cancel();
+        assert!(a.server_delete.is_none());
+        a.server_delete_ask();
+        assert_eq!(a.server_delete_confirm().as_deref(), Some("B"));
+        a.server_delete_done(vec![entry("A"), entry("C")]);
+        assert_eq!(a.servers.len(), 2);
+        // Un onglet qui n'est pas affiché compte aussi
+        a.open_in_new_tab();
+        a.switch_server("C");
+        a.switch_tab(-1);
+        a.set_caps("C", true, true);
+        a.server_picker_move(1);
+        a.server_delete_ask();
+        assert!(a.server_delete.is_none());
+        // Le dernier serveur ne se supprime pas
+        a.server_delete_done(vec![entry("A")]);
+        a.server_picker = Some(0);
+        a.server_delete_ask();
+        assert!(a.server_note.as_deref().unwrap().contains("dernier"));
+    }
+
+    #[test]
+    fn oublier_un_serveur_le_deconnecte() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A")]);
+        a.set_caps("A", true, true);
+        assert!(a.is_connected("A"));
+        a.forget_caps("A");
+        assert!(!a.is_connected("A"));
     }
 }
