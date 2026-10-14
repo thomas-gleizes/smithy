@@ -40,11 +40,12 @@ const TICK: Duration = Duration::from_millis(100);
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Les arguments d'abord : `--help` doit répondre sans configuration.
+    let fresh = parse_args()?;
     let cfg = config::load()?;
     let wanted = std::env::var("SMITHY_SERVER").ok();
     // Vérifie le nom demandé (erreur claire) avant d'ouvrir le terminal.
     cfg.server(wanted.as_deref())?;
-    let fresh = parse_args()?;
     let store = SessionStore::default_location();
 
     let mut terminal = ratatui::init();
@@ -57,8 +58,9 @@ const USAGE: &str = "smithy : consulter la CI et le code de vos forges git dans 
 
 Usage : smithy [--fresh]
 
-  --fresh   ne rouvre pas les onglets de la dernière session (démarre sur l'accueil)
-  --help    affiche ce message
+  --fresh     ne rouvre pas les onglets de la dernière session (démarre sur l'accueil)
+  --version   affiche la version
+  --help      affiche ce message
 
 Configuration : voir le README (serveurs dans ~/.config/smithy/config.toml).";
 
@@ -68,6 +70,10 @@ fn parse_args() -> Result<bool> {
     for arg in std::env::args().skip(1) {
         match arg.as_str() {
             "--fresh" => fresh = true,
+            "-V" | "--version" => {
+                println!("smithy {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
             "-h" | "--help" => {
                 println!("{USAGE}");
                 std::process::exit(0);
