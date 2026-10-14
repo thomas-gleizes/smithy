@@ -54,6 +54,12 @@ pub enum Msg {
         pipeline_id: u64,
         result: Result<JobLog, Error>,
     },
+    /// Résultat de la sonde de joignabilité d'un serveur (version si connue, ou raison).
+    Reach {
+        server: String,
+        url: String,
+        result: Result<Option<String>, String>,
+    },
     /// Résultat du login sur ce serveur : la session à conserver, ou le message d'erreur.
     LoggedIn {
         server: String,
@@ -106,6 +112,15 @@ impl Page {
 pub enum LoginField {
     Username,
     Password,
+}
+
+/// Le serveur répond-il sur le réseau ? Indépendant de la session : un serveur peut être
+/// « connecté » (identifiants sauvegardés) et injoignable (VPN coupé).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reach {
+    Checking,
+    Up(Option<String>),
+    Down(String),
 }
 
 /// Un serveur configuré, pour la liste des serveurs.
@@ -176,6 +191,9 @@ pub struct App {
     pub server_delete: Option<String>,
     /// Message affiché dans la liste des serveurs (refus, confirmation).
     pub server_note: Option<String>,
+    /// Joignabilité des serveurs, mesurée tant que la liste est ouverte.
+    pub reach: std::collections::HashMap<String, Reach>,
+    probes: Vec<String>,
     /// Ce que sait faire chaque serveur **connecté** : `(logs, explorateur)`. Absent = pas de
     /// fournisseur (il faut se connecter avant de pouvoir y aller).
     caps: std::collections::HashMap<String, (bool, bool)>,
@@ -228,6 +246,8 @@ impl App {
             server_form: None,
             server_delete: None,
             server_note: None,
+            reach: std::collections::HashMap::new(),
+            probes: Vec::new(),
             caps: std::collections::HashMap::new(),
             stack: vec![Page::Home(home)],
             tabs: vec![Vec::new()],
@@ -543,6 +563,9 @@ impl App {
     /// logs d'un job en cours), et les jobs en cours des autres onglets, pour que leur titre
     /// signale la fin.
     pub fn tick(&mut self) {
+        if self.server_picker.is_some() {
+            self.probe_all();
+        }
         match self.stack.last() {
             Some(Page::Runs(r)) => {
                 let repo = r.repo.clone();
@@ -765,6 +788,22 @@ impl App {
     /// (une réponse tardive, après un changement de serveur de l'onglet, est donc ignorée).
     pub fn apply_for(&mut self, server: &str, msg: Msg) {
         match msg {
+            Msg::Reach {
+                server: name,
+                url,
+                result,
+            } => {
+                // Une réponse pour une ancienne URL (serveur modifié depuis) est ignorée.
+                if self.servers.iter().any(|s| s.name == name && s.url == url) {
+                    self.reach.insert(
+                        name,
+                        match result {
+                            Ok(v) => Reach::Up(v),
+                            Err(e) => Reach::Down(e),
+                        },
+                    );
+                }
+            }
             Msg::Repos { source, result } => {
                 for stack in self.stacks_of(server) {
                     if let Some(Page::Home(h)) = stack.first_mut() {
@@ -1033,6 +1072,34 @@ impl App {
         let at = self.servers.iter().position(|s| s.name == self.server_name);
         self.server_picker = Some(at.unwrap_or(0));
         self.server_note = None;
+        for s in &self.servers {
+            self.reach.entry(s.name.clone()).or_insert(Reach::Checking);
+        }
+        self.probe_all();
+    }
+
+    fn probe_all(&mut self) {
+        let names: Vec<String> = self.servers.iter().map(|s| s.name.clone()).collect();
+        for n in names {
+            self.probe(&n);
+        }
+    }
+
+    fn probe(&mut self, name: &str) {
+        if !self.probes.iter().any(|p| p == name) {
+            self.probes.push(name.to_owned());
+        }
+    }
+
+    /// Les serveurs à sonder (nom, URL) : `main` lance une sonde pour chacun.
+    pub fn take_probes(&mut self) -> Vec<(String, String)> {
+        std::mem::take(&mut self.probes)
+            .into_iter()
+            .filter_map(|n| {
+                let url = self.servers.iter().find(|s| s.name == n)?.url.clone();
+                Some((n, url))
+            })
+            .collect()
     }
 
     pub fn close_server_picker(&mut self) {
@@ -1168,6 +1235,9 @@ impl App {
     pub fn server_form_done(&mut self, servers: Vec<ServerEntry>, name: &str) {
         self.server_form = None;
         self.servers = servers;
+        // L'URL a pu changer : on remesure.
+        self.reach.insert(name.to_owned(), Reach::Checking);
+        self.probe(name);
         if let Some(i) = self.servers.iter().position(|s| s.name == name) {
             self.server_picker = Some(i);
         }
@@ -1206,6 +1276,8 @@ impl App {
     /// Après la suppression par `main` : la liste est mise à jour.
     pub fn server_delete_done(&mut self, servers: Vec<ServerEntry>) {
         self.servers = servers;
+        let names: Vec<&str> = self.servers.iter().map(|s| s.name.as_str()).collect();
+        self.reach.retain(|n, _| names.contains(&n.as_str()));
         let max = self.servers.len().saturating_sub(1);
         self.server_picker = self.server_picker.map(|i| i.min(max));
         self.server_note = None;
@@ -3204,5 +3276,75 @@ mod tests {
         assert!(a.is_connected("A"));
         a.forget_caps("A");
         assert!(!a.is_connected("A"));
+    }
+
+    // --- joignabilité
+
+    fn reach_msg(n: &str, r: Result<Option<String>, String>) -> Msg {
+        Msg::Reach {
+            server: n.into(),
+            url: format!("http://{n}"),
+            result: r,
+        }
+    }
+
+    #[test]
+    fn la_liste_des_serveurs_sonde_chaque_serveur() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        assert!(
+            a.take_probes().is_empty(),
+            "rien tant que la liste est fermée"
+        );
+        a.tick();
+        assert!(a.take_probes().is_empty());
+        a.open_server_picker();
+        assert_eq!(a.reach.get("A"), Some(&Reach::Checking));
+        assert_eq!(
+            a.take_probes(),
+            [
+                ("A".into(), "http://A".into()),
+                ("B".into(), "http://B".into())
+            ]
+        );
+        // Liste ouverte : chaque tick remesure (le VPN peut revenir), sans doublon
+        a.tick();
+        a.tick();
+        assert_eq!(a.take_probes().len(), 2);
+        a.apply_for("A", reach_msg("A", Ok(Some("15.0".into()))));
+        a.apply_for("B", reach_msg("B", Err("connexion impossible".into())));
+        assert_eq!(a.reach["A"], Reach::Up(Some("15.0".into())));
+        assert_eq!(a.reach["B"], Reach::Down("connexion impossible".into()));
+        // Le résultat précédent reste affiché pendant la remesure
+        a.close_server_picker();
+        a.open_server_picker();
+        assert_eq!(a.reach["B"], Reach::Down("connexion impossible".into()));
+    }
+
+    #[test]
+    fn sonde_d_une_ancienne_url_ignoree_et_modification_remesuree() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A")]);
+        a.apply_for(
+            "A",
+            Msg::Reach {
+                server: "A".into(),
+                url: "http://ancienne".into(),
+                result: Ok(None),
+            },
+        );
+        assert!(a.reach.is_empty());
+        a.server_form_done(
+            vec![ServerEntry {
+                name: "A".into(),
+                url: "http://nouvelle".into(),
+            }],
+            "A",
+        );
+        assert_eq!(a.reach["A"], Reach::Checking);
+        assert_eq!(a.take_probes(), [("A".into(), "http://nouvelle".into())]);
+        // Un serveur supprimé n'a plus d'état
+        a.server_delete_done(vec![]);
+        assert!(a.reach.is_empty());
     }
 }

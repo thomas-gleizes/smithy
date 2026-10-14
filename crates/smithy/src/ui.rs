@@ -10,7 +10,7 @@ use ratatui::{
 use smithy_core::{EntryKind, RepoInfo, Status};
 
 use crate::{
-    app::{App, LoginField, LoginForm, ServerField, ServerForm, TabMarker, TabTitle},
+    app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
@@ -224,21 +224,32 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
         .iter()
         .map(|s| {
             let here = s.name == app.server_name;
-            let state = if app.is_connected(&s.name) {
-                Span::styled("connecté", Style::new().fg(Color::Green))
+            // D'abord le réseau (le serveur répond-il ?), ensuite la session (identifiants).
+            let network = match app.reach.get(&s.name) {
+                Some(Reach::Up(_)) => Span::styled("joignable", Style::new().fg(Color::Green)),
+                Some(Reach::Down(why)) => Span::styled(
+                    format!("injoignable ({why})"),
+                    Style::new().fg(Color::Red).bold(),
+                ),
+                _ => Span::styled("vérification…", Style::new().fg(Color::DarkGray)),
+            };
+            let session = if app.is_connected(&s.name) {
+                Span::styled("session ouverte", Style::new().fg(Color::Green))
             } else {
-                Span::styled("à connecter", Style::new().fg(Color::DarkGray))
+                Span::styled("pas de session", Style::new().fg(Color::DarkGray))
             };
             ListItem::new(Line::from(vec![
                 Span::raw(if here { "● " } else { "  " }),
                 Span::raw(format!("{} ", s.name)),
                 Span::styled(format!("({}) ", s.url), Style::new().fg(Color::DarkGray)),
-                state,
+                network,
+                Span::styled(" · ", Style::new().fg(Color::DarkGray)),
+                session,
             ]))
         })
         .collect();
     let height = (items.len() as u16).clamp(1, 12) + 2;
-    let area = centered(f.area(), 84, height);
+    let area = centered(f.area(), 104, height);
     f.render_widget(Clear, area);
     let mut block = Block::default()
         .borders(Borders::ALL)
@@ -2485,11 +2496,45 @@ mod tests {
         app.open_server_picker();
         let text = render(&app, 100, 14);
         assert!(text.contains("Serveurs"), "{text}");
-        assert!(text.contains("● A") && text.contains("connecté"), "{text}");
         assert!(
-            text.contains("B (http://B.example)") && text.contains("à connecter"),
+            text.contains("● A") && text.contains("session ouverte"),
             "{text}"
         );
+        assert!(
+            text.contains("B (http://B.example)") && text.contains("pas de session"),
+            "{text}"
+        );
+        // Réseau : vérification en cours, puis résultats distincts de la session
+        assert!(text.contains("vérification…"), "{text}");
+        let reach = |app: &mut App, n: &str, r: Result<Option<String>, String>| {
+            let url = format!("http://{n}.example");
+            app.apply_for(
+                n,
+                Msg::Reach {
+                    server: n.into(),
+                    url,
+                    result: r,
+                },
+            );
+        };
+        reach(&mut app, "A", Ok(Some("15.0".into())));
+        reach(&mut app, "B", Err("délai dépassé".into()));
+        let text = render(&app, 120, 14);
+        assert!(text.contains("joignable · session ouverte"), "{text}");
+        assert!(
+            text.contains("injoignable (délai dépassé) · pas de session"),
+            "{text}"
+        );
+        // Une réponse pour une ancienne URL est ignorée
+        app.apply_for(
+            "B",
+            Msg::Reach {
+                server: "B".into(),
+                url: "http://ancienne".into(),
+                result: Ok(None),
+            },
+        );
+        assert!(render(&app, 120, 14).contains("injoignable"));
         assert!(text.contains("↵ choisir"));
     }
 

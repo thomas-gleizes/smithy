@@ -711,6 +711,21 @@ async fn run(
             app.tick();
             last_refresh = Instant::now();
         }
+        // Sondes de joignabilité demandées par la liste des serveurs.
+        for (name, url) in app.take_probes() {
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                let result = smithy_forgejo::ping(&url).await;
+                let _ = tx.send((
+                    name.clone(),
+                    Msg::Reach {
+                        server: name,
+                        url,
+                        result,
+                    },
+                ));
+            });
+        }
         // Chaque requête part vers le fournisseur de son serveur ; sans fournisseur (pas encore
         // connecté), elle attend dans la file.
         let mut waiting = Vec::new();

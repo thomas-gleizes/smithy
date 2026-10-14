@@ -5,10 +5,12 @@
 mod browse;
 mod login;
 mod logs;
+mod ping;
 mod repos;
 mod version;
 
 pub use login::{Login, login};
+pub use ping::ping;
 pub use version::{Decision, Flavor, Support, Version, decide};
 
 use reqwest::StatusCode;
