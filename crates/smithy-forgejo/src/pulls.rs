@@ -11,7 +11,7 @@ use reqwest::StatusCode;
 use serde::Deserialize;
 use smithy_core::{
     CheckStatus, Comment, Commit, Error, PullDetail, PullFilter, PullPage, PullRequest, PullState,
-    Repo, Result, Review, ReviewComment, ReviewState, Status,
+    PullStats, Repo, Result, Review, ReviewComment, ReviewState, Status,
 };
 
 use crate::{Forgejo, PAGE_SIZE, history::ApiCommit};
@@ -170,10 +170,12 @@ impl ApiPull {
                 .into_iter()
                 .map(|l| l.name)
                 .collect(),
-            comments: self.comments,
-            additions: self.additions,
-            deletions: self.deletions,
-            changed_files: self.changed_files,
+            stats: Some(PullStats {
+                additions: self.additions,
+                deletions: self.deletions,
+                changed_files: self.changed_files,
+                comments: self.comments,
+            }),
             // Sans objet pour une PR fermée (annoncée fusionnable) ou un brouillon (annoncé
             // non fusionnable alors qu'il n'a pas de conflit, mesuré).
             mergeable: (state == PullState::Open && !self.draft).then_some(self.mergeable),
@@ -469,8 +471,9 @@ mod tests {
         );
         assert_eq!(p.labels, ["docs"]);
         assert_eq!(
-            (p.additions, p.deletions, p.changed_files, p.comments),
-            (8, 2, 4, 2)
+            p.stats
+                .map(|s| (s.additions, s.deletions, s.changed_files, s.comments)),
+            Some((8, 2, 4, 2))
         );
         assert_eq!(p.author, "smithy");
         assert_eq!(p.head_sha, HEAD);

@@ -371,17 +371,21 @@ pub fn pull_layout(d: &PullDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Option
         ));
     }
     head.push(plain("", None));
-    let comments = d.comments.as_ref().map_or(p.comments as usize, Vec::len);
+    let stats = p.stats.unwrap_or_default();
+    let comments = d
+        .comments
+        .as_ref()
+        .map_or(stats.comments as usize, Vec::len);
     head.push(plain(
         format!(
             "{} · +{} −{} · {} · {} · {}",
             plural(
-                p.changed_files as usize,
+                stats.changed_files as usize,
                 "fichier modifié",
                 "fichiers modifiés"
             ),
-            p.additions,
-            p.deletions,
+            stats.additions,
+            stats.deletions,
             plural(d.commits.len(), "commit", "commits"),
             plural(d.reviews.len(), "revue", "revues"),
             plural(comments, "commentaire", "commentaires"),
@@ -456,8 +460,8 @@ pub fn pull_layout(d: &PullDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Option
             });
         }
         Some(_) => {}
-        None if p.comments > 0 => parts.push(Part {
-            name: format!("Conversation ({}, non affichée)", p.comments),
+        None if stats.comments > 0 => parts.push(Part {
+            name: format!("Conversation ({}, non affichée)", stats.comments),
             status: Status::Skipped,
             collapsed: false,
             lines: vec![plain(
@@ -574,10 +578,12 @@ mod tests {
             base: "main".into(),
             head_sha: format!("{n:040x}"),
             labels: if n == 3 { vec!["docs".into()] } else { vec![] },
-            comments: 0,
-            additions: 1,
-            deletions: 0,
-            changed_files: 1,
+            stats: Some(smithy_core::PullStats {
+                additions: 1,
+                deletions: 0,
+                changed_files: 1,
+                comments: 0,
+            }),
             mergeable: Some(true),
             created: Some("2026-10-14T10:00:00Z".into()),
             updated: None,
@@ -673,10 +679,12 @@ mod tests {
         p.title = "feat: page de garde".into();
         p.body = "Ajoute une **page**.\n\n- un\n- deux\n".into();
         p.labels = vec!["docs".into(), "enhancement".into()];
-        p.comments = 2;
-        p.changed_files = 2;
-        p.additions = 3;
-        p.deletions = 1;
+        p.stats = Some(smithy_core::PullStats {
+            additions: 3,
+            deletions: 1,
+            changed_files: 2,
+            comments: 2,
+        });
         PullDetail {
             pull: p,
             commits: vec![Commit {

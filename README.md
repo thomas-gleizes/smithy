@@ -4,14 +4,14 @@ A terminal UI (TUI) to browse the CI and the code of your git forges, written in
 
 Built for machines without a desktop (e.g. a server behind a VPN): a single static-ish binary, `rustls` only (no OpenSSL), read-only access.
 
-> **Status:** early development. Only Forgejo is implemented. The UI and its messages are in French.
+> **Status:** early development. Forgejo and GitHub are implemented. The UI and its messages are in French.
 
 ## Features
 
 - A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list, the code explorer, the **commit history**, the **branches** and the **pull requests**.
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step. Filter the list of runs (`/` for text, `s` for status) and search inside logs, files and rendered Markdown (`/`, then `n` / `N`).
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme. **Markdown files** (`.md`) open rendered: headings, emphasis, lists (nested, ordered, task lists), quotes, tables, links (the target is shown), images (alt text), rules, and code blocks coloured by their language; raw HTML is shown dimmed. Press `m` to switch to the highlighted source.
-- Sign in from the TUI (username and password, entered once and never stored).
+- Sign in from the TUI on Forgejo (username and password, entered once and never stored); GitHub uses a token.
 - A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`; each tab has its own server, which you can change from the tab (`S`) without touching the other tabs.
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
@@ -39,7 +39,7 @@ An unverified version is never silently trusted: the log view shows a ⚠ notice
 | Forge        | Status                                              |
 |--------------|-----------------------------------------------------|
 | Forgejo      | Implemented, including job steps and logs (through Forgejo's web routes, which need a login: see below) |
-| GitHub       | Planned                                             |
+| GitHub       | Implemented (github.com and GitHub Enterprise): runs and job logs split by step, repositories, code, history, pull requests with their checks. Needs a token: see below |
 | GitLab       | Planned                                             |
 | Bitbucket    | Planned                                             |
 | Azure DevOps | Planned                                             |
@@ -85,14 +85,31 @@ Servers are declared in a TOML file at `~/.config/smithy/config.toml` (platform 
 ```toml
 [[server]]
 name = "home"            # letters, digits, - _ . only
-kind = "forgejo"         # default; other forges are planned
+kind = "forgejo"         # default; or "github"
 url = "https://forge.example.com"
 token = "<your token>"   # read-only is enough
 
 [[server]]
 name = "work"
 url = "https://git.work.example"
+
+[[server]]
+name = "gh"
+kind = "github"          # url defaults to https://api.github.com
+token = "<your token>"   # required for GitHub
+# GitHub Enterprise: url = "https://github.example.com/api/v3"
 ```
+
+### GitHub
+
+GitHub has no password login in its API, so a **token is required** (no login form: when a GitHub server has no token, smithy opens the server form on its token field instead). Either a *classic* token with the `repo` scope (add `read:org` to list organisation repositories), or a *fine-grained* token with read access to *Actions*, *Contents*, *Pull requests*, *Commit statuses* and *Metadata*. With the GitHub CLI installed, `gh auth token` prints one you already have. The token goes into the config like any other (`S`, then `e`, or `kind = "github"` in `config.toml`).
+
+Everything goes through GitHub's documented REST API with that token. Some differences with Forgejo:
+
+- **Logs**: GitHub serves a job's log as one text; smithy splits it into the job's steps (from the log's own markers, in the order of the steps that ran) so it reads like Forgejo's. If the markers do not match the steps, the whole log is shown in one section and the view says so. GitHub only serves a job's log once the job is finished; while it runs, the steps and their status are shown and kept up to date.
+- **Rate limit**: 5,000 requests an hour. GitHub only gives jobs run by run (the 20 latest runs are listed), but every answer is kept with its `ETag` and re-asking for something unchanged is free (*304 Not Modified* does not count), so the 5-second refresh costs almost nothing. When the limit is reached, smithy says when it comes back.
+- The repository page does not show the number of open pull requests (GitHub counts them with the issues), and the list of pull requests does not show their size (only the opened pull request does).
+- The CI of a pull request comes from its *check runs* (GitHub Actions) and commit statuses (other services).
 
 All the servers are available at once: smithy starts on `SMITHY_SERVER` if set, otherwise on the first server that already has credentials (a `token` or a saved login), otherwise on the first one. Each tab belongs to one server; press `S` to change the server of the current tab (see below). The former single-server format (`url` and `token` at the top level) is still read, as a server named `default`.
 
@@ -224,10 +241,11 @@ make dev-reset  # destroy the local environment
 
 ### Architecture
 
-Cargo workspace of 3 crates, dependencies flow one way: `smithy` → `smithy-forgejo` → `smithy-core`.
+Cargo workspace of 4 crates, dependencies flow one way: `smithy` → `smithy-forgejo` / `smithy-github` → `smithy-core`.
 
 - `smithy-core`: common models, `Error`, `Capabilities` and the `Provider` trait.
 - `smithy-forgejo`: Forgejo REST client implementing `Provider`.
+- `smithy-github`: GitHub REST client implementing `Provider`.
 - `smithy`: the binary (application state, rendering, config, event loop).
 
 A new forge is a new crate implementing `Provider`.
@@ -254,7 +272,8 @@ A new forge is a new crate implementing `Provider`.
 - [x] Markdown rendering in the explorer
 - [ ] File search by name in the explorer, tags and commits as references
 - [ ] Open the run URL from the TUI
-- [ ] GitHub backend (jobs and logs)
+- [x] GitHub backend with a token (jobs and logs, code, history, pull requests)
+- [ ] GitHub sign-in from the TUI (device flow: a code to enter on github.com)
 - [x] Multiple instances in the config file (selected per tab from the TUI)
 - [ ] GitLab, Bitbucket, Azure DevOps backends
 

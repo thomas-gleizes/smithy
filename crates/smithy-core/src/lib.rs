@@ -277,11 +277,9 @@ pub struct PullRequest {
     /// Commit de tête de la branche proposée (pour son statut de CI).
     pub head_sha: String,
     pub labels: Vec<String>,
-    /// Commentaires de la conversation (hors revues).
-    pub comments: u64,
-    pub additions: u64,
-    pub deletions: u64,
-    pub changed_files: u64,
+    /// Volume et commentaires ; `None` quand la liste du serveur ne les donne pas (GitHub : seul
+    /// le détail d'une PR les a).
+    pub stats: Option<PullStats>,
     /// `None` : inconnu (calcul en cours côté serveur, ou PR fermée).
     pub mergeable: Option<bool>,
     /// Dates RFC 3339 telles que le serveur les donne.
@@ -290,6 +288,15 @@ pub struct PullRequest {
     /// Fusion ou fermeture.
     pub closed: Option<String>,
     pub url: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PullStats {
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    /// Commentaires de la conversation (hors revues).
+    pub comments: u64,
 }
 
 /// Une page de la liste des pull requests, de la plus récente à la plus ancienne.

@@ -9,6 +9,7 @@ use smithy_core::{
 
 use crate::{
     browser::{Browser, Mode},
+    config::ServerKind,
     highlight::Run,
     history::{BranchesView, CommitView, CommitsView},
     logview::{LogState, LogView, Start, TextView},
@@ -175,10 +176,13 @@ pub enum Reach {
 pub struct ServerEntry {
     pub name: String,
     pub url: String,
+    pub kind: ServerKind,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerField {
+    /// Forgejo ou GitHub ; seulement à l'ajout.
+    Kind,
     Name,
     Url,
     Token,
@@ -189,6 +193,7 @@ pub enum ServerField {
 #[derive(Debug)]
 pub struct ServerForm {
     pub original: Option<String>,
+    pub kind: ServerKind,
     pub name: String,
     pub url: String,
     /// Vide = pas de token (ajout) ou token inchangé (modification).
@@ -204,6 +209,7 @@ pub struct ServerForm {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ServerDraft {
     pub original: Option<String>,
+    pub kind: ServerKind,
     pub name: String,
     pub url: String,
     pub token: Option<String>,
@@ -1667,13 +1673,58 @@ impl App {
         self.server_note = None;
         self.server_form = Some(ServerForm {
             original: None,
+            kind: ServerKind::Forgejo,
             name: String::new(),
             url: "https://".to_owned(),
             token: String::new(),
-            field: ServerField::Name,
+            field: ServerField::Kind,
             error: None,
             first_run: false,
         });
+    }
+
+    /// Un serveur GitHub sans token : GitHub n'a pas de connexion par mot de passe, on ouvre le
+    /// formulaire du serveur sur son token (à la place du login).
+    pub fn open_token_form(&mut self, server: &str) {
+        let Some(entry) = self.servers.iter().find(|s| s.name == server).cloned() else {
+            return;
+        };
+        self.server_form = Some(ServerForm {
+            original: Some(entry.name.clone()),
+            kind: entry.kind,
+            name: entry.name,
+            url: entry.url,
+            token: String::new(),
+            field: ServerField::Token,
+            error: Some(
+                "GitHub demande un token (pas de mot de passe) : classique « repo », ou à grain \
+                 fin en lecture (Actions, Contents, Pull requests, Commit statuses)"
+                    .to_owned(),
+            ),
+            first_run: false,
+        });
+    }
+
+    /// Champ Type : bascule Forgejo ↔ GitHub ; l'URL suit tant qu'elle n'a pas été saisie.
+    pub fn server_form_toggle_kind(&mut self) {
+        let Some(f) = self.server_form.as_mut() else {
+            return;
+        };
+        if f.original.is_some() || f.field != ServerField::Kind {
+            return;
+        }
+        let untouched = f.url.is_empty() || f.url == "https://" || f.url == f.kind.default_url();
+        f.kind = match f.kind {
+            ServerKind::Forgejo => ServerKind::GitHub,
+            ServerKind::GitHub => ServerKind::Forgejo,
+        };
+        if untouched {
+            f.url = match f.kind.default_url() {
+                "" => "https://".to_owned(),
+                url => url.to_owned(),
+            };
+        }
+        f.error = None;
     }
 
     /// Premier lancement : le formulaire d'ajout, sans liste derrière et sans annulation possible.
@@ -1696,6 +1747,7 @@ impl App {
         };
         self.server_form = Some(ServerForm {
             original: Some(entry.name.clone()),
+            kind: entry.kind,
             name: entry.name,
             url: entry.url,
             token: String::new(),
@@ -1708,6 +1760,8 @@ impl App {
     fn server_form_field(&mut self) -> Option<&mut String> {
         let f = self.server_form.as_mut()?;
         Some(match f.field {
+            // Le type ne se tape pas : il se bascule.
+            ServerField::Kind => return None,
             ServerField::Name => &mut f.name,
             ServerField::Url => &mut f.url,
             ServerField::Token => &mut f.token,
@@ -1731,10 +1785,16 @@ impl App {
         let Some(f) = self.server_form.as_mut() else {
             return;
         };
-        let all = [ServerField::Name, ServerField::Url, ServerField::Token];
+        let all = [
+            ServerField::Kind,
+            ServerField::Name,
+            ServerField::Url,
+            ServerField::Token,
+        ];
+        // Type et nom ne se choisissent qu'à l'ajout.
         let usable: Vec<ServerField> = all
             .into_iter()
-            .filter(|x| f.original.is_none() || *x != ServerField::Name)
+            .filter(|x| f.original.is_none() || !matches!(x, ServerField::Name | ServerField::Kind))
             .collect();
         let at = usable.iter().position(|x| *x == f.field).unwrap_or(0) as isize;
         f.field = usable[(at + delta).rem_euclid(usable.len() as isize) as usize];
@@ -1767,8 +1827,15 @@ impl App {
             return None;
         }
         let token = f.token.trim();
+        // Un nouveau serveur GitHub sans token ne pourrait jamais se connecter.
+        if f.kind == ServerKind::GitHub && f.original.is_none() && token.is_empty() {
+            f.field = ServerField::Token;
+            f.error = Some("GitHub : un token est obligatoire (pas de mot de passe)".to_owned());
+            return None;
+        }
         Some(ServerDraft {
             original: f.original.clone(),
+            kind: f.kind,
             name,
             url: url.to_owned(),
             token: (!token.is_empty()).then(|| token.to_owned()),
@@ -3406,6 +3473,7 @@ mod tests {
         ServerEntry {
             name: n.into(),
             url: format!("http://{n}"),
+            kind: ServerKind::Forgejo,
         }
     }
 
@@ -3722,7 +3790,11 @@ mod tests {
         a.open_server_picker();
         a.server_form_add();
         let f = a.server_form.as_ref().unwrap();
-        assert_eq!((f.field, f.url.as_str()), (ServerField::Name, "https://"));
+        assert_eq!(
+            (f.field, f.kind, f.url.as_str()),
+            (ServerField::Kind, ServerKind::Forgejo, "https://")
+        );
+        assert_eq!(a.server_form_enter(), None); // -> Nom
         // Nom déjà pris : erreur, curseur sur le nom
         type_str(&mut a, "A");
         assert_eq!(a.server_form_enter(), None); // -> URL
@@ -3747,6 +3819,7 @@ mod tests {
             draft,
             ServerDraft {
                 original: None,
+                kind: ServerKind::Forgejo,
                 name: "B".into(),
                 url: "https://x.example".into(),
                 token: None
@@ -3759,6 +3832,65 @@ mod tests {
     }
 
     #[test]
+    fn ajout_d_un_serveur_github_avec_token_obligatoire() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A")]);
+        a.open_server_picker();
+        a.server_form_add();
+        // Le type se bascule ; l'URL non saisie suit
+        a.server_form_toggle_kind();
+        let f = a.server_form.as_ref().unwrap();
+        assert_eq!(
+            (f.kind, f.url.as_str()),
+            (ServerKind::GitHub, "https://api.github.com")
+        );
+        type_str(&mut a, "x"); // le type ne se tape pas
+        a.server_form_enter();
+        type_str(&mut a, "gh");
+        a.server_form_enter(); // -> URL (gardée)
+        a.server_form_enter(); // -> Token
+        assert_eq!(a.server_form_enter(), None, "sans token : refusé");
+        let f = a.server_form.as_ref().unwrap();
+        assert_eq!(f.field, ServerField::Token);
+        assert!(f.error.as_deref().unwrap().contains("token"));
+        type_str(&mut a, "ghp_x");
+        let d = a.server_form_enter().unwrap();
+        assert_eq!(
+            (d.kind, d.name.as_str(), d.url.as_str(), d.token.as_deref()),
+            (
+                ServerKind::GitHub,
+                "gh",
+                "https://api.github.com",
+                Some("ghp_x")
+            )
+        );
+        // Revenir à Forgejo remet l'URL vide à compléter ; une URL saisie ne bouge plus
+        a.server_form_add();
+        a.server_form_toggle_kind();
+        a.server_form_toggle_kind();
+        assert_eq!(a.server_form.as_ref().unwrap().url, "https://");
+        // Serveur GitHub sans token : le formulaire s'ouvre sur le token, type et nom figés
+        a.set_servers(vec![
+            entry("A"),
+            ServerEntry {
+                name: "gh".into(),
+                url: "https://api.github.com".into(),
+                kind: ServerKind::GitHub,
+            },
+        ]);
+        a.open_token_form("gh");
+        let f = a.server_form.as_ref().unwrap();
+        assert_eq!(
+            (f.field, f.kind, f.original.as_deref()),
+            (ServerField::Token, ServerKind::GitHub, Some("gh"))
+        );
+        a.server_form_move(1);
+        assert_eq!(a.server_form.as_ref().unwrap().field, ServerField::Url);
+        a.server_form_toggle_kind();
+        assert_eq!(a.server_form.as_ref().unwrap().kind, ServerKind::GitHub);
+    }
+
+    #[test]
     fn premier_lancement_sans_serveur() {
         // Pas `fresh()` : on garde la demande de l'accueil faite au démarrage
         let mut a = App::new();
@@ -3768,6 +3900,7 @@ mod tests {
         assert!(a.server_form_escape());
         assert!(a.server_form.is_none());
         a.open_first_server_form();
+        a.server_form_enter(); // Type (Forgejo) -> Nom
         type_str(&mut a, "maison");
         a.server_form_enter();
         type_str(&mut a, "git.example");
@@ -3929,6 +4062,7 @@ mod tests {
             vec![ServerEntry {
                 name: "A".into(),
                 url: "http://nouvelle".into(),
+                kind: ServerKind::Forgejo,
             }],
             "A",
         );
@@ -4658,10 +4792,12 @@ mod tests {
             base: "main".into(),
             head_sha: format!("{n:040x}"),
             labels: vec![],
-            comments: 0,
-            additions: 1,
-            deletions: 0,
-            changed_files: 1,
+            stats: Some(smithy_core::PullStats {
+                additions: 1,
+                deletions: 0,
+                changed_files: 1,
+                comments: 0,
+            }),
             mergeable: Some(true),
             created: None,
             updated: None,

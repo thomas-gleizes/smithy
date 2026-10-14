@@ -27,6 +27,7 @@ use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
 use smithy_core::{Error, Provider};
 use smithy_forgejo::Forgejo;
+use smithy_github::GitHub;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use app::{App, Msg};
@@ -88,15 +89,145 @@ fn parse_args() -> Result<bool> {
     Ok(fresh)
 }
 
+/// Le fournisseur d'un serveur, quel que soit son type : `Provider` n'est pas utilisable en
+/// `dyn` (méthodes `impl Future`), on délègue donc à la main.
+enum AnyProvider {
+    Forgejo(Forgejo),
+    GitHub(GitHub),
+}
+
+macro_rules! delegate {
+    ($self:ident, $p:ident => $call:expr) => {
+        match $self {
+            AnyProvider::Forgejo($p) => $call,
+            AnyProvider::GitHub($p) => $call,
+        }
+    };
+}
+
+impl Provider for AnyProvider {
+    fn capabilities(&self) -> smithy_core::Capabilities {
+        delegate!(self, p => p.capabilities())
+    }
+
+    async fn list_repos(
+        &self,
+        source: &smithy_core::RepoSource,
+    ) -> smithy_core::Result<Vec<smithy_core::RepoInfo>> {
+        delegate!(self, p => p.list_repos(source).await)
+    }
+
+    async fn repo_info(
+        &self,
+        repo: &smithy_core::Repo,
+    ) -> smithy_core::Result<smithy_core::RepoInfo> {
+        delegate!(self, p => p.repo_info(repo).await)
+    }
+
+    async fn list_pipelines(
+        &self,
+        repo: &smithy_core::Repo,
+    ) -> smithy_core::Result<Vec<smithy_core::Pipeline>> {
+        delegate!(self, p => p.list_pipelines(repo).await)
+    }
+
+    async fn list_branches(
+        &self,
+        repo: &smithy_core::Repo,
+    ) -> smithy_core::Result<Vec<smithy_core::Branch>> {
+        delegate!(self, p => p.list_branches(repo).await)
+    }
+
+    async fn list_commits(
+        &self,
+        repo: &smithy_core::Repo,
+        reference: &str,
+        page: u32,
+    ) -> smithy_core::Result<smithy_core::CommitPage> {
+        delegate!(self, p => p.list_commits(repo, reference, page).await)
+    }
+
+    async fn commit_detail(
+        &self,
+        repo: &smithy_core::Repo,
+        sha: &str,
+        max_bytes: usize,
+    ) -> smithy_core::Result<smithy_core::CommitDetail> {
+        delegate!(self, p => p.commit_detail(repo, sha, max_bytes).await)
+    }
+
+    async fn list_pulls(
+        &self,
+        repo: &smithy_core::Repo,
+        filter: smithy_core::PullFilter,
+        page: u32,
+    ) -> smithy_core::Result<smithy_core::PullPage> {
+        delegate!(self, p => p.list_pulls(repo, filter, page).await)
+    }
+
+    async fn pull_detail(
+        &self,
+        repo: &smithy_core::Repo,
+        number: u64,
+        max_bytes: usize,
+    ) -> smithy_core::Result<smithy_core::PullDetail> {
+        delegate!(self, p => p.pull_detail(repo, number, max_bytes).await)
+    }
+
+    async fn read_dir(
+        &self,
+        repo: &smithy_core::Repo,
+        reference: &str,
+        path: &str,
+    ) -> smithy_core::Result<Vec<smithy_core::Entry>> {
+        delegate!(self, p => p.read_dir(repo, reference, path).await)
+    }
+
+    async fn read_file(
+        &self,
+        repo: &smithy_core::Repo,
+        reference: &str,
+        path: &str,
+        max_bytes: usize,
+    ) -> smithy_core::Result<smithy_core::FileContent> {
+        delegate!(self, p => p.read_file(repo, reference, path, max_bytes).await)
+    }
+
+    async fn job_log(
+        &self,
+        repo: &smithy_core::Repo,
+        pipeline: &smithy_core::Pipeline,
+    ) -> smithy_core::Result<smithy_core::JobLog> {
+        delegate!(self, p => p.job_log(repo, pipeline).await)
+    }
+}
+
 fn build_provider(
     server: &Server,
     token: String,
     cookies: BTreeMap<String, String>,
-) -> Arc<Forgejo> {
-    match server.kind {
+) -> Arc<AnyProvider> {
+    Arc::new(match server.kind {
         ServerKind::Forgejo => {
-            Arc::new(Forgejo::new(server.url.clone(), token).with_cookies(cookies))
+            AnyProvider::Forgejo(Forgejo::new(server.url.clone(), token).with_cookies(cookies))
         }
+        // Ni cookie ni route web : le token suffit à tout.
+        ServerKind::GitHub => AnyProvider::GitHub(GitHub::new(server.url.clone(), token)),
+    })
+}
+
+/// Il manque des identifiants à ce serveur : le login (Forgejo), ou la saisie du token (GitHub,
+/// qui n'a pas de connexion par mot de passe).
+fn ask_credentials(
+    app: &mut App,
+    backends: &HashMap<String, Backend>,
+    name: &str,
+    switch_to: bool,
+) {
+    let Some(b) = backends.get(name) else { return };
+    match b.server.kind {
+        ServerKind::Forgejo => app.open_login(name, &b.username, switch_to),
+        ServerKind::GitHub => app.open_token_form(name),
     }
 }
 
@@ -720,6 +851,8 @@ fn spawn_login(
             ServerKind::Forgejo => {
                 smithy_forgejo::login(&server.url, &username, &password, create).await
             }
+            // Jamais ouvert pour GitHub (voir `ask_credentials`).
+            ServerKind::GitHub => Err(Error::Unsupported("connexion par mot de passe")),
         }
         .map(|l| Session {
             url: server.url.clone(),
@@ -743,7 +876,7 @@ fn spawn_login(
 /// reconnecter sans créer de token de plus.
 struct Backend {
     server: Server,
-    provider: Option<Arc<Forgejo>>,
+    provider: Option<Arc<AnyProvider>>,
     username: String,
     saved_token: Option<String>,
 }
@@ -791,6 +924,7 @@ fn entries(servers: &[Server]) -> Vec<app::ServerEntry> {
         .map(|s| app::ServerEntry {
             name: s.name.clone(),
             url: s.url.clone(),
+            kind: s.kind,
         })
         .collect()
 }
@@ -836,7 +970,7 @@ fn save_server(
         .and_then(|n| known.iter().find(|s| &s.name == n));
     let server = Server {
         name: draft.name.clone(),
-        kind: ServerKind::Forgejo,
+        kind: draft.kind,
         url: draft.url.clone(),
         token: draft
             .token
@@ -875,8 +1009,12 @@ fn save_server(
         app.set_initial_server(&server.name);
     }
     // L'onglet affiché est sur ce serveur et il n'est plus connecté (URL changée) : login.
-    if server.name == app.server_name && !app.is_connected(&server.name) && app.login.is_none() {
-        app.open_login(&server.name, &backends[&server.name].username, false);
+    if server.name == app.server_name
+        && !app.is_connected(&server.name)
+        && app.login.is_none()
+        && app.server_form.is_none()
+    {
+        ask_credentials(app, backends, &server.name, false);
     }
     Ok(())
 }
@@ -920,6 +1058,7 @@ async fn run(
             .map(|s| app::ServerEntry {
                 name: s.name.clone(),
                 url: s.url.clone(),
+                kind: s.kind,
             })
             .collect(),
     );
@@ -975,7 +1114,7 @@ async fn run(
     match backends.get(&initial) {
         // Premier lancement : aucun serveur configuré, le formulaire d'ajout s'impose.
         None => app.open_first_server_form(),
-        Some(b) if b.provider.is_none() => app.open_login(&initial, &b.username, false),
+        Some(b) if b.provider.is_none() => ask_credentials(&mut app, &backends, &initial, false),
         Some(_) => {}
     }
     let mut last_refresh = Instant::now();
@@ -1016,6 +1155,14 @@ async fn run(
                             app.server_form_fail(e);
                         }
                     }
+                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                        if app
+                            .server_form
+                            .as_ref()
+                            .is_some_and(|f| f.field == app::ServerField::Kind) =>
+                    {
+                        app.server_form_toggle_kind()
+                    }
                     KeyCode::Tab | KeyCode::Down => app.server_form_move(1),
                     KeyCode::BackTab | KeyCode::Up => app.server_form_move(-1),
                     KeyCode::Backspace => app.server_form_backspace(),
@@ -1050,7 +1197,7 @@ async fn run(
                         KeyCode::Enter => {
                             // Pas encore connecté : le login d'abord, la bascule ensuite.
                             if let Some(name) = app.server_picker_choose() {
-                                app.open_login(&name, &backends[&name].username, true);
+                                ask_credentials(&mut app, &backends, &name, true);
                             }
                         }
                         _ => {}
@@ -1142,8 +1289,7 @@ async fn run(
                     result: Err(Error::SessionExpired),
                     ..
                 } if app.login.is_none() && origin == app.server_name => {
-                    let username = backends.get(&origin).map_or("", |b| b.username.as_str());
-                    app.open_login(&origin, username, false);
+                    ask_credentials(&mut app, &backends, &origin, false);
                 }
                 _ => {}
             }
@@ -1166,8 +1312,15 @@ async fn run(
         // Sondes de joignabilité demandées par la liste des serveurs.
         for (name, url) in app.take_probes() {
             let tx = tx.clone();
+            let kind = backends
+                .get(&name)
+                .map(|b| b.server.kind)
+                .unwrap_or_default();
             tokio::spawn(async move {
-                let result = smithy_forgejo::ping(&url).await;
+                let result = match kind {
+                    ServerKind::Forgejo => smithy_forgejo::ping(&url).await,
+                    ServerKind::GitHub => smithy_github::ping(&url).await,
+                };
                 let _ = tx.send((
                     name.clone(),
                     Msg::Reach {

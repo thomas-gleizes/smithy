@@ -1416,6 +1416,7 @@ dependencies = [
  "serde_json",
  "smithy-core",
  "smithy-forgejo",
+ "smithy-github",
  "syntect",
  "tokio",
  "toml",
@@ -1433,6 +1434,18 @@ dependencies = [
 
 [[package]]
 name = "smithy-forgejo"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smithy-core",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
+name = "smithy-github"
 version = "0.1.0"
 dependencies = [
  "reqwest",

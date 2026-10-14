@@ -5,6 +5,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
+        Wrap,
     },
 };
 use smithy_core::{EntryKind, PullFilter, RepoInfo, Status};
@@ -12,6 +13,7 @@ use smithy_core::{EntryKind, PullFilter, RepoInfo, Status};
 use crate::{
     app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
+    config::ServerKind,
     highlight::{self, Tok},
     history::{BranchesView, CommitView, CommitsView},
     logview::{LineKind, LogState, LogView, TextView},
@@ -255,7 +257,10 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
             ListItem::new(Line::from(vec![
                 Span::raw(if here { "● " } else { "  " }),
                 Span::raw(format!("{} ", s.name)),
-                Span::styled(format!("({}) ", s.url), Style::new().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("[{}] ({}) ", s.kind.label(), s.url),
+                    Style::new().fg(Color::DarkGray),
+                ),
                 network,
                 Span::styled(" · ", Style::new().fg(Color::DarkGray)),
                 session,
@@ -294,7 +299,7 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
 }
 
 fn draw_server_form(f: &mut Frame, form: &ServerForm) {
-    let area = centered(f.area(), 70, 11);
+    let area = centered(f.area(), 76, 15);
     f.render_widget(Clear, area);
     let editing = form.original.is_some();
     let field = |label: &str, value: String, which: ServerField, locked: bool| {
@@ -312,10 +317,15 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
             Span::raw(format!("{value}{cursor}")),
         ])
     };
-    let token_hint = if editing {
-        "(vide : inchangé)"
+    let token_hint = match (editing, form.kind) {
+        (true, _) => "(vide : inchangé)",
+        (false, ServerKind::GitHub) => "(obligatoire : GitHub n'accepte pas de mot de passe)",
+        (false, ServerKind::Forgejo) => "(facultatif : sinon connexion par mot de passe)",
+    };
+    let kind = if editing {
+        form.kind.label().to_owned()
     } else {
-        "(facultatif : sinon connexion par mot de passe)"
+        format!("‹ {} ›", form.kind.label())
     };
     let mut lines = Vec::new();
     if form.first_run {
@@ -325,6 +335,7 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
         )));
     }
     lines.extend([
+        field("Type", kind, ServerField::Kind, editing),
         field("Nom", form.name.clone(), ServerField::Name, editing),
         field("URL", form.url.clone(), ServerField::Url, false),
         field(
@@ -344,8 +355,13 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
         None => Line::from(""),
     });
     let escape = if form.first_run { "quitter" } else { "annuler" };
+    let help = if form.field == ServerField::Kind {
+        format!("←/→/Espace changer de type · Entrée suivant · Esc {escape}")
+    } else {
+        format!("Entrée suivant / enregistrer · Tab changer de champ · Esc {escape}")
+    };
     lines.push(Line::from(Span::styled(
-        format!("Entrée suivant / enregistrer · Tab changer de champ · Esc {escape}"),
+        help,
         Style::new().fg(Color::DarkGray),
     )));
     let title = match &form.original {
@@ -357,7 +373,13 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
         .borders(Borders::ALL)
         .title(title)
         .border_style(Style::new().fg(Color::Yellow));
-    f.render_widget(Paragraph::new(lines).block(block), area);
+    // Le message (erreur, ou ce qu'il faut pour GitHub) peut tenir sur deux lignes.
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        area,
+    );
 }
 
 fn draw_tab_picker(f: &mut Frame, app: &App, selected: usize) {
@@ -1459,22 +1481,26 @@ fn draw_pulls(f: &mut Frame, app: &App, v: &PullsView, area: Rect) {
             Style::new().fg(Color::Cyan),
         ))
     } else if let Some(p) = v.selected_pull() {
-        let mut text = format!(
-            "{} · +{} −{} · {} commentaire{}",
-            if p.changed_files > 1 {
-                format!("{} fichiers", p.changed_files)
-            } else {
-                format!("{} fichier", p.changed_files)
-            },
-            p.additions,
-            p.deletions,
-            p.comments,
-            if p.comments > 1 { "s" } else { "" }
-        );
-        if let Some(url) = &p.url {
-            text.push_str(&format!(" · {url}"));
+        // Sans compteurs (GitHub ne les donne qu'avec le détail), seulement l'adresse.
+        let mut parts: Vec<String> = Vec::new();
+        if let Some(st) = p.stats {
+            parts.push(format!(
+                "{} · +{} −{} · {} commentaire{}",
+                if st.changed_files > 1 {
+                    format!("{} fichiers", st.changed_files)
+                } else {
+                    format!("{} fichier", st.changed_files)
+                },
+                st.additions,
+                st.deletions,
+                st.comments,
+                if st.comments > 1 { "s" } else { "" }
+            ));
         }
-        Line::from(text)
+        if let Some(url) = &p.url {
+            parts.push(url.clone());
+        }
+        Line::from(parts.join(" · "))
     } else {
         Line::from("")
     };
@@ -3283,6 +3309,7 @@ mod tests {
         app.set_servers(vec![crate::app::ServerEntry {
             name: "maison".into(),
             url: "http://forge".into(),
+            kind: Default::default(),
         }]);
         app.open_login("maison", "thomas", false);
         "hunter2".chars().for_each(|c| app.login_type(c));
@@ -3316,6 +3343,7 @@ mod tests {
                 .map(|n| crate::app::ServerEntry {
                     name: n.into(),
                     url: format!("http://{n}.example"),
+                    kind: Default::default(),
                 })
                 .to_vec(),
         );
@@ -3355,7 +3383,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains("B (http://B.example)") && text.contains("pas de session"),
+            text.contains("B [forgejo] (http://B.example)") && text.contains("pas de session"),
             "{text}"
         );
         // Réseau : vérification en cours, puis résultats distincts de la session
@@ -3419,10 +3447,12 @@ mod tests {
             base: "main".into(),
             head_sha: "abc".into(),
             labels: vec![],
-            comments: 2,
-            additions: 8,
-            deletions: 2,
-            changed_files: 4,
+            stats: Some(smithy_core::PullStats {
+                additions: 8,
+                deletions: 2,
+                changed_files: 4,
+                comments: 2,
+            }),
             mergeable: Some(true),
             created: None,
             updated: None,
@@ -3556,6 +3586,7 @@ mod tests {
             "{text}"
         );
         app.server_form_add();
+        app.server_form_move(1); // Type -> Nom
         "dix".chars().for_each(|c| app.server_form_type(c));
         let text = render(&app, 110, 20);
         assert!(

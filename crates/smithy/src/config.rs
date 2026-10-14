@@ -9,6 +9,27 @@ use serde::{Deserialize, Serialize};
 pub enum ServerKind {
     #[default]
     Forgejo,
+    /// github.com, ou GitHub Enterprise (`https://<hôte>/api/v3`). Un token est obligatoire :
+    /// l'API n'accepte pas de mot de passe.
+    #[serde(rename = "github")]
+    GitHub,
+}
+
+impl ServerKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            ServerKind::Forgejo => "forgejo",
+            ServerKind::GitHub => "github",
+        }
+    }
+
+    /// URL proposée à la création d'un serveur de ce type (et prise si `url` est absente).
+    pub fn default_url(self) -> &'static str {
+        match self {
+            ServerKind::Forgejo => "",
+            ServerKind::GitHub => smithy_github::DEFAULT_API,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +73,8 @@ struct FileServer {
     name: String,
     #[serde(default)]
     kind: ServerKind,
+    /// Facultative pour GitHub (l'API publique par défaut).
+    #[serde(default)]
     url: String,
     token: Option<String>,
 }
@@ -96,9 +119,13 @@ fn parse_file(file: Option<&str>) -> Result<Vec<Server>> {
         .server
         .into_iter()
         .map(|s| Server {
+            url: if s.url.trim().is_empty() {
+                s.kind.default_url().to_owned()
+            } else {
+                s.url
+            },
             name: s.name,
             kind: s.kind,
-            url: s.url,
             token: non_empty(s.token),
         })
         .collect();
@@ -194,9 +221,7 @@ fn render(servers: &[Server]) -> Result<String> {
             .iter()
             .map(|s| OutServer {
                 name: &s.name,
-                kind: match s.kind {
-                    ServerKind::Forgejo => "forgejo",
-                },
+                kind: s.kind.label(),
                 url: &s.url,
                 token: s.token.as_deref(),
             })
@@ -291,6 +316,22 @@ mod tests {
         let c = resolve(None, env).unwrap();
         assert_eq!(c.servers[0].name, "default");
         assert_eq!(c.servers[0].token.as_deref(), Some("tok"));
+    }
+
+    #[test]
+    fn serveur_github_url_par_defaut_et_reecriture() {
+        let toml = "[[server]]\nname = \"gh\"\nkind = \"github\"\ntoken = \"ghp_x\"\n\n[[server]]\nname = \"ghe\"\nkind = \"github\"\nurl = \"https://ghe.example/api/v3\"\n";
+        let c = resolve(Some(toml), no_env).unwrap();
+        assert_eq!(c.servers[0].kind, ServerKind::GitHub);
+        assert_eq!(c.servers[0].url, "https://api.github.com");
+        assert_eq!(c.servers[0].token.as_deref(), Some("ghp_x"));
+        assert_eq!(c.servers[1].url, "https://ghe.example/api/v3");
+        // Réécrit puis relu : identique
+        let again = resolve(Some(&render(&c.servers).unwrap()), no_env).unwrap();
+        assert_eq!(again.servers, c.servers);
+        assert!(render(&c.servers).unwrap().contains("kind = \"github\""));
+        // Un Forgejo sans URL reste une erreur
+        assert!(resolve(Some("[[server]]\nname = \"f\"\n"), no_env).is_err());
     }
 
     #[test]
