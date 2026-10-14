@@ -1,0 +1,102 @@
+name: Release
+
+# Construit le binaire Linux de smithy.
+#   - sur un tag `vX.Y.Z` : le binaire est publié dans une release GitHub ;
+#   - à la main (Actions > Release > Run workflow) : le binaire est gardé comme artefact du run.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write # créer la release (tags seulement)
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-musl
+  # `ring` compile du C : avec la cible musl, il lui faut `musl-gcc` (paquet musl-tools).
+  CC_x86_64_unknown_linux_musl: musl-gcc
+
+jobs:
+  linux:
+    name: Binaire Linux x86_64 (statique)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Nom de version
+        id: version
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            echo "name=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "name=dev-$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Le tag correspond à la version du Cargo.toml
+        if: github.ref_type == 'tag'
+        run: |
+          cargo_version="$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)"
+          if [ "v${cargo_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::le tag ${GITHUB_REF_NAME} ne correspond pas à la version ${cargo_version} du Cargo.toml"
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+      - name: musl-tools
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq musl-tools
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ env.TARGET }}
+
+      # Les contrôles passent avant de publier quoi que ce soit.
+      - name: Tests
+        run: cargo test --workspace --locked
+
+      - name: Compilation (release)
+        run: cargo build --release --locked -p smithy --target "${TARGET}"
+
+      - name: Vérifie que le binaire est statique et qu'il démarre
+        run: |
+          bin="target/${TARGET}/release/smithy"
+          # `ldd` dit « not a dynamic executable » ou « statically linked » selon sa version.
+          if ! ldd "$bin" 2>&1 | grep -Eq "not a dynamic executable|statically linked"; then
+            echo "::error::le binaire n'est pas statique"; ldd "$bin"; exit 1
+          fi
+          "$bin" --version
+          "$bin" --help >/dev/null
+
+      - name: Archive
+        id: pack
+        run: |
+          name="smithy-${{ steps.version.outputs.name }}-${TARGET}"
+          mkdir -p "dist/${name}"
+          cp "target/${TARGET}/release/smithy" "dist/${name}/"
+          strip "dist/${name}/smithy"
+          cp README.md LICENSE-MIT LICENSE-APACHE "dist/${name}/"
+          tar -C dist -czf "dist/${name}.tar.gz" "${name}"
+          (cd dist && sha256sum "${name}.tar.gz" > "${name}.tar.gz.sha256")
+          echo "archive=dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          ls -lh dist
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: smithy-${{ steps.version.outputs.name }}-${{ env.TARGET }}
+          path: |
+            ${{ steps.pack.outputs.archive }}
+            ${{ steps.pack.outputs.archive }}.sha256
+          if-no-files-found: error
+
+      - name: Publication de la release
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=("${{ steps.pack.outputs.archive }}" "${{ steps.pack.outputs.archive }}.sha256")
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" "${files[@]}" --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" "${files[@]}" --title "${GITHUB_REF_NAME}" --generate-notes
+          fi

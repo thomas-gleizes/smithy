@@ -129,6 +129,15 @@ Comme l'explorateur : l'API documentée avec le **token**, aucun cookie, pas d'a
 - Ne pas lancer de `docker pull` interrompu/répété pendant qu'un autre tourne : le démon peut rester bloqué (observé une fois : `docker ps` ne répondait plus alors que les conteneurs tournaient ; je n'ai pas vérifié ce qui le débloque).
 - Un `docker compose up` sans token de runner fait crasher le service `runner` ; `dev.sh` démarre donc `forgejo` seul d'abord, puis le runner avec le token.
 
+## CI et binaire Linux (`.github/workflows/`)
+
+Le dépôt est sur GitHub : deux workflows GitHub Actions. **Ils n'ont pas été exécutés** (rien n'est poussé) ; leur recette de compilation a en revanche été rejouée à la main dans `debian:bookworm-slim`.
+- `ci.yml` (push sur `main`, pull requests) : `cargo fmt --check`, `clippy -D warnings`, `cargo test`, tous `--locked`, comme `make check`.
+- `release.yml` (tag `vX.Y.Z`, ou lancement à la main) : tests, puis binaire **statique musl** (`x86_64-unknown-linux-musl`), archive `smithy-<version>-x86_64-unknown-linux-musl.tar.gz` (+ README et licences) et `.sha256`, gardée comme artefact du run ; sur un tag, publiée dans une release GitHub (`gh release create`/`upload`). Le tag doit être égal à `v` + la version du `Cargo.toml` (le workflow refuse sinon). Il vérifie que le binaire est bien statique et que `--version` répond.
+- Pourquoi musl : machine cible sans bureau, distribution inconnue ; un binaire glibc dépendrait de la version de la libc. `ring` compile du C : il faut `musl-tools` et `CC_x86_64_unknown_linux_musl=musl-gcc`. Rustls seulement (pas d'OpenSSL), donc rien d'autre à lier.
+- Rejouer en local sans installer musl : un conteneur Debian (`apt install build-essential musl-tools`, rustup, `cargo build --release --locked -p smithy --target x86_64-unknown-linux-musl`) donne un binaire statique de ~12 Mo. Un `cargo build --target …-musl` direct sur la machine échoue tant que `musl-gcc` manque.
+- Pas encore : autres cibles (macOS, Windows, aarch64), publication sur crates.io, signature des binaires.
+
 ## Conventions
 
 - Lints workspace : `unsafe_code = "forbid"`, clippy en `warn` (`-D warnings` via `make lint`).

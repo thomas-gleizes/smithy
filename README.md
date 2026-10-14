@@ -46,6 +46,20 @@ An unverified version is never silently trusted: the log view shows a ⚠ notice
 
 ## Install
 
+### Pre-built Linux binary
+
+Tagged releases (`vX.Y.Z`) carry a **static Linux x86_64 binary** (built against musl, so it runs on any distribution without installing anything). Download `smithy-<version>-x86_64-unknown-linux-musl.tar.gz` from the [Releases](https://github.com/thomas-gleizes/smithy/releases) page, check it against the `.sha256` file next to it, and unpack it:
+
+```sh
+sha256sum -c smithy-*.tar.gz.sha256
+tar xzf smithy-*.tar.gz
+./smithy-*/smithy --version
+```
+
+Any commit can also be built from the *Release* workflow (Actions tab → *Release* → *Run workflow*): the archive is kept as an artifact of the run.
+
+### From source
+
 Requires Rust 1.89+.
 
 ```sh
