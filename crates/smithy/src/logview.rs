@@ -970,4 +970,28 @@ mod tests {
         assert_eq!(v.current_step(W), Some(0));
         v.toggle_section(W, 10); // ne panique pas
     }
+
+    #[test]
+    fn longue_ligne_json_jusqu_a_la_derniere_ligne_d_ecran() {
+        // Même contenu que la fixture réelle : un JSON de ~7000 caractères sur une seule ligne.
+        let nums: Vec<String> = (0..1500).map(|i| i.to_string()).collect();
+        let line = format!("{{\"data\": [{}]}}", nums.join(","));
+        let mut v = view(&[&line]);
+        v.wrap = true;
+        let (w, h) = (98, 26);
+        let total = v.total_rows(w);
+        assert_eq!(
+            total,
+            crate::wrap::chunks(&line, w).len(),
+            "l'index et le découpage s'accordent"
+        );
+        v.scroll = v.max_scroll(w, h);
+        let win = v.window(w, h);
+        assert_eq!(win.len(), h, "la dernière page est pleine");
+        assert!(
+            win.last().unwrap().text.ends_with("1499]}"),
+            "la dernière ligne d'écran est atteinte : {:?}",
+            win.last()
+        );
+    }
 }

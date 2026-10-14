@@ -8,7 +8,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 
 ## Features
 
-- List the repositories you can access and the latest CI runs of the selected one.
+- A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list and the code explorer.
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible.
 - Sign in from the TUI (username and password, entered once and never stored).
@@ -91,15 +91,21 @@ Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (dire
 
 ## Key bindings
 
-| Key               | Action                    |
-|-------------------|---------------------------|
-| `j` / `k`, `↓` / `↑` | Move selection         |
-| `Tab`             | Switch panel              |
-| `Enter`           | Open the logs of the selected run (on the repository list: go to its runs) |
-| `e`               | Explore the code of the selected repository |
-| `r`               | Refresh                   |
-| `q`, `Ctrl+C`     | Quit (`q` only on the home screen; elsewhere it goes back) |
-| `Esc`             | Go back one page (never quits) |
+Everywhere: `Esc` goes back one page (it never quits), `Ctrl+C` quits, `r` refreshes the current page.
+
+On the home page:
+
+| Key                   | Action                          |
+|-----------------------|---------------------------------|
+| `j` / `k`, `↓` / `↑`  | Move the selection              |
+| `PgDn` / `f`, `PgUp` / `b`, `g` / `G` | Page, first, last |
+| `←` / `→`             | Previous / next section (My repositories, Watched, Starred, Explore, Recent) |
+| `Enter`               | Open the repository page        |
+| `/`                   | Filter the list; in *Explore*, search the whole server (`Enter` runs the search) |
+| `Esc`                 | Clear the filter (while typing: cancel) |
+| `q`                   | Quit                            |
+
+On a repository page and on the list of runs: `j`/`k` move, `Enter` or `→` opens (CI or Code; a run's logs), `←`, `Esc`, `q` or `Backspace` go back, `PgDn`/`PgUp`, `g`/`G` as above.
 
 In the code explorer:
 
@@ -159,7 +165,8 @@ A new forge is a new crate implementing `Provider`.
 
 - [ ] CI workflow running `make check`
 - [x] Page stack with a breadcrumb
-- [ ] Home page (my repositories, organisations, watched, explore, recent) and a repository page
+- [x] Home page (my repositories, watched, starred, explore, recent) and a repository page
+- [ ] Organisations on the home page (needs an extra `read:organization` token scope)
 - [ ] Independent tabs, each with its own page stack and server
 - [ ] Pull requests, notifications and runners
 - [ ] Filters and search (status, branch, workflow, repository)

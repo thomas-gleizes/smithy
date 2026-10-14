@@ -5,6 +5,7 @@
 mod browse;
 mod login;
 mod logs;
+mod repos;
 mod version;
 
 pub use login::{Login, login};
@@ -13,8 +14,8 @@ pub use version::{Decision, Flavor, Support, Version, decide};
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use smithy_core::{
-    Branch, Capabilities, Entry, Error, FileContent, JobLog, Pipeline, Provider, Repo, Result,
-    Status,
+    Branch, Capabilities, Entry, Error, FileContent, JobLog, Pipeline, Provider, Repo, RepoInfo,
+    RepoSource, Result, Status,
 };
 use std::collections::BTreeMap;
 
@@ -103,17 +104,6 @@ struct ApiVersion {
 }
 
 #[derive(Deserialize)]
-struct ApiRepo {
-    name: String,
-    owner: ApiOwner,
-}
-
-#[derive(Deserialize)]
-struct ApiOwner {
-    login: String,
-}
-
-#[derive(Deserialize)]
 struct ApiTasks {
     #[serde(default)]
     workflow_runs: Vec<ApiRun>,
@@ -188,25 +178,12 @@ impl Provider for Forgejo {
         }
     }
 
-    async fn list_repos(&self) -> Result<Vec<Repo>> {
-        let mut repos = Vec::new();
-        for page in 1..=MAX_PAGES {
-            let batch: Vec<ApiRepo> = self
-                .get(
-                    "/user/repos",
-                    &[("limit", PAGE_SIZE.to_string()), ("page", page.to_string())],
-                )
-                .await?;
-            let n = batch.len();
-            repos.extend(batch.into_iter().map(|r| Repo {
-                owner: r.owner.login,
-                name: r.name,
-            }));
-            if n < PAGE_SIZE {
-                break;
-            }
-        }
-        Ok(repos)
+    async fn list_repos(&self, source: &RepoSource) -> Result<Vec<RepoInfo>> {
+        self.fetch_repos(source).await
+    }
+
+    async fn repo_info(&self, repo: &Repo) -> Result<RepoInfo> {
+        self.fetch_repo_info(repo).await
     }
 
     async fn list_pipelines(&self, repo: &Repo) -> Result<Vec<Pipeline>> {
@@ -330,7 +307,10 @@ mod tests {
             .mount(&server)
             .await;
 
-        let repos = Forgejo::new(server.uri(), "t").list_repos().await.unwrap();
+        let repos = Forgejo::new(server.uri(), "t")
+            .list_repos(&RepoSource::Mine)
+            .await
+            .unwrap();
         assert_eq!(repos.len(), PAGE_SIZE + 3);
     }
 

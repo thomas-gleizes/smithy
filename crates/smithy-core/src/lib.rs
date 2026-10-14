@@ -39,6 +39,36 @@ impl Repo {
     }
 }
 
+/// Ce qu'une liste de dépôts affiche, sans requête de plus.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoInfo {
+    pub repo: Repo,
+    pub description: String,
+    pub private: bool,
+    pub fork: bool,
+    pub archived: bool,
+    /// Aucun commit.
+    pub empty: bool,
+    pub stars: u64,
+    pub open_prs: u64,
+    pub open_issues: u64,
+    /// Dernière mise à jour, en RFC 3339 tel que le serveur la donne.
+    pub updated: Option<String>,
+    pub default_branch: String,
+}
+
+/// D'où vient une liste de dépôts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RepoSource {
+    /// Ceux auxquels on a accès : les siens, ceux d'une organisation, ceux où l'on collabore.
+    Mine,
+    /// Ceux que l'on suit.
+    Watched,
+    Starred,
+    /// Recherche sur tout le serveur (au plus une page de résultats).
+    Search(String),
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Status {
     Pending,
@@ -189,7 +219,9 @@ pub struct Capabilities {
 
 pub trait Provider: Send + Sync {
     fn capabilities(&self) -> Capabilities;
-    fn list_repos(&self) -> impl Future<Output = Result<Vec<Repo>>> + Send;
+    fn list_repos(&self, source: &RepoSource)
+    -> impl Future<Output = Result<Vec<RepoInfo>>> + Send;
+    fn repo_info(&self, repo: &Repo) -> impl Future<Output = Result<RepoInfo>> + Send;
     fn list_pipelines(&self, repo: &Repo) -> impl Future<Output = Result<Vec<Pipeline>>> + Send;
 
     /// Branches du dépôt, la par défaut en premier. Réservé aux backends dont

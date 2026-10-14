@@ -1,18 +1,20 @@
 use ratatui::{
     Frame,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
     widgets::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
     },
 };
-use smithy_core::{EntryKind, Status};
+use smithy_core::{EntryKind, RepoInfo, Status};
 
 use crate::{
-    app::{App, Focus, LoginField, LoginForm},
+    app::{App, LoginField, LoginForm},
     browser::{Browser, DirState, Mode, fmt_size},
     logview::{LineKind, LogState, LogView, TextView},
+    pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
+    timeago,
 };
 
 pub fn status_style(s: Status) -> (&'static str, Color) {
@@ -27,14 +29,6 @@ pub fn status_style(s: Status) -> (&'static str, Color) {
     }
 }
 
-fn border(focused: bool) -> Style {
-    if focused {
-        Style::new().fg(Color::Yellow)
-    } else {
-        Style::new()
-    }
-}
-
 pub fn draw(f: &mut Frame, app: &App) {
     // Une ligne en haut pour dire où l'on est, le reste pour la page.
     let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(f.area());
@@ -43,8 +37,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_logs(f, app, view, body);
     } else if let Some(b) = app.browser() {
         draw_browser(f, app, b, body);
-    } else {
-        draw_lists(f, app, body);
+    } else if let Some(r) = app.runs() {
+        draw_runs(f, app, r, body);
+    } else if let Some(r) = app.repo_page() {
+        draw_repo(f, app, r, body);
+    } else if let Some(h) = app.home() {
+        draw_home(f, app, h, body);
     }
     if let Some(form) = &app.login {
         draw_login(f, form, &app.server_label);
@@ -226,16 +224,55 @@ fn pick_help<'a>(width: usize, variants: &[&'a str]) -> &'a str {
         .unwrap_or("")
 }
 
-/// Aide de la liste des dépôts et des runs.
-fn lists_help(width: usize) -> &'static str {
+fn home_help(width: usize, section: Section, editing: bool) -> &'static str {
+    if editing {
+        return pick_help(
+            width,
+            &["Entrée valider · Échap annuler", "↵ · Échap", "Échap"],
+        );
+    }
+    if section == Section::Explore {
+        return pick_help(
+            width,
+            &[
+                "/ chercher un dépôt · ←/→ section · ↵ ouvrir · j/k naviguer · q quitter",
+                "/ chercher · ←/→ section · ↵ · q quitter",
+                "/ · ←/→ · ↵ · q",
+                "q",
+            ],
+        );
+    }
     pick_help(
         width,
         &[
-            "j/k ↑/↓ naviguer · ↵ logs · e explorer le code · tab changer de panneau · r rafraîchir · q quitter",
-            "j/k naviguer · ↵ logs · e code · tab panneau · r rafraîchir · q quitter",
-            "↵ logs · e code · tab · r · q quitter",
-            "↵ · e · tab · q",
+            "j/k ↑/↓ naviguer · ←/→ section · ↵ ouvrir · / filtrer · r actualiser · q quitter",
+            "j/k · ←/→ section · ↵ ouvrir · / filtrer · q quitter",
+            "←/→ · ↵ · / · q quitter",
             "q",
+        ],
+    )
+}
+
+fn repo_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ choisir · ↵/→ ouvrir · ←/Échap retour · r actualiser · q retour",
+            "j/k · ↵ ouvrir · ← retour · r actualiser",
+            "↵ · ← · r",
+            "Échap",
+        ],
+    )
+}
+
+fn runs_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ naviguer · ↵/→ logs · ←/Échap retour · r actualiser · q retour",
+            "j/k · ↵ logs · ← retour · r actualiser",
+            "↵ · ← · r",
+            "Échap",
         ],
     )
 }
@@ -429,91 +466,329 @@ fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
     b.picker_offset.set(ls.offset());
 }
 
-fn draw_lists(f: &mut Frame, app: &App, area: Rect) {
+fn tag(text: &str) -> Span<'static> {
+    Span::styled(format!(" [{text}]"), Style::new().fg(Color::DarkGray))
+}
+
+/// Marques d'un dépôt à la suite de son nom : privé, archivé, fork, vide.
+fn repo_tags(info: &RepoInfo) -> Vec<Span<'static>> {
+    let mut out = Vec::new();
+    for (on, label) in [
+        (info.private, "privé"),
+        (info.archived, "archivé"),
+        (info.fork, "fork"),
+        (info.empty, "vide"),
+    ] {
+        if on {
+            out.push(tag(label));
+        }
+    }
+    out
+}
+
+fn draw_home(f: &mut Frame, app: &App, h: &HomeView, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
-    let cols = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
-        .split(rows[0]);
-
-    let items: Vec<ListItem> = app
-        .repos
-        .iter()
-        .map(|r| ListItem::new(r.full_name()))
-        .collect();
-    let list = List::new(items)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Dépôts ")
-                .border_style(border(app.focus == Focus::Repos)),
-        )
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut ls = ListState::default();
-    if !app.repos.is_empty() {
-        ls.select(Some(app.repo_idx));
+    // Les sections sont le titre du cadre, la courante en vidéo inverse.
+    let mut title: Vec<Span> = Vec::new();
+    for s in Section::ALL {
+        let style = if s == h.section {
+            Style::new()
+                .fg(Color::Yellow)
+                .bold()
+                .add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+        title.push(Span::styled(format!(" {} ", s.label()), style));
     }
-    f.render_stateful_widget(list, cols[0], &mut ls);
+    let data = h.data();
+    let list = app.home_rows();
+    let selected = h.selected(list.len());
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(title))
+        .border_style(Style::new().fg(Color::Yellow));
+    if h.editing || !data.filter.is_empty() {
+        let verb = if h.section == Section::Explore {
+            "chercher"
+        } else {
+            "filtrer"
+        };
+        let cursor = if h.editing { "▏" } else { "" };
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" {verb} : {}{cursor} ", data.filter),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    let inner = block.inner(rows[0]);
+    app.viewport.set((inner.height as usize).saturating_sub(1));
 
-    let title = match app.selected_repo() {
-        Some(r) => format!(" CI · {} ", r.full_name()),
-        None => " CI ".to_owned(),
+    let message = |text: String, color: Color| {
+        Paragraph::new(Line::from(Span::styled(text, Style::new().fg(color)))).block(block.clone())
     };
-    let table_rows: Vec<Row> = app
-        .pipelines
-        .iter()
-        .map(|p| {
-            let (label, color) = status_style(p.status);
-            Row::new(vec![
-                Cell::from(Span::styled(label, Style::new().fg(color))),
-                Cell::from(p.workflow.clone()),
-                Cell::from(p.branch.clone()),
-                Cell::from(p.commit.chars().take(7).collect::<String>()),
-                Cell::from(p.title.clone()),
-            ])
-        })
-        .collect();
-    let table = Table::new(
-        table_rows,
-        [
-            Constraint::Length(13),
-            Constraint::Length(14),
-            Constraint::Length(14),
-            Constraint::Length(8),
-            Constraint::Min(10),
-        ],
-    )
-    .header(
-        Row::new(["Statut", "Workflow", "Branche", "Commit", "Titre"]).style(Style::new().bold()),
-    )
-    .block(
-        Block::default()
-            .borders(Borders::ALL)
-            .title(title)
-            .border_style(border(app.focus == Focus::Pipelines)),
-    )
-    .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut ts = TableState::default();
-    if !app.pipelines.is_empty() {
-        ts.select(Some(app.pipe_idx));
+    let empty = match h.section {
+        Section::Recent => "(aucun dépôt ouvert récemment)".to_owned(),
+        Section::Explore => format!("(aucun résultat pour « {} »)", h.submitted()),
+        _ if !data.filter.is_empty() => {
+            format!("(aucun dépôt ne correspond à « {} »)", data.filter)
+        }
+        _ => "(aucun dépôt)".to_owned(),
+    };
+    let widget_message = match (&data.load, h.section) {
+        (_, Section::Recent) if list.is_empty() => Some(message(empty.clone(), Color::DarkGray)),
+        (Load::Idle, Section::Explore) => Some(message(
+            "Tapez / puis le nom d'un dépôt à chercher sur tout le serveur.".to_owned(),
+            Color::DarkGray,
+        )),
+        (Load::Idle | Load::Loading, _) if h.section != Section::Recent => {
+            Some(message("chargement…".to_owned(), Color::Cyan))
+        }
+        (Load::Failed(e), _) => Some(message(format!("erreur : {e}"), Color::Red)),
+        _ if list.is_empty() => Some(message(empty, Color::DarkGray)),
+        _ => None,
+    };
+    match widget_message {
+        Some(w) => f.render_widget(w, rows[0]),
+        None => {
+            let now = timeago::now_epoch();
+            let recent = h.section == Section::Recent;
+            let table_rows: Vec<Row> = list
+                .iter()
+                .map(|r| {
+                    let mut name = vec![Span::raw(r.repo.full_name())];
+                    if let Some(i) = &r.info {
+                        name.extend(repo_tags(i));
+                    }
+                    let mut cells = vec![Cell::from(Line::from(name))];
+                    if recent {
+                        let when = r.opened.map(|t| timeago::ago(now, t)).unwrap_or_default();
+                        cells.push(Cell::from(when));
+                    } else if let Some(i) = &r.info {
+                        let prs = if i.open_prs > 0 {
+                            format!("{} PR", i.open_prs)
+                        } else {
+                            String::new()
+                        };
+                        let stars = if i.stars > 0 {
+                            format!("★ {}", i.stars)
+                        } else {
+                            String::new()
+                        };
+                        let when = i
+                            .updated
+                            .as_deref()
+                            .map(|u| timeago::ago_rfc3339(now, u))
+                            .unwrap_or_default();
+                        cells.extend([Cell::from(prs), Cell::from(stars), Cell::from(when)]);
+                    }
+                    Row::new(cells)
+                })
+                .collect();
+            let (widths, header): (Vec<Constraint>, Vec<&str>) = if recent {
+                (
+                    vec![Constraint::Min(10), Constraint::Length(14)],
+                    vec!["Dépôt", "Ouvert"],
+                )
+            } else {
+                (
+                    vec![
+                        Constraint::Min(10),
+                        Constraint::Length(6),
+                        Constraint::Length(6),
+                        Constraint::Length(14),
+                    ],
+                    vec!["Dépôt", "PR", "★", "Mis à jour"],
+                )
+            };
+            let table = Table::new(table_rows, widths)
+                .header(Row::new(header).style(Style::new().bold()))
+                .block(block.title_bottom(
+                    Line::from(format!(" {}/{} ", selected + 1, list.len())).right_aligned(),
+                ))
+                .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+            let mut ts = TableState::default().with_offset(h.list_offset.get());
+            ts.select(Some(selected));
+            f.render_stateful_widget(table, rows[0], &mut ts);
+            h.list_offset.set(ts.offset());
+        }
     }
-    f.render_stateful_widget(table, cols[1], &mut ts);
 
-    let second = if let Some(err) = &app.error {
+    // Pied de page : la description du dépôt sélectionné (ou l'erreur), puis l'aide.
+    let description = list
+        .get(selected)
+        .and_then(|r| r.info.as_ref())
+        .map(|i| i.description.clone())
+        .unwrap_or_default();
+    let first = match &app.error {
+        Some(e) => Line::from(Span::styled(
+            format!("erreur : {e}"),
+            Style::new().fg(Color::Red),
+        )),
+        None => Line::from(Span::styled(description, Style::new().fg(Color::DarkGray))),
+    };
+    let help = Line::from(Span::styled(
+        home_help(area.width as usize, h.section, h.editing),
+        Style::new().fg(Color::DarkGray),
+    ));
+    f.render_widget(Paragraph::new(vec![first, help]), rows[1]);
+}
+
+fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let now = timeago::now_epoch();
+    let i = &r.info;
+    let mut title = vec![Span::raw(format!(" {} ", i.repo.full_name()))];
+    title.extend(repo_tags(i));
+    title.push(Span::raw(" "));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(title))
+        .border_style(Style::new().fg(Color::Yellow));
+
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines: Vec<Line> = Vec::new();
+    lines.push(if i.description.is_empty() {
+        Line::from(Span::styled("(pas de description)", dim))
+    } else {
+        Line::from(i.description.clone())
+    });
+    // Ce qu'on sait déjà du dépôt, sans requête de plus.
+    let mut facts: Vec<String> = Vec::new();
+    if !i.default_branch.is_empty() {
+        facts.push(format!("branche {}", i.default_branch));
+    }
+    if i.stars > 0 {
+        facts.push(format!("★ {}", i.stars));
+    }
+    if i.open_prs > 0 {
+        facts.push(format!("{} PR ouvertes", i.open_prs));
+    }
+    if i.open_issues > 0 {
+        facts.push(format!("{} tickets", i.open_issues));
+    }
+    if let Some(u) = i
+        .updated
+        .as_deref()
+        .map(|u| timeago::ago_rfc3339(now, u))
+        .filter(|u| !u.is_empty())
+    {
+        facts.push(format!("mis à jour {u}"));
+    }
+    lines.push(Line::from(Span::styled(facts.join(" · "), dim)));
+    lines.push(Line::from(""));
+    for (n, name) in RepoView::ITEMS.iter().enumerate() {
+        let summary: Vec<Span> = if n == 0 {
+            match &r.last_run {
+                LastRun::Loading => vec![Span::styled("…", dim)],
+                LastRun::None => vec![Span::styled("aucun run", dim)],
+                LastRun::Failed(e) => vec![Span::styled(format!("indisponible ({e})"), dim)],
+                LastRun::Ready(p) => {
+                    let (label, color) = status_style(p.status);
+                    vec![
+                        Span::styled(label, Style::new().fg(color)),
+                        Span::styled(format!("  {} · {}", p.workflow, p.branch), dim),
+                    ]
+                }
+            }
+        } else if i.empty {
+            vec![Span::styled("dépôt vide", dim)]
+        } else {
+            vec![Span::styled(format!("branche {}", i.default_branch), dim)]
+        };
+        let marker = if n == r.selected { "▸ " } else { "  " };
+        let style = if n == r.selected {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().bold()
+        };
+        let mut spans = vec![
+            Span::styled(format!("{marker}{name:<6}"), style),
+            Span::raw("  "),
+        ];
+        spans.extend(summary);
+        lines.push(Line::from(spans));
+    }
+    if let Some(e) = &r.info_error {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            format!("erreur : {e}"),
+            Style::new().fg(Color::Red),
+        )));
+    }
+    f.render_widget(Paragraph::new(lines).block(block), rows[0]);
+    draw_footer(f, app, rows[1], repo_help(area.width as usize), None);
+}
+
+fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Runs ")
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(rows[0]);
+    app.viewport.set((inner.height as usize).saturating_sub(1));
+    if r.pipelines.is_empty() {
+        let (text, color) = if r.loading {
+            ("chargement…", Color::Cyan)
+        } else {
+            ("(aucun run)", Color::DarkGray)
+        };
+        let line = Line::from(Span::styled(text, Style::new().fg(color)));
+        f.render_widget(Paragraph::new(line).block(block), rows[0]);
+    } else {
+        let table_rows: Vec<Row> = r
+            .pipelines
+            .iter()
+            .map(|p| {
+                let (label, color) = status_style(p.status);
+                Row::new(vec![
+                    Cell::from(Span::styled(label, Style::new().fg(color))),
+                    Cell::from(p.workflow.clone()),
+                    Cell::from(p.branch.clone()),
+                    Cell::from(p.commit.chars().take(7).collect::<String>()),
+                    Cell::from(p.title.clone()),
+                ])
+            })
+            .collect();
+        let table = Table::new(
+            table_rows,
+            [
+                Constraint::Length(13),
+                Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Length(8),
+                Constraint::Min(10),
+            ],
+        )
+        .header(
+            Row::new(["Statut", "Workflow", "Branche", "Commit", "Titre"])
+                .style(Style::new().bold()),
+        )
+        .block(block.title_bottom(
+            Line::from(format!(" {}/{} ", r.selected + 1, r.pipelines.len())).right_aligned(),
+        ))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut ts = TableState::default().with_offset(r.list_offset.get());
+        ts.select(Some(r.selected));
+        f.render_stateful_widget(table, rows[0], &mut ts);
+        r.list_offset.set(ts.offset());
+    }
+
+    let first = if let Some(err) = app.error.as_ref().or(r.error.as_ref()) {
         Line::from(Span::styled(
             format!("erreur : {err}"),
             Style::new().fg(Color::Red),
         ))
-    } else if let Some(url) = app.selected_pipeline().and_then(|p| p.url.as_deref()) {
+    } else if let Some(url) = r.selected_pipeline().and_then(|p| p.url.as_deref()) {
         Line::from(format!("run : {url}"))
     } else {
         Line::from("")
     };
     let help = Line::from(Span::styled(
-        lists_help(area.width as usize),
+        runs_help(area.width as usize),
         Style::new().fg(Color::DarkGray),
     ));
-    f.render_widget(Paragraph::new(vec![help, second]), rows[1]);
+    f.render_widget(Paragraph::new(vec![first, help]), rows[1]);
 }
 
 fn centered(area: Rect, width: u16, height: u16) -> Rect {
@@ -579,91 +854,118 @@ fn draw_login(f: &mut Frame, form: &LoginForm, server: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::Msg;
+    use crate::app::{Msg, Page};
     use crate::logview::{LineKind, LogLine, LogState};
     use ratatui::{Terminal, backend::TestBackend};
-    use smithy_core::{Pipeline, Repo};
+    use smithy_core::{Pipeline, Repo, RepoSource};
 
-    #[test]
-    fn rendu_complet_sans_panique_et_contenu_visible() {
+    fn info_of(repo: &Repo) -> RepoInfo {
+        RepoView::placeholder(repo.clone()).info
+    }
+
+    fn pipe(id: u64, workflow: &str, status: Status) -> Pipeline {
+        Pipeline {
+            id,
+            number: id,
+            job: "build".into(),
+            workflow: workflow.into(),
+            title: format!("titre {id}"),
+            branch: "main".into(),
+            commit: "2f9ec647244c".into(),
+            status,
+            url: Some(format!("http://x/runs/{id}")),
+        }
+    }
+
+    /// App sur la page des runs de `smithy/demo` : accueil → dépôt → CI, comme à l'usage.
+    fn app_on_runs(pipelines: Vec<Pipeline>) -> App {
+        let mut app = App::new();
+        app.logs_supported = true;
+        app.browse_supported = true;
+        app.take_requests();
         let repo = Repo {
             owner: "smithy".into(),
             name: "demo".into(),
         };
-        let mut app = App::new();
-        app.apply(Msg::Repos(Ok(vec![repo.clone()])));
+        app.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info_of(&repo)]),
+        });
+        app.home_enter();
+        app.repo_enter();
         app.apply(Msg::Pipelines {
             repo,
-            result: Ok(vec![Pipeline {
-                id: 1,
-                number: 2,
-                job: "build".into(),
-                workflow: "fail.yml".into(),
-                title: "ci: workflow rouge".into(),
-                branch: "main".into(),
-                commit: "2f9ec647244c".into(),
-                status: Status::Failure,
-                url: Some("http://x/runs/2".into()),
-            }]),
+            result: Ok(pipelines),
         });
+        app
+    }
 
-        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        term.draw(|f| draw(f, &app)).unwrap();
-        let text: String = term
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+    #[test]
+    fn page_des_runs() {
+        let app = app_on_runs(vec![Pipeline {
+            number: 2,
+            job: "build".into(),
+            ..pipe(1, "fail.yml", Status::Failure)
+        }]);
+        let text = render(&app, 100, 12);
         for needle in [
-            "smithy/demo",
+            "CI",
+            "Runs",
             "fail.yml",
             "failure",
             "2f9ec64",
-            "http://x/runs/2",
+            "titre 1",
+            "run : http://x/runs/1",
+            "1/1",
         ] {
-            assert!(text.contains(needle), "absent du rendu : {needle}");
+            assert!(text.contains(needle), "absent du rendu : {needle}\n{text}");
         }
+        assert!(!text.contains("Mes dépôts"), "l'accueil n'est plus affiché");
     }
 
     #[test]
     fn le_pied_de_page_suit_le_run_selectionne() {
-        let repo = Repo {
-            owner: "o".into(),
-            name: "r".into(),
-        };
-        let pipe = |id: u64| Pipeline {
-            id,
-            number: id,
-            job: "build".into(),
-            workflow: "ci.yml".into(),
-            title: "t".into(),
-            branch: "main".into(),
-            commit: "abc".into(),
-            status: Status::Success,
-            url: Some(format!("http://x/runs/{id}")),
-        };
-        let mut app = App::new();
-        app.apply(Msg::Repos(Ok(vec![repo.clone()])));
-        app.apply(Msg::Pipelines {
-            repo,
-            result: Ok(vec![pipe(3), pipe(2)]),
-        });
-        app.toggle_focus();
-        app.step(1);
-
-        let mut term = Terminal::new(TestBackend::new(100, 12)).unwrap();
-        term.draw(|f| draw(f, &app)).unwrap();
-        let text: String = term
-            .backend()
-            .buffer()
-            .content()
-            .iter()
-            .map(|c| c.symbol())
-            .collect();
+        let mut app = app_on_runs(vec![
+            pipe(3, "ci.yml", Status::Success),
+            pipe(2, "ci.yml", Status::Success),
+        ]);
+        app.list_move(1);
+        let text = render(&app, 100, 12);
         assert!(text.contains("run : http://x/runs/2"));
         assert!(!text.contains("run : http://x/runs/3"));
+    }
+
+    #[test]
+    fn page_des_runs_etats() {
+        let mut app = app_on_runs(vec![]);
+        assert!(render(&app, 80, 10).contains("(aucun run)"));
+        // Premier chargement : la liste est encore vide
+        let loading = app_on_runs(vec![]);
+        let mut loading = loading;
+        if let Some(Page::Runs(r)) = loading.stack.last_mut() {
+            r.loading = true;
+        }
+        assert!(render(&loading, 80, 10).contains("chargement"));
+        // Erreur de rafraîchissement : la liste reste, l'erreur apparaît en pied de page
+        app.apply(Msg::Pipelines {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "demo".into(),
+            },
+            result: Ok(vec![pipe(1, "ok.yml", Status::Success)]),
+        });
+        app.apply(Msg::Pipelines {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "demo".into(),
+            },
+            result: Err("coupé".into()),
+        });
+        let t = render(&app, 100, 10);
+        assert!(t.contains("ok.yml") && t.contains("erreur : coupé"), "{t}");
+        for (w, h) in [(1, 1), (10, 3), (30, 5)] {
+            render(&app, w, h);
+        }
     }
 
     fn render(app: &App, w: u16, h: u16) -> String {
@@ -678,28 +980,11 @@ mod tests {
     }
 
     fn app_with_logs(state: LogState) -> App {
-        let repo = Repo {
-            owner: "smithy".into(),
-            name: "demo".into(),
-        };
-        let mut app = App::new();
-        app.logs_supported = true;
-        app.apply(Msg::Repos(Ok(vec![repo.clone()])));
-        app.apply(Msg::Pipelines {
-            repo: repo.clone(),
-            result: Ok(vec![Pipeline {
-                id: 1,
-                number: 3,
-                job: "test".into(),
-                workflow: "fail.yml".into(),
-                title: "t".into(),
-                branch: "main".into(),
-                commit: "abc".into(),
-                status: Status::Failure,
-                url: None,
-            }]),
-        });
-        app.focus = Focus::Pipelines;
+        let mut app = app_on_runs(vec![Pipeline {
+            number: 3,
+            job: "test".into(),
+            ..pipe(1, "fail.yml", Status::Failure)
+        }]);
         app.open_logs();
         app.logs_mut().unwrap().state = state;
         app
@@ -826,8 +1111,14 @@ mod tests {
     fn explorer_app() -> App {
         let mut app = App::new();
         app.browse_supported = true;
-        app.apply(Msg::Repos(Ok(vec![tree_repo()])));
-        app.open_browser();
+        app.take_requests();
+        app.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info_of(&tree_repo())]),
+        });
+        app.home_enter();
+        app.list_move(1); // « Code »
+        app.repo_enter();
         app
     }
 
@@ -1028,16 +1319,358 @@ mod tests {
         assert_eq!(browser(&app).list_offset.get(), 0);
     }
 
+    // --- accueil
+
+    fn recent_ts(seconds_ago: i64) -> String {
+        // RFC 3339 en UTC, reconstruit à partir de l'heure courante.
+        let t = timeago::now_epoch() - seconds_ago;
+        let days = t.div_euclid(86_400);
+        let rem = t.rem_euclid(86_400);
+        // jours depuis 1970 -> date civile (algorithme de H. Hinnant, sens inverse)
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z.rem_euclid(146_097);
+        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let d = doy - (153 * mp + 2) / 5 + 1;
+        let m = if mp < 10 { mp + 3 } else { mp - 9 };
+        let y = yoe + era * 400 + i64::from(m <= 2);
+        format!(
+            "{y:04}-{m:02}-{d:02}T{:02}:{:02}:{:02}Z",
+            rem / 3600,
+            rem % 3600 / 60,
+            rem % 60
+        )
+    }
+
+    fn info_full(name: &str) -> RepoInfo {
+        let mut i = info_of(&Repo {
+            owner: "smithy".into(),
+            name: name.into(),
+        });
+        i.description = format!("description de {name}");
+        i.default_branch = "main".into();
+        i
+    }
+
+    fn home_app(infos: Vec<RepoInfo>) -> App {
+        let mut app = App::new();
+        app.take_requests();
+        app.server_name = "maison".into();
+        app.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(infos),
+        });
+        app
+    }
+
     #[test]
-    fn aide_de_la_liste_des_depots_adaptee_a_la_largeur() {
-        // 80 colonnes : l'ancienne aide tenait, la nouvelle (avec « e ») doit tenir aussi.
-        let h = lists_help(80);
-        assert!(h.contains("e code") && h.contains("q quitter"), "{h}");
-        assert!(lists_help(120).contains("e explorer le code"));
-        for w in [100, 80, 60, 40, 20, 8, 3, 0] {
-            let h = lists_help(w);
-            assert!(h.chars().count() <= w.max(1), "{h:?} dépasse {w}");
-            assert!(h.contains('q'), "toujours la sortie : {h:?}");
+    fn accueil_liste_les_depots_avec_marques_et_dates() {
+        let mut demo = info_full("demo");
+        demo.private = true;
+        demo.open_prs = 2;
+        demo.stars = 3;
+        demo.updated = Some(recent_ts(2 * 3600));
+        let mut vieux = info_full("vieux");
+        vieux.archived = true;
+        vieux.fork = true;
+        vieux.empty = true;
+        let app = home_app(vec![demo, vieux]);
+        let t = render(&app, 110, 12);
+        for needle in [
+            "maison › Accueil",
+            "Mes dépôts",
+            "Suivis",
+            "Étoilés",
+            "Explorer",
+            "Récents",
+            "Dépôt",
+            "PR",
+            "Mis à jour",
+            "smithy/demo",
+            "[privé]",
+            "2 PR",
+            "★ 3",
+            "il y a 2 h",
+            "smithy/vieux",
+            "[archivé]",
+            "[fork]",
+            "[vide]",
+            "1/2",
+            "description de demo",
+        ] {
+            assert!(t.contains(needle), "absent : {needle}\n{t}");
+        }
+        assert!(
+            !t.contains("description de vieux"),
+            "seule la description de la sélection est montrée"
+        );
+        let mut moved = home_app(vec![info_full("a"), info_full("b")]);
+        moved.list_move(1);
+        let t = render(&moved, 110, 12);
+        assert!(t.contains("description de b") && t.contains("2/2"));
+    }
+
+    #[test]
+    fn accueil_sections_en_video_inverse() {
+        let app = home_app(vec![info_full("a")]);
+        let mut term = Terminal::new(TestBackend::new(100, 8)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        // Ligne 1 : le cadre et ses sections. Seule la section courante est inversée.
+        let row =
+            |y: u16| -> Vec<&ratatui::buffer::Cell> { (0..100).map(|x| &buf[(x, y)]).collect() };
+        let reversed: String = row(1)
+            .iter()
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(reversed.trim(), "Mes dépôts", "{reversed:?}");
+    }
+
+    #[test]
+    fn accueil_etats_vides_et_erreurs() {
+        // Chargement initial
+        let app = App::new();
+        assert!(render(&app, 80, 10).contains("chargement"));
+        // Échec
+        let mut app = App::new();
+        app.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Err(smithy_core::Error::Network("coupé".into())),
+        });
+        assert!(render(&app, 80, 10).contains("erreur : "));
+        // Liste vide
+        let app = home_app(vec![]);
+        assert!(render(&app, 80, 10).contains("(aucun dépôt)"));
+        // Filtre sans résultat
+        let mut app = home_app(vec![info_full("a")]);
+        app.home_mut().unwrap().start_edit();
+        "zzz"
+            .chars()
+            .for_each(|c| app.home_mut().unwrap().type_char(c));
+        let t = render(&app, 90, 10);
+        assert!(
+            t.contains("aucun dépôt ne correspond à « zzz »") && t.contains("filtrer : zzz▏"),
+            "{t}"
+        );
+        assert!(
+            t.contains("Entrée valider"),
+            "l'aide change pendant la saisie"
+        );
+        // « Explorer » : invitation à chercher, puis résultat vide
+        let mut app = home_app(vec![]);
+        app.home_switch(3);
+        assert!(render(&app, 90, 10).contains("Tapez /"));
+        app.home_mut().unwrap().start_edit();
+        "rien"
+            .chars()
+            .for_each(|c| app.home_mut().unwrap().type_char(c));
+        assert!(render(&app, 90, 10).contains("chercher : rien▏"));
+        app.home_commit();
+        app.apply(Msg::Repos {
+            source: RepoSource::Search("rien".into()),
+            result: Ok(vec![]),
+        });
+        assert!(render(&app, 90, 10).contains("(aucun résultat pour « rien »)"));
+        // « Récents » vide
+        let mut app = home_app(vec![]);
+        app.home_switch(4);
+        assert!(render(&app, 90, 10).contains("(aucun dépôt ouvert récemment)"));
+    }
+
+    #[test]
+    fn accueil_recents_avec_date_d_ouverture() {
+        let mut app = home_app(vec![]);
+        app.recents = vec![crate::recent::RecentEntry {
+            server: "maison".into(),
+            owner: "smithy".into(),
+            name: "tree".into(),
+            opened: timeago::now_epoch() - 3 * 86_400,
+        }];
+        app.home_switch(4);
+        let t = render(&app, 90, 10);
+        assert!(
+            t.contains("Ouvert") && t.contains("smithy/tree") && t.contains("il y a 3 j"),
+            "{t}"
+        );
+        assert!(!t.contains("Mis à jour"), "colonnes propres aux récents");
+    }
+
+    #[test]
+    fn accueil_long_defile_sans_sauter() {
+        let many: Vec<_> = (0..300).map(|i| info_full(&format!("r{i:03}"))).collect();
+        let mut app = home_app(many);
+        for _ in 0..200 {
+            app.list_move(1);
+            render(&app, 90, 14);
+        }
+        let t = render(&app, 90, 14);
+        assert!(
+            t.contains("r200") && !t.contains("r000") && t.contains("201/300"),
+            "{t}"
+        );
+        let before = app.home().unwrap().list_offset.get();
+        app.list_move(-1);
+        render(&app, 90, 14);
+        assert_eq!(
+            app.home().unwrap().list_offset.get(),
+            before,
+            "remonter d'une ligne ne fait pas sauter la liste"
+        );
+    }
+
+    #[test]
+    fn accueil_et_depot_tres_petits_terminaux() {
+        let mut app = home_app(vec![info_full("a")]);
+        for (w, h) in [(1, 1), (5, 2), (12, 4), (30, 6)] {
+            render(&app, w, h);
+        }
+        app.home_enter();
+        for (w, h) in [(1, 1), (5, 2), (12, 4), (30, 6)] {
+            render(&app, w, h);
+        }
+    }
+
+    // --- page d'un dépôt
+
+    fn repo_app(mut info: RepoInfo) -> App {
+        info.description = "Outil de CI".into();
+        let mut app = home_app(vec![info]);
+        app.home_enter();
+        app.take_requests();
+        app
+    }
+
+    #[test]
+    fn page_du_depot() {
+        let mut i = info_full("demo");
+        i.private = true;
+        i.stars = 4;
+        i.open_prs = 3;
+        i.open_issues = 7;
+        i.updated = Some(recent_ts(5 * 60));
+        let mut app = repo_app(i);
+        let t = render(&app, 100, 12);
+        for needle in [
+            "maison › Accueil › smithy/demo",
+            "smithy/demo",
+            "[privé]",
+            "Outil de CI",
+            "branche main",
+            "★ 4",
+            "3 PR ouvertes",
+            "7 tickets",
+            "mis à jour il y a 5 min",
+            "▸ CI",
+            "Code",
+        ] {
+            assert!(t.contains(needle), "absent : {needle}\n{t}");
+        }
+        assert!(t.contains("…"), "dernier run en cours de chargement");
+        // Le dernier run, une fois reçu
+        app.apply(Msg::Pipelines {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "demo".into(),
+            },
+            result: Ok(vec![pipe(9, "fail.yml", Status::Failure)]),
+        });
+        let t = render(&app, 100, 12);
+        assert!(
+            t.contains("✘ failure") && t.contains("fail.yml · main"),
+            "{t}"
+        );
+        // Sélection sur « Code »
+        app.list_move(1);
+        let t = render(&app, 100, 12);
+        assert!(t.contains("▸ Code") && !t.contains("▸ CI"), "{t}");
+        assert!(t.contains("branche main"));
+    }
+
+    #[test]
+    fn page_du_depot_cas_limites() {
+        // Sans description ni fiche, aucun run, dépôt vide, erreurs
+        let mut app = repo_app(
+            RepoView::placeholder(Repo {
+                owner: "smithy".into(),
+                name: "vide".into(),
+            })
+            .info,
+        );
+        app.repo_page_info_mut(|i| {
+            i.description.clear();
+            i.empty = true;
+        });
+        app.apply(Msg::Pipelines {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "vide".into(),
+            },
+            result: Ok(vec![]),
+        });
+        let t = render(&app, 100, 12);
+        assert!(
+            t.contains("(pas de description)")
+                && t.contains("aucun run")
+                && t.contains("dépôt vide"),
+            "{t}"
+        );
+        app.apply(Msg::Pipelines {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "vide".into(),
+            },
+            result: Err("coupé".into()),
+        });
+        assert!(render(&app, 100, 12).contains("indisponible (coupé)"));
+        app.apply(Msg::RepoInfo {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "vide".into(),
+            },
+            result: Err(smithy_core::Error::NotFound("vide".into())),
+        });
+        assert!(render(&app, 100, 14).contains("erreur : "));
+    }
+
+    #[test]
+    fn aides_de_la_page_du_depot_et_des_runs() {
+        for w in [120, 80, 50, 30, 12, 5, 0] {
+            for h in [repo_help(w), runs_help(w)] {
+                assert!(h.chars().count() <= w.max(5), "{h:?} dépasse {w}");
+                assert!(
+                    h.contains("Échap") || h.contains('←'),
+                    "le retour reste indiqué : {h:?}"
+                );
+            }
+        }
+        assert!(repo_help(120).contains("↵/→ ouvrir") && runs_help(120).contains("logs"));
+    }
+
+    #[test]
+    fn aide_de_l_accueil_adaptee_a_la_largeur() {
+        // 80 colonnes : « ↵ ouvrir », « / filtrer » et « q quitter » doivent rester visibles.
+        let h = home_help(80, Section::Mine, false);
+        assert!(
+            h.contains("↵ ouvrir") && h.contains("/ filtrer") && h.contains("q quitter"),
+            "{h}"
+        );
+        assert!(home_help(120, Section::Mine, false).contains("r actualiser"));
+        assert!(home_help(90, Section::Explore, false).contains("/ chercher"));
+        assert!(home_help(90, Section::Mine, true).contains("Entrée valider"));
+        for section in Section::ALL {
+            for editing in [false, true] {
+                for w in [100, 80, 60, 40, 20, 8, 3, 0] {
+                    let h = home_help(w, section, editing);
+                    assert!(h.chars().count() <= w.max(8), "{h:?} dépasse {w}");
+                    assert!(
+                        h.contains('q') || h.contains("Échap"),
+                        "une sortie reste indiquée : {h:?}"
+                    );
+                }
+            }
         }
         // Rendu réel à 80 colonnes
         let app = App::new();

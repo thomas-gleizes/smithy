@@ -2,7 +2,11 @@ mod app;
 mod browser;
 mod config;
 mod logview;
+mod pages;
+mod recent;
+mod request;
 mod session;
+mod timeago;
 mod ui;
 mod wrap;
 
@@ -15,13 +19,15 @@ use std::{
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
 use ratatui::DefaultTerminal;
-use smithy_core::{Error, Pipeline, Provider, Repo};
+use smithy_core::{Error, Provider};
 use smithy_forgejo::Forgejo;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use app::{App, Msg};
-use browser::{Browser, FILE_LIMIT_BYTES, Request, Screen};
+use browser::{Browser, FILE_LIMIT_BYTES, Screen};
 use config::{Server, ServerKind};
+use recent::RecentStore;
+use request::Request;
 use session::{Session, SessionStore};
 
 const REFRESH: Duration = Duration::from_secs(5);
@@ -53,39 +59,73 @@ fn build_provider(
     }
 }
 
-fn fetch_repos<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>) {
-    let (p, tx) = (p.clone(), tx.clone());
-    tokio::spawn(async move {
-        let r = p.list_repos().await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Repos(r));
-    });
-}
-
-fn fetch_pipelines<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>, app: &App) {
-    let Some(repo) = app.selected_repo().cloned() else {
+/// Touches de l'accueil. Pendant une saisie (filtre ou recherche), presque tout est du texte.
+fn home_key(app: &mut App, code: KeyCode) {
+    if app.home().is_some_and(|h| h.editing) {
+        match code {
+            KeyCode::Enter => app.home_commit(),
+            KeyCode::Esc => {
+                if let Some(h) = app.home_mut() {
+                    h.cancel_edit();
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(h) = app.home_mut() {
+                    h.backspace();
+                }
+            }
+            KeyCode::Char(c) => {
+                if let Some(h) = app.home_mut() {
+                    h.type_char(c);
+                }
+            }
+            _ => {}
+        }
         return;
-    };
-    let (p, tx) = (p.clone(), tx.clone());
-    tokio::spawn(async move {
-        let result = p.list_pipelines(&repo).await.map_err(|e| e.to_string());
-        let _ = tx.send(Msg::Pipelines { repo, result });
-    });
+    }
+    match code {
+        KeyCode::Char('q') => app.should_quit = true,
+        // Échap ne quitte jamais : à l'accueil il ne fait que retirer le filtre.
+        KeyCode::Esc => {
+            if let Some(h) = app.home_mut() {
+                h.clear_filter();
+            }
+        }
+        KeyCode::Char('/') => {
+            if let Some(h) = app.home_mut() {
+                h.start_edit();
+            }
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.list_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.list_move(-1),
+        KeyCode::PageDown | KeyCode::Char('f') => app.list_page(1),
+        KeyCode::PageUp | KeyCode::Char('b') => app.list_page(-1),
+        KeyCode::Home | KeyCode::Char('g') => app.list_move(isize::MIN / 2),
+        KeyCode::End | KeyCode::Char('G') => app.list_move(isize::MAX / 2),
+        KeyCode::Right => app.home_switch(1),
+        KeyCode::Left => app.home_switch(-1),
+        KeyCode::Enter => app.home_enter(),
+        KeyCode::Char('r') => app.refresh_current(),
+        _ => {}
+    }
 }
 
-fn fetch_logs<P: Provider + 'static>(
-    p: &Arc<P>,
-    tx: &UnboundedSender<Msg>,
-    (repo, pipeline): (Repo, Pipeline),
-) {
-    let (p, tx) = (p.clone(), tx.clone());
-    tokio::spawn(async move {
-        let result = p.job_log(&repo, &pipeline).await;
-        let _ = tx.send(Msg::Logs {
-            repo,
-            pipeline_id: pipeline.id,
-            result,
-        });
-    });
+/// Touches de la page d'un dépôt et de la liste de ses runs.
+fn list_key(app: &mut App, code: KeyCode, enter: fn(&mut App)) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
+            app.pop();
+        }
+        KeyCode::Char('j') | KeyCode::Down => app.list_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.list_move(-1),
+        KeyCode::PageDown | KeyCode::Char('f') => app.list_page(1),
+        KeyCode::PageUp | KeyCode::Char('b') => app.list_page(-1),
+        KeyCode::Home | KeyCode::Char('g') => app.list_move(isize::MIN / 2),
+        KeyCode::End | KeyCode::Char('G') => app.list_move(isize::MAX / 2),
+        KeyCode::Enter | KeyCode::Right => enter(app),
+        KeyCode::Char('r') => app.refresh_current(),
+        _ => {}
+    }
 }
 
 /// Touches de l'explorateur de code : un écran à la fois (dossier, sélecteur de branche, fichier).
@@ -107,11 +147,7 @@ fn browser_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('g') | KeyCode::Home => app.text_top(),
             KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
             KeyCode::Char('w') => app.text_toggle_wrap(),
-            KeyCode::Char('r') => {
-                if let Some(b) = app.browser_mut() {
-                    b.refresh();
-                }
-            }
+            KeyCode::Char('r') => app.refresh_current(),
             _ => {}
         },
         Screen::Branches => {
@@ -137,8 +173,8 @@ fn browser_key(app: &mut App, code: KeyCode) {
                     app.close_browser();
                 }
             }
-            KeyCode::PageDown | KeyCode::Char('f') => app.browser_page(1),
-            KeyCode::PageUp | KeyCode::Char('b') => app.browser_page(-1),
+            KeyCode::PageDown | KeyCode::Char('f') => app.list_page(1),
+            KeyCode::PageUp | KeyCode::Char('b') => app.list_page(-1),
             _ => {
                 let Some(b) = app.browser_mut() else {
                     return;
@@ -159,11 +195,31 @@ fn browser_key(app: &mut App, code: KeyCode) {
     }
 }
 
-/// Lance une requête de l'explorateur ; la réponse revient par le canal comme les autres.
+/// Lance une requête de l'application ; la réponse revient par le canal sous forme de `Msg`.
 fn run_request<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>, req: Request) {
     let (p, tx) = (p.clone(), tx.clone());
     tokio::spawn(async move {
         let msg = match req {
+            Request::Repos(source) => {
+                let result = p.list_repos(&source).await;
+                Msg::Repos { source, result }
+            }
+            Request::RepoInfo(repo) => {
+                let result = p.repo_info(&repo).await;
+                Msg::RepoInfo { repo, result }
+            }
+            Request::Pipelines(repo) => {
+                let result = p.list_pipelines(&repo).await.map_err(|e| e.to_string());
+                Msg::Pipelines { repo, result }
+            }
+            Request::Logs { repo, pipeline } => {
+                let result = p.job_log(&repo, &pipeline).await;
+                Msg::Logs {
+                    repo,
+                    pipeline_id: pipeline.id,
+                    result,
+                }
+            }
             Request::Branches(repo) => {
                 let result = p.list_branches(&repo).await;
                 Msg::Branches { repo, result }
@@ -240,10 +296,14 @@ async fn run(
     server: Server,
     store: Option<SessionStore>,
 ) -> Result<()> {
+    let recent_store = RecentStore::default_location();
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = App::new();
     app.server_name = server.name.clone();
     app.server_label = format!("{} ({})", server.name, server.url);
+    if let Some(r) = &recent_store {
+        app.recents = r.load();
+    }
 
     // Le token de la config prime ; sinon celui créé lors d'un login précédent.
     // Les cookies, eux, viennent toujours de la session sauvegardée.
@@ -259,7 +319,6 @@ async fn run(
         Some(p) => {
             app.logs_supported = p.capabilities().logs;
             app.browse_supported = p.capabilities().browse;
-            fetch_repos(p, &tx);
         }
         None => app.open_login(&username),
     }
@@ -267,10 +326,6 @@ async fn run(
 
     while !app.should_quit {
         terminal.draw(|f| ui::draw(f, &app))?;
-
-        let mut need_pipelines = false;
-        let mut need_repos = false;
-        let mut need_logs = None;
 
         if event::poll(TICK)? {
             if let Event::Key(k) = event::read()? {
@@ -295,6 +350,12 @@ async fn run(
                             KeyCode::Char(c) if !ctrl => app.login_type(c),
                             _ => {}
                         }
+                    } else if app.home().is_some() {
+                        home_key(&mut app, k.code);
+                    } else if app.repo_page().is_some() {
+                        list_key(&mut app, k.code, App::repo_enter);
+                    } else if app.runs().is_some() {
+                        list_key(&mut app, k.code, App::open_logs);
                     } else if app.logs().is_some() {
                         match k.code {
                             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
@@ -311,26 +372,11 @@ async fn run(
                             KeyCode::Char('g') | KeyCode::Home => app.text_top(),
                             KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
                             KeyCode::Char('w') => app.text_toggle_wrap(),
-                            KeyCode::Char('r') => need_logs = app.refetch_logs(),
+                            KeyCode::Char('r') => app.refetch_logs(),
                             _ => {}
                         }
                     } else if app.browser().is_some() {
                         browser_key(&mut app, k.code);
-                    } else {
-                        match k.code {
-                            // Échap ne quitte jamais : il ne fait que dépiler (rien à la racine).
-                            KeyCode::Char('q') => app.should_quit = true,
-                            KeyCode::Char('e') => app.open_browser(),
-                            KeyCode::Char('j') | KeyCode::Down => need_pipelines = app.step(1),
-                            KeyCode::Char('k') | KeyCode::Up => need_pipelines = app.step(-1),
-                            KeyCode::Tab => app.toggle_focus(),
-                            KeyCode::Enter => need_logs = app.open_logs(),
-                            KeyCode::Char('r') => {
-                                need_repos = true;
-                                need_pipelines = true;
-                            }
-                            _ => {}
-                        }
                     }
                 }
             }
@@ -348,9 +394,8 @@ async fn run(
                         app.logs_supported = p.capabilities().logs;
                         app.browse_supported = p.capabilities().browse;
                         provider = Some(p);
-                        need_repos = true;
                         // Des logs étaient demandés quand la session a expiré : on les relance.
-                        need_logs = app.refetch_logs();
+                        app.refetch_logs();
                     }
                     if let Some(Err(e)) = store.as_ref().map(|s| s.save(&server.name, session)) {
                         save_error = Some(format!("session non sauvegardée : {e}"));
@@ -362,7 +407,7 @@ async fn run(
                 } if app.login.is_none() => app.open_login(&username),
                 _ => {}
             }
-            need_pipelines |= app.apply(msg);
+            app.apply(msg);
             // Après `apply`, qui efface le bandeau d'erreur.
             if save_error.is_some() {
                 app.error = save_error;
@@ -370,24 +415,18 @@ async fn run(
         }
 
         if last_refresh.elapsed() >= REFRESH {
-            need_pipelines = true;
-            if need_logs.is_none() && app.logs_are_live() {
-                need_logs = app.refetch_logs();
-            }
+            app.tick();
             last_refresh = Instant::now();
         }
         if let Some(p) = &provider {
-            if need_repos {
-                fetch_repos(p, &tx);
-            }
-            if need_pipelines {
-                fetch_pipelines(p, &tx, &app);
-            }
-            if let Some(req) = need_logs {
-                fetch_logs(p, &tx, req);
-            }
             for req in app.take_requests() {
                 run_request(p, &tx, req);
+            }
+        }
+        if app.recents_dirty {
+            app.recents_dirty = false;
+            if let Some(Err(e)) = recent_store.as_ref().map(|r| r.save(&app.recents)) {
+                app.error = Some(format!("historique non sauvegardé : {e}"));
             }
         }
     }

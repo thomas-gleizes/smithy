@@ -87,7 +87,7 @@ impl SessionStore {
 }
 
 #[cfg(unix)]
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     fs::DirBuilder::new()
         .recursive(true)
@@ -97,12 +97,12 @@ fn create_private_dir(dir: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn create_private_dir(dir: &Path) -> Result<()> {
+pub(crate) fn create_private_dir(dir: &Path) -> Result<()> {
     fs::create_dir_all(dir).with_context(|| format!("création de {}", dir.display()))
 }
 
 #[cfg(unix)]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
     let mut f = fs::OpenOptions::new()
         .write(true)
@@ -114,7 +114,7 @@ fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+pub(crate) fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     fs::File::create(path)?.write_all(data)
 }
 

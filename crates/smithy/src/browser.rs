@@ -7,28 +7,12 @@ use std::cell::Cell;
 
 use smithy_core::{Branch, Entry, EntryKind, Error, FileContent, Repo, clean_text_line};
 
-use crate::logview::TextView;
+use crate::{logview::TextView, request::Request};
 
 /// Octets lus d'un fichier au plus : au-delà, seul le début est affiché.
 pub const FILE_LIMIT_BYTES: usize = 1024 * 1024;
 /// Lignes affichées au plus (un million de lignes vides tiendrait dans la limite d'octets).
 pub const FILE_LIMIT_LINES: usize = 50_000;
-
-/// Ce que la boucle principale doit demander au backend.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Request {
-    Branches(Repo),
-    Dir {
-        repo: Repo,
-        reference: String,
-        path: String,
-    },
-    File {
-        repo: Repo,
-        reference: String,
-        path: String,
-    },
-}
 
 #[derive(Debug)]
 pub enum DirState {
@@ -111,7 +95,8 @@ impl Browser {
         }
     }
 
-    /// Fil d'Ariane de la page : dépôt, « Code », branche, puis les dossiers (ou le fichier).
+    /// Fil d'Ariane de la page : « Code », branche, puis les dossiers (ou le fichier). Le dépôt
+    /// n'y est pas : la page du dépôt, plus bas dans la pile, le donne déjà.
     pub fn breadcrumb(&self) -> Vec<String> {
         let reference = if self.reference.is_empty() {
             "…"
@@ -122,11 +107,7 @@ impl Browser {
             Mode::File(fv) => fv.path.as_str(),
             _ => self.path.as_str(),
         };
-        let mut out = vec![
-            self.repo.full_name(),
-            "Code".to_owned(),
-            reference.to_owned(),
-        ];
+        let mut out = vec!["Code".to_owned(), reference.to_owned()];
         out.extend(path.split('/').filter(|s| !s.is_empty()).map(str::to_owned));
         out
     }
@@ -624,27 +605,24 @@ mod tests {
     #[test]
     fn fil_d_ariane_de_l_explorateur() {
         let mut b = Browser::open(repo());
-        assert_eq!(b.breadcrumb(), ["o/r", "Code", "…"], "branche inconnue");
+        assert_eq!(b.breadcrumb(), ["Code", "…"], "branche inconnue");
         b.take_requests();
         b.on_branches(&repo(), Ok(vec![branch("feature/x", true)]));
         assert_eq!(
             b.breadcrumb(),
-            ["o/r", "Code", "feature/x"],
+            ["Code", "feature/x"],
             "un slash de branche reste un seul élément"
         );
         b.path = "src/deep".into();
-        assert_eq!(b.breadcrumb(), ["o/r", "Code", "feature/x", "src", "deep"]);
+        assert_eq!(b.breadcrumb(), ["Code", "feature/x", "src", "deep"]);
         b.mode = Mode::File(FileView {
             path: "src/deep/a.rs".into(),
             text: TextView::new(),
         });
-        assert_eq!(
-            b.breadcrumb(),
-            ["o/r", "Code", "feature/x", "src", "deep", "a.rs"]
-        );
+        assert_eq!(b.breadcrumb(), ["Code", "feature/x", "src", "deep", "a.rs"]);
         b.path.clear();
         b.mode = Mode::Dir;
-        assert_eq!(b.breadcrumb().len(), 3, "racine : pas de segment vide");
+        assert_eq!(b.breadcrumb().len(), 2, "racine : pas de segment vide");
     }
 
     #[test]

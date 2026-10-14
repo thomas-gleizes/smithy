@@ -2,17 +2,36 @@
 
 use std::cell::Cell;
 
-use smithy_core::{Branch, Entry, Error, FileContent, JobLog, Pipeline, Repo, Status};
+use smithy_core::{
+    Branch, Entry, Error, FileContent, JobLog, Pipeline, Repo, RepoInfo, RepoSource, Status,
+};
 
 use crate::{
-    browser::{Browser, Mode, Request},
+    browser::{Browser, Mode},
     logview::{LogState, LogView, Start, TextView},
+    pages::{HomeRow, HomeView, RepoView, RunsView},
+    recent::{self, RecentEntry},
+    request::Request,
     session::Session,
+    timeago,
 };
 
 pub enum Msg {
-    /// Explorateur : branches, contenu d'un dossier, contenu d'un fichier. Chaque réponse porte
-    /// ce qu'on a demandé, pour que l'explorateur écarte celles qui sont devenues périmées.
+    /// Accueil : une liste de dépôts, ou la fiche d'un seul. Chaque réponse porte ce qu'on a
+    /// demandé, pour écarter celles qui sont devenues périmées.
+    Repos {
+        source: RepoSource,
+        result: Result<Vec<RepoInfo>, Error>,
+    },
+    RepoInfo {
+        repo: Repo,
+        result: Result<RepoInfo, Error>,
+    },
+    Pipelines {
+        repo: Repo,
+        result: Result<Vec<Pipeline>, String>,
+    },
+    /// Explorateur : branches, contenu d'un dossier, contenu d'un fichier.
     Branches {
         repo: Repo,
         result: Result<Vec<Branch>, Error>,
@@ -37,23 +56,15 @@ pub enum Msg {
     },
     /// Résultat du login : la session à conserver, ou le message d'erreur.
     LoggedIn(Result<Session, String>),
-    Repos(Result<Vec<Repo>, String>),
-    Pipelines {
-        repo: Repo,
-        result: Result<Vec<Pipeline>, String>,
-    },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Focus {
-    Repos,
-    Pipelines,
-}
-
-/// Une page de la pile de navigation. La racine est l'écran des listes (dépôts et runs).
+/// Une page de la pile de navigation, avec son propre état de vue.
 #[derive(Debug)]
 pub enum Page {
-    Root,
+    /// L'accueil : au fond de la pile, toujours.
+    Home(HomeView),
+    Repo(RepoView),
+    Runs(RunsView),
     Logs(LogView),
     Browser(Browser),
 }
@@ -75,11 +86,7 @@ pub struct LoginForm {
 }
 
 pub struct App {
-    pub repos: Vec<Repo>,
-    pub pipelines: Vec<Pipeline>,
-    pub repo_idx: usize,
-    pub pipe_idx: usize,
-    pub focus: Focus,
+    /// Message d'erreur ou d'information passager, affiché en pied de page.
     pub error: Option<String>,
     pub should_quit: bool,
     /// Formulaire affiché par-dessus l'interface tant que l'utilisateur n'est pas connecté.
@@ -87,40 +94,84 @@ pub struct App {
     /// Nom et URL du serveur, pour le titre du formulaire.
     pub server_label: String,
     /// Pages empilées, comme dans un navigateur : `Échap` dépile et retrouve la page d'avant
-    /// telle qu'on l'a laissée. Jamais vide : le fond est toujours `Page::Root`.
+    /// telle qu'on l'a laissée. Jamais vide : le fond est toujours l'accueil.
     pub stack: Vec<Page>,
-    /// Nom du serveur, pour le fil d'Ariane.
+    /// Nom du serveur, pour le fil d'Ariane et l'historique.
     pub server_name: String,
     /// Le backend sait-il fournir des logs ? (`Capabilities::logs`)
     pub logs_supported: bool,
     /// Le backend sait-il parcourir le code ? (`Capabilities::browse`)
     pub browse_supported: bool,
-    /// Dernier choix de retour à la ligne, appliqué aux vues de logs suivantes (le temps de la session).
+    /// Dernier choix de retour à la ligne, appliqué aux volets de texte suivants (le temps de la session).
     pub logs_wrap: bool,
-    /// Hauteur et largeur utiles de la vue des logs, écrites par le rendu qui seul les connaît.
+    /// Hauteur et largeur utiles de la page, écrites par le rendu qui seul les connaît.
     pub viewport: Cell<usize>,
     pub viewport_width: Cell<usize>,
+    /// Dépôts ouverts récemment (tous serveurs) ; à sauvegarder quand `recents_dirty`.
+    pub recents: Vec<RecentEntry>,
+    pub recents_dirty: bool,
+    /// Requêtes que la boucle principale doit lancer. Gardées tant qu'aucun fournisseur n'est
+    /// prêt (connexion à faire) : elles partent dès que la connexion aboutit.
+    pending: Vec<Request>,
 }
 
 impl App {
     pub fn new() -> Self {
+        let mut home = HomeView::new();
+        let pending = home.request_current().into_iter().collect();
         Self {
-            repos: Vec::new(),
-            pipelines: Vec::new(),
-            repo_idx: 0,
-            pipe_idx: 0,
-            focus: Focus::Repos,
             error: None,
             should_quit: false,
             login: None,
             server_label: String::new(),
-            stack: vec![Page::Root],
+            stack: vec![Page::Home(home)],
             server_name: String::new(),
             logs_supported: false,
             browse_supported: false,
             logs_wrap: false,
             viewport: Cell::new(20),
             viewport_width: Cell::new(80),
+            recents: Vec::new(),
+            recents_dirty: false,
+            pending,
+        }
+    }
+
+    // --- la page affichée, selon son type
+
+    pub fn home(&self) -> Option<&HomeView> {
+        match self.stack.last() {
+            Some(Page::Home(h)) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub fn home_mut(&mut self) -> Option<&mut HomeView> {
+        match self.stack.last_mut() {
+            Some(Page::Home(h)) => Some(h),
+            _ => None,
+        }
+    }
+
+    pub fn repo_page(&self) -> Option<&RepoView> {
+        match self.stack.last() {
+            Some(Page::Repo(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Pour les tests du rendu : modifie la fiche de la page du dépôt affichée.
+    #[cfg(test)]
+    pub fn repo_page_info_mut(&mut self, f: impl FnOnce(&mut RepoInfo)) {
+        if let Some(Page::Repo(r)) = self.stack.last_mut() {
+            f(&mut r.info);
+        }
+    }
+
+    pub fn runs(&self) -> Option<&RunsView> {
+        match self.stack.last() {
+            Some(Page::Runs(r)) => Some(r),
+            _ => None,
         }
     }
 
@@ -154,7 +205,8 @@ impl App {
         }
     }
 
-    /// Où l'on est, du serveur à la page affichée : `maison › Accueil › smithy/demo › CI › …`.
+    /// Où l'on est, du serveur à la page affichée : chaque page ajoute son segment.
+    /// `maison › Accueil › smithy/demo › CI › fail.yml › test`.
     pub fn breadcrumb(&self) -> Vec<String> {
         let server = if self.server_name.is_empty() {
             "smithy"
@@ -164,20 +216,17 @@ impl App {
         let mut out = vec![server.to_owned()];
         for page in &self.stack {
             match page {
-                Page::Root => out.push("Accueil".to_owned()),
-                Page::Logs(v) => out.extend([
-                    v.repo.full_name(),
-                    "CI".to_owned(),
-                    v.pipeline.workflow.clone(),
-                    v.pipeline.job.clone(),
-                ]),
+                Page::Home(_) => out.push("Accueil".to_owned()),
+                Page::Repo(r) => out.push(r.info.repo.full_name()),
+                Page::Runs(_) => out.push("CI".to_owned()),
+                Page::Logs(v) => out.extend([v.pipeline.workflow.clone(), v.pipeline.job.clone()]),
                 Page::Browser(b) => out.extend(b.breadcrumb()),
             }
         }
         out
     }
 
-    /// Dépile la page affichée ; la racine ne se dépile jamais. Renvoie `true` si une page est partie.
+    /// Dépile la page affichée ; l'accueil ne se dépile jamais. Renvoie `true` si une page est partie.
     pub fn pop(&mut self) -> bool {
         if self.stack.len() > 1 {
             self.stack.pop();
@@ -187,34 +236,191 @@ impl App {
         }
     }
 
-    /// Entrée sur un run : ouvre ses logs. Sur la liste des dépôts, passe aux runs.
-    /// Renvoie la demande à envoyer au backend.
-    pub fn open_logs(&mut self) -> Option<(Repo, Pipeline)> {
-        if self.focus == Focus::Repos {
-            self.focus = Focus::Pipelines;
-            return None;
+    /// Les requêtes à lancer : celles de l'application, puis celles de chaque explorateur ouvert.
+    pub fn take_requests(&mut self) -> Vec<Request> {
+        let mut out = std::mem::take(&mut self.pending);
+        for page in &mut self.stack {
+            if let Page::Browser(b) = page {
+                out.extend(b.take_requests());
+            }
         }
+        out
+    }
+
+    // --- accueil
+
+    /// Les lignes de la section affichée (filtre appliqué).
+    pub fn home_rows(&self) -> Vec<HomeRow> {
+        self.home()
+            .map(|h| h.rows(&self.recents, &self.server_name))
+            .unwrap_or_default()
+    }
+
+    /// Haut, bas, page : déplace la sélection de la liste affichée (accueil, runs ou dossier).
+    pub fn list_move(&mut self, delta: isize) {
+        let len = self.home_rows().len();
+        match self.stack.last_mut() {
+            Some(Page::Home(h)) => h.move_selection(delta, len),
+            Some(Page::Repo(r)) => r.move_selection(delta),
+            Some(Page::Runs(r)) => r.move_selection(delta),
+            Some(Page::Browser(b)) => b.move_selection(delta),
+            _ => {}
+        }
+    }
+
+    /// Une page (`1`) ou la précédente (`-1`) : la hauteur affichée moins une ligne.
+    pub fn list_page(&mut self, pages: isize) {
+        let page = self.viewport.get().saturating_sub(1).max(1) as isize;
+        self.list_move(pages * page);
+    }
+
+    /// Flèche droite / gauche : section suivante ou précédente de l'accueil.
+    pub fn home_switch(&mut self, delta: isize) {
+        if let Some(r) = self.home_mut().and_then(|h| h.switch(delta)) {
+            self.pending.push(r);
+        }
+    }
+
+    /// Entrée dans la saisie de l'accueil : « Explorer » lance sa recherche.
+    pub fn home_commit(&mut self) {
+        if let Some(r) = self.home_mut().and_then(HomeView::commit) {
+            self.pending.push(r);
+        }
+    }
+
+    /// Entrée sur un dépôt de l'accueil : ouvre sa page.
+    pub fn home_enter(&mut self) {
+        let row = {
+            let Some(h) = self.home() else { return };
+            let rows = self.home_rows();
+            rows.get(h.selected(rows.len())).cloned()
+        };
+        let Some(row) = row else { return };
+        let view = match row.info {
+            Some(info) => RepoView::new(info),
+            None => RepoView::placeholder(row.repo.clone()),
+        };
+        self.record_recent(&row.repo);
+        self.pending.push(Request::RepoInfo(row.repo.clone()));
+        self.pending.push(Request::Pipelines(row.repo));
+        self.stack.push(Page::Repo(view));
+    }
+
+    fn record_recent(&mut self, repo: &Repo) {
+        recent::push(
+            &mut self.recents,
+            RecentEntry {
+                server: self.server_name.clone(),
+                owner: repo.owner.clone(),
+                name: repo.name.clone(),
+                opened: timeago::now_epoch(),
+            },
+        );
+        self.recents_dirty = true;
+    }
+
+    // --- page d'un dépôt
+
+    /// Entrée sur une rubrique du dépôt : la CI ou le code.
+    pub fn repo_enter(&mut self) {
+        let Some(r) = self.repo_page() else { return };
+        let (repo, item) = (r.info.repo.clone(), r.selected);
+        if item == 0 {
+            self.pending.push(Request::Pipelines(repo.clone()));
+            self.stack.push(Page::Runs(RunsView::new(repo)));
+        } else if self.browse_supported {
+            self.stack.push(Page::Browser(Browser::open(repo)));
+        } else {
+            self.error = Some("ce backend ne permet pas d'explorer le code".to_owned());
+        }
+    }
+
+    // --- runs et logs
+
+    /// Entrée sur un run : ouvre ses logs.
+    pub fn open_logs(&mut self) {
         if !self.logs_supported {
             self.error = Some("ce backend ne fournit pas les logs".to_owned());
-            return None;
+            return;
         }
-        let repo = self.selected_repo()?.clone();
-        let pipeline = self.selected_pipeline()?.clone();
+        let Some(runs) = self.runs() else { return };
+        let Some(pipeline) = runs.selected_pipeline().cloned() else {
+            return;
+        };
+        let repo = runs.repo.clone();
         let mut view = LogView::new(repo.clone(), pipeline.clone());
         view.wrap = self.logs_wrap;
         self.stack.push(Page::Logs(view));
-        Some((repo, pipeline))
+        self.pending.push(Request::Logs { repo, pipeline });
     }
 
-    /// Touche `e` : explore le code du dépôt sélectionné.
-    pub fn open_browser(&mut self) {
-        if !self.browse_supported {
-            self.error = Some("ce backend ne permet pas d'explorer le code".to_owned());
-            return;
+    /// Redemande les logs affichés. Le contenu déjà là reste visible pendant ce temps ;
+    /// une erreur précédente repasse en chargement.
+    pub fn refetch_logs(&mut self) {
+        let Some(v) = self.logs_mut() else { return };
+        if matches!(v.state, LogState::Failed(_)) {
+            v.state = LogState::Loading;
         }
-        if let Some(repo) = self.selected_repo().cloned() {
-            self.stack.push(Page::Browser(Browser::open(repo)));
+        let req = Request::Logs {
+            repo: v.repo.clone(),
+            pipeline: v.pipeline.clone(),
+        };
+        self.pending.push(req);
+    }
+
+    /// Le job affiché tourne encore : ses logs sont à rafraîchir périodiquement. Son statut
+    /// courant est celui de la liste des runs, plus bas dans la pile, qui se rafraîchit aussi.
+    pub fn logs_are_live(&self) -> bool {
+        let Some(v) = self.logs() else { return false };
+        let current = self
+            .stack
+            .iter()
+            .find_map(|p| match p {
+                Page::Runs(r) if r.repo == v.repo => {
+                    r.pipelines.iter().find(|x| x.id == v.pipeline.id)
+                }
+                _ => None,
+            })
+            .map_or(v.pipeline.status, |p| p.status);
+        matches!(current, Status::Running | Status::Pending)
+    }
+
+    /// Toutes les 5 s : ce qui change tout seul sur la page affichée (les runs d'un dépôt, les
+    /// logs d'un job en cours).
+    pub fn tick(&mut self) {
+        match self.stack.last() {
+            Some(Page::Runs(r)) => {
+                let repo = r.repo.clone();
+                self.pending.push(Request::Pipelines(repo));
+            }
+            Some(Page::Logs(v)) => {
+                // La liste des runs, plus bas, dit si le job a fini.
+                let repo = v.repo.clone();
+                self.pending.push(Request::Pipelines(repo));
+                if self.logs_are_live() {
+                    self.refetch_logs();
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// Touche `r` : recharge la page affichée.
+    pub fn refresh_current(&mut self) {
+        let mut requests = Vec::new();
+        match self.stack.last_mut() {
+            Some(Page::Home(h)) => requests.extend(h.refresh()),
+            Some(Page::Repo(r)) => {
+                let repo = r.info.repo.clone();
+                requests.push(Request::RepoInfo(repo.clone()));
+                requests.push(Request::Pipelines(repo));
+            }
+            Some(Page::Runs(r)) => requests.push(Request::Pipelines(r.repo.clone())),
+            Some(Page::Browser(b)) => b.refresh(),
+            Some(Page::Logs(_)) => self.refetch_logs(),
+            None => {}
+        }
+        self.pending.extend(requests);
     }
 
     pub fn close_browser(&mut self) {
@@ -223,18 +429,9 @@ impl App {
         }
     }
 
-    /// Requêtes que l'explorateur demande de lancer.
-    pub fn take_requests(&mut self) -> Vec<Request> {
-        self.browser_mut()
-            .map(Browser::take_requests)
-            .unwrap_or_default()
-    }
-
-    /// Page précédente (`-1`) ou suivante (`1`) de la liste de l'explorateur.
-    pub fn browser_page(&mut self, pages: isize) {
-        let page = self.viewport.get().saturating_sub(1).max(1) as isize;
-        if let Some(b) = self.browser_mut() {
-            b.move_selection(pages * page);
+    pub fn close_logs(&mut self) {
+        if self.logs().is_some() {
+            self.pop();
         }
     }
 
@@ -246,35 +443,8 @@ impl App {
                 _ => None, // la liste d'un dossier n'est pas un volet de texte
             },
             Page::Logs(v) => Some(&mut **v),
-            Page::Root => None,
+            _ => None,
         }
-    }
-
-    pub fn close_logs(&mut self) {
-        if self.logs().is_some() {
-            self.pop();
-        }
-    }
-
-    /// Redemande les logs affichés. Le contenu déjà là reste visible pendant ce temps ;
-    /// une erreur précédente repasse en chargement.
-    pub fn refetch_logs(&mut self) -> Option<(Repo, Pipeline)> {
-        let v = self.logs_mut()?;
-        if matches!(v.state, LogState::Failed(_)) {
-            v.state = LogState::Loading;
-        }
-        Some((v.repo.clone(), v.pipeline.clone()))
-    }
-
-    /// Le job affiché tourne encore : ses logs sont à rafraîchir périodiquement.
-    pub fn logs_are_live(&self) -> bool {
-        let Some(v) = self.logs() else { return false };
-        let current = self
-            .pipelines
-            .iter()
-            .find(|p| p.id == v.pipeline.id)
-            .map_or(v.pipeline.status, |p| p.status);
-        matches!(current, Status::Running | Status::Pending)
     }
 
     fn view_size(&self) -> (usize, usize) {
@@ -401,51 +571,39 @@ impl App {
         Some((f.username.clone(), std::mem::take(&mut f.password)))
     }
 
-    pub fn selected_repo(&self) -> Option<&Repo> {
-        self.repos.get(self.repo_idx)
-    }
-
-    pub fn selected_pipeline(&self) -> Option<&Pipeline> {
-        self.pipelines.get(self.pipe_idx)
-    }
-
-    pub fn toggle_focus(&mut self) {
-        self.focus = match self.focus {
-            Focus::Repos => Focus::Pipelines,
-            Focus::Pipelines => Focus::Repos,
-        };
-    }
-
-    /// Déplace la sélection de la liste active. Renvoie `true` si le dépôt
-    /// sélectionné a changé (il faut alors recharger ses pipelines).
-    pub fn step(&mut self, delta: isize) -> bool {
-        match self.focus {
-            Focus::Repos => {
-                let new = clamp_step(self.repo_idx, self.repos.len(), delta);
-                let changed = new != self.repo_idx;
-                if changed {
-                    self.repo_idx = new;
-                    self.pipelines.clear();
-                    self.pipe_idx = 0;
-                }
-                changed
-            }
-            Focus::Pipelines => {
-                self.pipe_idx = clamp_step(self.pipe_idx, self.pipelines.len(), delta);
-                false
-            }
-        }
-    }
-
-    /// Applique un résultat réseau. Renvoie `true` s'il faut charger les
-    /// pipelines du dépôt sélectionné.
-    pub fn apply(&mut self, msg: Msg) -> bool {
+    /// Intègre une réponse du réseau. Les réponses périmées (page dépilée, autre dépôt, autre
+    /// recherche) sont ignorées par les pages concernées.
+    pub fn apply(&mut self, msg: Msg) {
         match msg {
+            Msg::Repos { source, result } => {
+                if let Some(Page::Home(h)) = self.stack.first_mut() {
+                    h.apply(&source, result);
+                }
+            }
+            Msg::RepoInfo { repo, result } => {
+                for page in &mut self.stack {
+                    if let Page::Repo(r) = page {
+                        let result = match &result {
+                            Ok(i) => Ok(i.clone()),
+                            Err(e) => Err(Error::Network(e.to_string())),
+                        };
+                        r.apply_info(&repo, result);
+                    }
+                }
+            }
+            Msg::Pipelines { repo, result } => {
+                for page in &mut self.stack {
+                    match page {
+                        Page::Repo(r) => r.apply_pipelines(&repo, &result),
+                        Page::Runs(r) => r.apply_pipelines(&repo, result.clone()),
+                        _ => {}
+                    }
+                }
+            }
             Msg::Branches { repo, result } => {
                 if let Some(b) = self.browser_mut() {
                     b.on_branches(&repo, result);
                 }
-                false
             }
             Msg::Dir {
                 repo,
@@ -456,7 +614,6 @@ impl App {
                 if let Some(b) = self.browser_mut() {
                     b.on_dir(&repo, &reference, &path, result);
                 }
-                false
             }
             Msg::File {
                 repo,
@@ -467,7 +624,6 @@ impl App {
                 if let Some(b) = self.browser_mut() {
                     b.on_file(&repo, &reference, &path, result);
                 }
-                false
             }
             Msg::Logs {
                 repo,
@@ -479,7 +635,7 @@ impl App {
                     .logs()
                     .is_some_and(|v| v.repo == repo && v.pipeline.id == pipeline_id);
                 if !current {
-                    return false;
+                    return;
                 }
                 match result {
                     Ok(log) => {
@@ -487,7 +643,7 @@ impl App {
                         let notice = log.notice.clone();
                         let (w, h) = self.view_size();
                         let Some(v) = self.logs_mut() else {
-                            return false;
+                            return;
                         };
                         let first_load = matches!(v.state, LogState::Loading);
                         let was_at_bottom = v.scroll >= v.max_scroll(w, h);
@@ -517,12 +673,10 @@ impl App {
                         }
                     }
                 }
-                false
             }
             Msg::LoggedIn(Ok(_)) => {
                 self.login = None;
                 self.error = None;
-                false
             }
             Msg::LoggedIn(Err(e)) => {
                 if let Some(f) = self.login.as_mut() {
@@ -530,45 +684,9 @@ impl App {
                     f.field = LoginField::Password;
                     f.error = Some(e);
                 }
-                false
-            }
-            Msg::Repos(Ok(repos)) => {
-                self.error = None;
-                let previous = self.selected_repo().cloned();
-                self.repos = repos;
-                self.repo_idx = previous
-                    .and_then(|p| self.repos.iter().position(|r| *r == p))
-                    .unwrap_or(0);
-                !self.repos.is_empty()
-            }
-            Msg::Repos(Err(e)) => {
-                self.error = Some(e);
-                false
-            }
-            Msg::Pipelines { repo, result } => {
-                // Réponse périmée : l'utilisateur a changé de dépôt entre-temps.
-                if self.selected_repo() != Some(&repo) {
-                    return false;
-                }
-                match result {
-                    Ok(p) => {
-                        self.error = None;
-                        self.pipelines = p;
-                        self.pipe_idx = self.pipe_idx.min(self.pipelines.len().saturating_sub(1));
-                    }
-                    Err(e) => self.error = Some(e),
-                }
-                false
             }
         }
     }
-}
-
-fn clamp_step(idx: usize, len: usize, delta: isize) -> usize {
-    if len == 0 {
-        return 0;
-    }
-    idx.saturating_add_signed(delta).min(len - 1)
 }
 
 #[cfg(test)]
@@ -576,7 +694,8 @@ mod tests {
     use super::*;
     use crate::browser::Mode;
     use crate::logview::{LineKind, LogLine};
-    use smithy_core::Status;
+    use crate::pages::LastRun;
+    use smithy_core::{Branch, Entry, EntryKind, Status};
 
     fn repo(n: &str) -> Repo {
         Repo {
@@ -607,22 +726,6 @@ mod tests {
         }
     }
 
-    /// App avec un dépôt, un run sélectionné (id 7) et les logs pris en charge.
-    fn app_on_run(status: Status) -> App {
-        let mut a = App::new();
-        a.logs_supported = true;
-        a.apply(Msg::Repos(Ok(vec![repo("a")])));
-        let mut p = pipe(7);
-        p.status = status;
-        a.apply(Msg::Pipelines {
-            repo: repo("a"),
-            result: Ok(vec![p]),
-        });
-        a.focus = Focus::Pipelines;
-        a.viewport.set(5);
-        a
-    }
-
     fn deliver(a: &mut App, id: u64, result: Result<JobLog, Error>) {
         a.apply(Msg::Logs {
             repo: repo("a"),
@@ -638,30 +741,89 @@ mod tests {
         }
     }
 
-    #[test]
-    fn entree_sur_les_depots_passe_aux_runs() {
-        let mut a = app_on_run(Status::Success);
-        a.focus = Focus::Repos;
-        assert!(a.open_logs().is_none());
-        assert_eq!(a.focus, Focus::Pipelines);
-        assert!(a.logs().is_none());
+    fn long_log() -> JobLog {
+        JobLog {
+            steps: vec![smithy_core::StepLog {
+                name: "s".into(),
+                status: Status::Running, // ouverte : une étape réussie serait repliée
+                lines: vec!["x".repeat(25), "fin".into()],
+            }],
+            ..Default::default()
+        }
     }
 
-    #[test]
-    fn ouverture_des_logs() {
-        let mut a = app_on_run(Status::Success);
-        let (r, p) = a.open_logs().unwrap();
-        assert_eq!((r, p.id), (repo("a"), 7));
-        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
+    fn typed(app: &mut App, text: &str) {
+        text.chars().for_each(|c| app.login_type(c));
+    }
 
-        let mut b = app_on_run(Status::Success);
-        b.logs_supported = false;
-        assert!(b.open_logs().is_none() && b.logs().is_none() && b.error.is_some());
+    fn feed(a: &mut App) {
+        let r = repo("a");
+        a.apply(Msg::Branches {
+            repo: r.clone(),
+            result: Ok(vec![Branch {
+                name: "main".into(),
+                default: true,
+            }]),
+        });
+        a.apply(Msg::Dir {
+            repo: r,
+            reference: "main".into(),
+            path: String::new(),
+            result: Ok(vec![
+                Entry {
+                    name: "src".into(),
+                    path: "src".into(),
+                    kind: EntryKind::Dir,
+                    size: 0,
+                },
+                Entry {
+                    name: "a.txt".into(),
+                    path: "a.txt".into(),
+                    kind: EntryKind::File,
+                    size: 3,
+                },
+            ]),
+        });
+    }
 
-        let mut c = App::new(); // aucun run sélectionné
-        c.logs_supported = true;
-        c.focus = Focus::Pipelines;
-        assert!(c.open_logs().is_none());
+    fn info(n: &str) -> RepoInfo {
+        RepoView::placeholder(repo(n)).info
+    }
+
+    /// App au repos : le démarrage a déjà demandé « mes dépôts », la file est vidée.
+    fn fresh() -> App {
+        let mut a = App::new();
+        a.logs_supported = true;
+        a.browse_supported = true;
+        a.take_requests();
+        a
+    }
+
+    /// App sur la page d'un dépôt (`o/a`), prête à ouvrir la CI ou le code.
+    fn app_on_repo() -> App {
+        let mut a = fresh();
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("a"), info("b")]),
+        });
+        a.home_enter();
+        a.take_requests();
+        a
+    }
+
+    /// App sur la page des runs de `o/a`, un run (id 7) sélectionné, logs et explorateur pris en charge.
+    fn app_on_run(status: Status) -> App {
+        let mut a = app_on_repo();
+        a.repo_enter();
+        let mut p = pipe(7);
+        p.status = status;
+        a.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(vec![p]),
+        });
+        a.viewport.set(5);
+        a.take_requests();
+        a
     }
 
     #[test]
@@ -737,6 +899,33 @@ mod tests {
     }
 
     #[test]
+    fn ouverture_des_logs() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        let v = a.logs().unwrap();
+        assert_eq!((v.repo.clone(), v.pipeline.id), (repo("a"), 7));
+        assert!(matches!(v.state, LogState::Loading));
+        assert!(
+            matches!(&a.take_requests()[..], [Request::Logs { pipeline, .. }] if pipeline.id == 7)
+        );
+
+        let mut b = app_on_run(Status::Success);
+        b.logs_supported = false;
+        b.open_logs();
+        assert!(b.logs().is_none() && b.error.is_some());
+        assert!(b.take_requests().is_empty());
+
+        // Aucun run (liste vide) ou pas sur la page des runs : rien ne s'ouvre
+        let mut c = app_on_repo();
+        c.repo_enter();
+        c.open_logs();
+        assert!(c.logs().is_none());
+        let mut d = app_on_repo();
+        d.open_logs();
+        assert!(d.logs().is_none() && d.repo_page().is_some());
+    }
+
+    #[test]
     fn la_reserve_du_backend_est_conservee() {
         let mut a = app_on_run(Status::Success);
         a.open_logs();
@@ -752,17 +941,6 @@ mod tests {
         // Un rafraîchissement sans réserve l'efface
         deliver(&mut a, 7, Ok(JobLog::default()));
         assert_eq!(a.logs().unwrap().notice, None);
-    }
-
-    fn long_log() -> JobLog {
-        JobLog {
-            steps: vec![smithy_core::StepLog {
-                name: "s".into(),
-                status: Status::Running, // ouverte : une étape réussie serait repliée
-                lines: vec!["x".repeat(25), "fin".into()],
-            }],
-            ..Default::default()
-        }
     }
 
     #[test]
@@ -882,219 +1060,6 @@ mod tests {
         none.text_select_section(1);
     }
 
-    // --- pile de pages
-
-    #[test]
-    fn la_pile_commence_a_la_racine_et_ne_se_vide_jamais() {
-        let mut a = app_on_run(Status::Success);
-        assert!(matches!(a.stack[..], [Page::Root]));
-        assert!(a.logs().is_none() && a.browser().is_none());
-        assert!(!a.pop(), "la racine ne se dépile pas");
-        assert_eq!(a.stack.len(), 1);
-        a.open_logs();
-        assert_eq!(a.stack.len(), 2);
-        assert!(a.logs().is_some());
-        assert!(a.pop());
-        assert!(a.logs().is_none() && a.stack.len() == 1);
-    }
-
-    #[test]
-    fn fermer_une_page_ne_depile_que_la_bonne() {
-        let mut a = app_on_run(Status::Success);
-        a.browse_supported = true;
-        a.open_logs();
-        a.close_browser(); // l'explorateur n'est pas la page affichée : rien ne bouge
-        assert!(a.logs().is_some());
-        a.close_logs();
-        assert_eq!(a.stack.len(), 1);
-        a.close_logs(); // déjà à la racine : sans effet
-        a.close_browser();
-        assert_eq!(a.stack.len(), 1);
-        a.open_browser();
-        assert!(a.browser().is_some() && a.logs().is_none());
-        a.close_logs(); // les logs ne sont pas la page affichée
-        assert!(a.browser().is_some());
-        a.close_browser();
-        assert!(matches!(a.stack[..], [Page::Root]));
-    }
-
-    #[test]
-    fn fil_d_ariane_de_la_pile() {
-        let mut a = app_on_run(Status::Success);
-        a.server_name = "maison".into();
-        assert_eq!(a.breadcrumb(), ["maison", "Accueil"]);
-        a.open_logs();
-        assert_eq!(
-            a.breadcrumb(),
-            [
-                "maison",
-                "Accueil",
-                "a/a".to_owned().replace("a/a", "o/a").as_str(),
-                "CI",
-                "ci.yml",
-                "build"
-            ]
-        );
-        a.close_logs();
-        a.browse_supported = true;
-        a.open_browser();
-        assert_eq!(
-            a.breadcrumb(),
-            ["maison", "Accueil", "o/a", "Code", "…"],
-            "branche inconnue pendant le chargement"
-        );
-        let mut anonymous = App::new();
-        assert_eq!(anonymous.breadcrumb(), ["smithy", "Accueil"]);
-        anonymous.server_name = "x".into();
-        assert_eq!(anonymous.breadcrumb()[0], "x");
-    }
-
-    // --- explorateur de code
-
-    use smithy_core::{Branch, Entry, EntryKind};
-
-    fn explorer() -> App {
-        let mut a = app_on_run(Status::Success);
-        a.browse_supported = true;
-        a.open_browser();
-        a
-    }
-
-    fn feed(a: &mut App) {
-        let r = repo("a");
-        a.apply(Msg::Branches {
-            repo: r.clone(),
-            result: Ok(vec![Branch {
-                name: "main".into(),
-                default: true,
-            }]),
-        });
-        a.apply(Msg::Dir {
-            repo: r,
-            reference: "main".into(),
-            path: String::new(),
-            result: Ok(vec![
-                Entry {
-                    name: "src".into(),
-                    path: "src".into(),
-                    kind: EntryKind::Dir,
-                    size: 0,
-                },
-                Entry {
-                    name: "a.txt".into(),
-                    path: "a.txt".into(),
-                    kind: EntryKind::File,
-                    size: 3,
-                },
-            ]),
-        });
-    }
-
-    #[test]
-    fn ouverture_de_l_explorateur_et_file_de_requetes() {
-        let mut a = explorer();
-        assert!(a.browser().is_some());
-        let reqs = a.take_requests();
-        assert_eq!(reqs, [crate::browser::Request::Branches(repo("a"))]);
-        assert!(a.take_requests().is_empty(), "la file est vidée");
-        feed(&mut a);
-        let reqs = a.take_requests();
-        assert!(
-            matches!(&reqs[..], [crate::browser::Request::Dir { reference, .. }] if reference == "main")
-        );
-        a.close_browser();
-        assert!(a.browser().is_none());
-        assert!(
-            a.take_requests().is_empty(),
-            "sans explorateur, rien à demander"
-        );
-    }
-
-    #[test]
-    fn explorateur_refuse_si_le_backend_ne_sait_pas() {
-        let mut a = app_on_run(Status::Success);
-        a.open_browser();
-        assert!(a.browser().is_none());
-        assert!(a.error.is_some());
-        let mut none = App::new();
-        none.browse_supported = true;
-        none.open_browser(); // aucun dépôt sélectionné
-        assert!(none.browser().is_none());
-    }
-
-    #[test]
-    fn les_reponses_sans_explorateur_sont_ignorees() {
-        let mut a = app_on_run(Status::Success);
-        feed(&mut a);
-        a.apply(Msg::File {
-            repo: repo("a"),
-            reference: "main".into(),
-            path: "a.txt".into(),
-            result: Err(Error::Network("x".into())),
-        });
-        assert!(a.browser().is_none());
-    }
-
-    #[test]
-    fn fichier_de_l_explorateur_defile_et_se_replie() {
-        let mut a = explorer();
-        feed(&mut a);
-        a.viewport.set(3);
-        a.viewport_width.set(10);
-        {
-            let b = a.browser_mut().unwrap();
-            b.move_selection(1); // « a.txt » (dossiers d'abord)
-            b.enter();
-        }
-        a.apply(Msg::File {
-            repo: repo("a"),
-            reference: "main".into(),
-            path: "a.txt".into(),
-            result: Ok(FileContent {
-                size: 40,
-                text: Some(format!("{}\nfin\n", "x".repeat(25))),
-                truncated: false,
-            }),
-        });
-        let rows = |a: &App, w: usize| match &a.browser().unwrap().mode {
-            Mode::File(fv) => fv.text.total_rows(w),
-            _ => 0,
-        };
-        assert_eq!(rows(&a, 10), 2, "sans repli : 2 lignes");
-        a.text_toggle_wrap();
-        assert_eq!(
-            rows(&a, 10),
-            4,
-            "25 caractères sur 10 colonnes : 3 lignes d'écran + « fin »"
-        );
-        assert!(a.logs_wrap, "le choix est partagé avec la vue des logs");
-        a.text_bottom();
-        let Mode::File(fv) = &a.browser().unwrap().mode else {
-            panic!()
-        };
-        assert_eq!(fv.text.scroll, 1);
-        // Dans la liste d'un dossier, ces actions sont sans effet
-        a.browser_mut().unwrap().up();
-        a.text_scroll(5);
-        a.text_toggle_wrap();
-    }
-
-    #[test]
-    fn pages_de_l_explorateur() {
-        let mut a = explorer();
-        feed(&mut a);
-        a.viewport.set(1);
-        a.browser_page(1);
-        assert_eq!(
-            a.browser().unwrap().selected,
-            1,
-            "une page = au moins 1 entrée"
-        );
-        a.browser_page(-1);
-        assert_eq!(a.browser().unwrap().selected, 0);
-        App::new().browser_page(1);
-    }
-
     #[test]
     fn bascule_sans_vue_ouverte() {
         App::new().text_toggle_wrap();
@@ -1133,59 +1098,6 @@ mod tests {
         assert_eq!(a.logs().unwrap().scroll, 15);
         // Pas de panique sans vue ni contenu
         App::new().text_scroll(3);
-    }
-
-    #[test]
-    fn erreur_de_logs_selon_l_etat() {
-        let mut a = app_on_run(Status::Success);
-        a.open_logs();
-        deliver(&mut a, 7, Err(Error::SessionExpired));
-        assert!(
-            matches!(a.logs().unwrap().state, LogState::Failed(ref m) if m.contains("reconnexion"))
-        );
-        // Une relance repasse en chargement, puis un succès remplace l'erreur
-        assert!(a.refetch_logs().is_some());
-        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
-        deliver(
-            &mut a,
-            7,
-            Ok(JobLog {
-                steps: vec![step("s", Status::Success, 1)],
-                ..Default::default()
-            }),
-        );
-        // Échec d'un rafraîchissement : le contenu reste, l'erreur va dans le bandeau
-        deliver(&mut a, 7, Err(Error::Network("coupé".into())));
-        assert_eq!(lines(&a).len(), 2);
-        assert!(a.error.as_deref().unwrap().contains("coupé"));
-    }
-
-    #[test]
-    fn logs_en_direct_selon_le_statut_courant() {
-        let mut a = app_on_run(Status::Running);
-        assert!(!a.logs_are_live(), "pas de vue ouverte");
-        a.open_logs();
-        assert!(a.logs_are_live());
-        // Le run passe au vert dans la liste rafraîchie : plus de rafraîchissement
-        let mut done = pipe(7);
-        done.status = Status::Success;
-        a.apply(Msg::Pipelines {
-            repo: repo("a"),
-            result: Ok(vec![done]),
-        });
-        assert!(!a.logs_are_live());
-    }
-
-    #[test]
-    fn fermeture_de_la_vue() {
-        let mut a = app_on_run(Status::Success);
-        a.open_logs();
-        a.close_logs();
-        assert!(a.logs().is_none() && a.refetch_logs().is_none());
-    }
-
-    fn typed(app: &mut App, text: &str) {
-        text.chars().for_each(|c| app.login_type(c));
     }
 
     #[test]
@@ -1257,66 +1169,506 @@ mod tests {
     }
 
     #[test]
-    fn selection_bornee() {
-        let mut a = App::new();
-        assert!(!a.step(1)); // liste vide
-        a.apply(Msg::Repos(Ok(vec![repo("a"), repo("b")])));
-        assert!(!a.step(-1)); // déjà en haut
-        assert!(a.step(1));
-        assert!(!a.step(1)); // déjà en bas
-        assert_eq!(a.repo_idx, 1);
+    fn les_reponses_sans_explorateur_sont_ignorees() {
+        let mut a = app_on_run(Status::Success);
+        feed(&mut a);
+        a.apply(Msg::File {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "a.txt".into(),
+            result: Err(Error::Network("x".into())),
+        });
+        assert!(a.browser().is_none());
     }
 
     #[test]
-    fn reponse_perimee_ignoree() {
-        let mut a = App::new();
-        a.apply(Msg::Repos(Ok(vec![repo("a"), repo("b")])));
-        a.step(1);
+    fn fichier_de_l_explorateur_defile_et_se_replie() {
+        let mut a = explorer();
+        feed(&mut a);
+        a.viewport.set(3);
+        a.viewport_width.set(10);
+        {
+            let b = a.browser_mut().unwrap();
+            b.move_selection(1); // « a.txt » (dossiers d'abord)
+            b.enter();
+        }
+        a.apply(Msg::File {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "a.txt".into(),
+            result: Ok(FileContent {
+                size: 40,
+                text: Some(format!("{}\nfin\n", "x".repeat(25))),
+                truncated: false,
+            }),
+        });
+        let rows = |a: &App, w: usize| match &a.browser().unwrap().mode {
+            Mode::File(fv) => fv.text.total_rows(w),
+            _ => 0,
+        };
+        assert_eq!(rows(&a, 10), 2, "sans repli : 2 lignes");
+        a.text_toggle_wrap();
+        assert_eq!(
+            rows(&a, 10),
+            4,
+            "25 caractères sur 10 colonnes : 3 lignes d'écran + « fin »"
+        );
+        assert!(a.logs_wrap, "le choix est partagé avec la vue des logs");
+        a.text_bottom();
+        let Mode::File(fv) = &a.browser().unwrap().mode else {
+            panic!()
+        };
+        assert_eq!(fv.text.scroll, 1);
+        // Dans la liste d'un dossier, ces actions sont sans effet
+        a.browser_mut().unwrap().up();
+        a.text_scroll(5);
+        a.text_toggle_wrap();
+    }
+
+    #[test]
+    fn logs_en_direct_selon_le_statut_courant() {
+        let mut a = app_on_run(Status::Running);
+        assert!(!a.logs_are_live(), "pas de vue ouverte");
+        a.open_logs();
+        assert!(a.logs_are_live());
+        // Le run passe au vert dans la liste rafraîchie : plus de rafraîchissement
+        let mut done = pipe(7);
+        done.status = Status::Success;
         a.apply(Msg::Pipelines {
             repo: repo("a"),
-            result: Ok(vec![pipe(1)]),
+            result: Ok(vec![done]),
         });
-        assert!(a.pipelines.is_empty());
-        a.apply(Msg::Pipelines {
-            repo: repo("b"),
-            result: Ok(vec![pipe(2)]),
+        assert!(!a.logs_are_live());
+    }
+
+    #[test]
+    fn erreur_de_logs_selon_l_etat() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        a.take_requests();
+        deliver(&mut a, 7, Err(Error::SessionExpired));
+        assert!(
+            matches!(a.logs().unwrap().state, LogState::Failed(ref m) if m.contains("reconnexion"))
+        );
+        // Une relance repasse en chargement, puis un succès remplace l'erreur
+        a.refetch_logs();
+        assert!(matches!(&a.take_requests()[..], [Request::Logs { .. }]));
+        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
+        deliver(
+            &mut a,
+            7,
+            Ok(JobLog {
+                steps: vec![step("s", Status::Success, 1)],
+                ..Default::default()
+            }),
+        );
+        // Échec d'un rafraîchissement : le contenu reste, l'erreur va dans le bandeau
+        deliver(&mut a, 7, Err(Error::Network("coupé".into())));
+        assert_eq!(lines(&a).len(), 2);
+        assert!(a.error.as_deref().unwrap().contains("coupé"));
+    }
+
+    #[test]
+    fn fermeture_de_la_vue() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        a.take_requests();
+        a.close_logs();
+        assert!(a.logs().is_none() && a.runs().is_some());
+        a.refetch_logs(); // plus de vue : rien à redemander
+        assert!(a.take_requests().is_empty());
+    }
+
+    // --- démarrage, accueil, page d'un dépôt
+
+    #[test]
+    fn demarrage_sur_l_accueil_qui_demande_mes_depots() {
+        let mut a = App::new();
+        assert!(matches!(a.stack[..], [Page::Home(_)]));
+        assert_eq!(a.take_requests(), [Request::Repos(RepoSource::Mine)]);
+        assert!(a.take_requests().is_empty(), "la file est vidée");
+        assert_eq!(a.breadcrumb(), ["smithy", "Accueil"]);
+    }
+
+    #[test]
+    fn les_requetes_attendent_d_etre_prises() {
+        // Sans fournisseur (connexion à faire), la boucle ne les prend pas : elles restent.
+        let mut a = App::new();
+        a.home_switch(1);
+        a.home_switch(-1);
+        let first = a.take_requests();
+        assert_eq!(
+            first,
+            [
+                Request::Repos(RepoSource::Mine),
+                Request::Repos(RepoSource::Watched)
+            ]
+        );
+    }
+
+    #[test]
+    fn ouvrir_un_depot_depuis_l_accueil() {
+        let mut a = fresh();
+        a.server_name = "maison".into();
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("a"), info("b")]),
         });
-        assert_eq!(a.pipelines.len(), 1);
+        a.list_move(1); // « b »
+        a.home_enter();
+        let r = a.repo_page().expect("page du dépôt");
+        assert_eq!(r.info.repo, repo("b"));
+        assert_eq!(
+            a.take_requests(),
+            [Request::RepoInfo(repo("b")), Request::Pipelines(repo("b"))]
+        );
+        assert_eq!(a.breadcrumb(), ["maison", "Accueil", "o/b"]);
+        // L'historique retient le dépôt, une seule fois, le plus récent en tête
+        assert!(a.recents_dirty);
+        assert_eq!(
+            (a.recents[0].server.as_str(), a.recents[0].name.as_str()),
+            ("maison", "b")
+        );
+        a.pop();
+        a.list_move(-1);
+        a.home_enter();
+        a.pop();
+        a.list_move(1);
+        a.home_enter();
+        assert_eq!(
+            a.recents
+                .iter()
+                .map(|e| e.name.as_str())
+                .collect::<Vec<_>>(),
+            ["b", "a"]
+        );
     }
 
     #[test]
-    fn rechargement_conserve_la_selection() {
-        let mut a = App::new();
-        a.apply(Msg::Repos(Ok(vec![repo("a"), repo("b")])));
-        a.step(1);
-        let fetch = a.apply(Msg::Repos(Ok(vec![repo("z"), repo("a"), repo("b")])));
-        assert!(fetch);
-        assert_eq!(a.selected_repo(), Some(&repo("b")));
+    fn rien_ne_s_ouvre_sur_une_liste_vide() {
+        let mut a = fresh();
+        a.home_enter(); // « Mes dépôts » encore en chargement
+        assert!(a.repo_page().is_none());
+        assert!(a.take_requests().is_empty());
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Err(Error::Network("coupé".into())),
+        });
+        a.home_enter();
+        assert!(a.repo_page().is_none());
     }
 
     #[test]
-    fn erreur_puis_succes_efface_le_bandeau() {
-        let mut a = App::new();
-        a.apply(Msg::Repos(Err("boum".into())));
-        assert_eq!(a.error.as_deref(), Some("boum"));
-        a.apply(Msg::Repos(Ok(vec![repo("a")])));
-        assert!(a.error.is_none());
+    fn ouvrir_depuis_les_recents_sans_fiche() {
+        let mut a = fresh();
+        a.server_name = "s".into();
+        a.recents = vec![RecentEntry {
+            server: "s".into(),
+            owner: "o".into(),
+            name: "vieux".into(),
+            opened: 5,
+        }];
+        a.home_switch(4); // « Récents »
+        assert!(a.take_requests().is_empty(), "local : rien à charger");
+        assert_eq!(a.home_rows().len(), 1);
+        a.home_enter();
+        let r = a.repo_page().unwrap();
+        assert!(
+            r.info.default_branch.is_empty(),
+            "fiche vide en attendant le serveur"
+        );
+        a.apply(Msg::RepoInfo {
+            repo: repo("vieux"),
+            result: Ok(info("vieux")),
+        });
+        assert_eq!(a.repo_page().unwrap().info.repo.name, "vieux");
+        // La fiche d'un autre dépôt est ignorée
+        let mut other = info("autre");
+        other.description = "x".into();
+        a.apply(Msg::RepoInfo {
+            repo: repo("autre"),
+            result: Ok(other),
+        });
+        assert_eq!(a.repo_page().unwrap().info.description, "");
     }
 
     #[test]
-    fn index_pipeline_reborne_apres_rafraichissement() {
-        let mut a = App::new();
-        a.apply(Msg::Repos(Ok(vec![repo("a")])));
+    fn de_la_page_du_depot_vers_la_ci_et_le_code() {
+        let mut a = app_on_repo();
+        a.repo_enter(); // « CI » par défaut
+        assert!(a.runs().is_some());
+        assert_eq!(a.take_requests(), [Request::Pipelines(repo("a"))]);
+        assert_eq!(a.breadcrumb(), ["smithy", "Accueil", "o/a", "CI"]);
+        a.pop();
+        a.list_move(1); // « Code »
+        a.repo_enter();
+        assert!(a.browser().is_some());
+        assert_eq!(a.take_requests(), [Request::Branches(repo("a"))]);
+        assert_eq!(a.breadcrumb(), ["smithy", "Accueil", "o/a", "Code", "…"]);
+    }
+
+    #[test]
+    fn explorateur_refuse_si_le_backend_ne_sait_pas() {
+        let mut a = app_on_repo();
+        a.browse_supported = false;
+        a.list_move(1);
+        a.repo_enter();
+        assert!(a.browser().is_none() && a.repo_page().is_some());
+        assert!(a.error.as_deref().unwrap().contains("explorer"));
+        assert!(a.take_requests().is_empty());
+    }
+
+    #[test]
+    fn les_reponses_de_runs_atteignent_toute_la_pile() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        a.take_requests();
+        // La liste arrive alors que les logs sont affichés : la page du dépôt, plus bas, la reçoit
+        let mut newer = pipe(9);
+        newer.status = Status::Failure;
         a.apply(Msg::Pipelines {
             repo: repo("a"),
-            result: Ok(vec![pipe(1), pipe(2), pipe(3)]),
+            result: Ok(vec![newer, pipe(7)]),
         });
-        a.focus = Focus::Pipelines;
-        a.step(2);
+        a.pop();
+        assert_eq!(a.runs().unwrap().pipelines.len(), 2);
+        a.pop();
+        let LastRun::Ready(p) = &a.repo_page().unwrap().last_run else {
+            panic!("dernier run attendu")
+        };
+        assert_eq!((p.id, p.status), (9, Status::Failure));
+        // Un autre dépôt est ignoré partout
         a.apply(Msg::Pipelines {
-            repo: repo("a"),
-            result: Ok(vec![pipe(1)]),
+            repo: repo("zzz"),
+            result: Ok(vec![]),
         });
-        assert_eq!(a.pipe_idx, 0);
+        assert!(matches!(a.repo_page().unwrap().last_run, LastRun::Ready(_)));
+    }
+
+    #[test]
+    fn rafraichissement_et_tick_selon_la_page() {
+        // Accueil : `r` recharge la section ; le tick ne fait rien
+        let mut a = fresh();
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("a")]),
+        });
+        a.tick();
+        assert!(a.take_requests().is_empty());
+        a.refresh_current();
+        assert_eq!(a.take_requests(), [Request::Repos(RepoSource::Mine)]);
+        // Page du dépôt : la fiche et la CI ; le tick ne fait rien
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("a")]),
+        });
+        a.home_enter();
+        a.take_requests();
+        a.tick();
+        assert!(a.take_requests().is_empty());
+        a.refresh_current();
+        assert_eq!(
+            a.take_requests(),
+            [Request::RepoInfo(repo("a")), Request::Pipelines(repo("a"))]
+        );
+        // Runs : le tick renouvelle la liste
+        a.repo_enter();
+        a.take_requests();
+        a.tick();
+        assert_eq!(a.take_requests(), [Request::Pipelines(repo("a"))]);
+        a.refresh_current();
+        assert_eq!(a.take_requests(), [Request::Pipelines(repo("a"))]);
+    }
+
+    #[test]
+    fn tick_dans_les_logs_suit_les_runs_et_les_jobs_en_cours() {
+        let mut done = app_on_run(Status::Success);
+        done.open_logs();
+        done.take_requests();
+        done.tick();
+        assert_eq!(
+            done.take_requests(),
+            [Request::Pipelines(repo("a"))],
+            "job fini : seulement les runs"
+        );
+
+        let mut live = app_on_run(Status::Running);
+        live.open_logs();
+        live.take_requests();
+        live.tick();
+        let reqs = live.take_requests();
+        assert!(reqs.contains(&Request::Pipelines(repo("a"))));
+        assert!(
+            reqs.iter().any(|r| matches!(r, Request::Logs { .. })),
+            "job en cours : ses logs aussi"
+        );
+        // Le job se termine : la liste des runs, sous les logs, le dit
+        live.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(vec![pipe(7)]),
+        });
+        live.tick();
+        assert!(
+            !live
+                .take_requests()
+                .iter()
+                .any(|r| matches!(r, Request::Logs { .. }))
+        );
+    }
+
+    #[test]
+    fn deplacements_dans_les_listes() {
+        let mut a = fresh();
+        let many: Vec<_> = (0..30).map(|i| info(&format!("r{i:02}"))).collect();
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(many),
+        });
+        a.viewport.set(11);
+        a.list_page(1);
+        assert_eq!(a.home().unwrap().selected(30), 10, "une page = hauteur - 1");
+        a.list_move(isize::MAX / 2);
+        assert_eq!(a.home().unwrap().selected(30), 29);
+        a.list_move(isize::MIN / 2);
+        assert_eq!(a.home().unwrap().selected(30), 0);
+        // Sans effet (et sans panique) sur les pages de texte
+        let mut l = app_on_run(Status::Success);
+        l.open_logs();
+        l.list_move(3);
+        l.list_page(1);
+        // Page du dépôt : deux rubriques
+        let mut r = app_on_repo();
+        r.list_move(5);
+        assert_eq!(r.repo_page().unwrap().selected, 1);
+        // Runs
+        let mut u = app_on_run(Status::Success);
+        u.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok((1..=20).map(pipe).collect()),
+        });
+        // La sélection suit « son » run (id 7, maintenant le 7e) ; viewport 5 : une page = 4 lignes.
+        assert_eq!(u.runs().unwrap().selected, 6);
+        u.list_page(1);
+        assert_eq!(u.runs().unwrap().selected, 10);
+        // Explorateur
+        let mut e = explorer();
+        feed(&mut e);
+        e.viewport.set(1);
+        e.list_page(1);
+        assert_eq!(
+            e.browser().unwrap().selected,
+            1,
+            "une page = au moins 1 entrée"
+        );
+        e.list_page(-1);
+        assert_eq!(e.browser().unwrap().selected, 0);
+        App::new().list_page(1);
+    }
+
+    #[test]
+    fn recherche_et_commit_depuis_l_accueil() {
+        let mut a = fresh();
+        a.home_switch(3); // « Explorer »
+        a.home_mut().unwrap().start_edit();
+        "tree"
+            .chars()
+            .for_each(|c| a.home_mut().unwrap().type_char(c));
+        a.home_commit();
+        assert_eq!(
+            a.take_requests(),
+            [Request::Repos(RepoSource::Search("tree".into()))]
+        );
+        a.apply(Msg::Repos {
+            source: RepoSource::Search("tree".into()),
+            result: Ok(vec![info("tree")]),
+        });
+        assert_eq!(a.home_rows().len(), 1);
+        a.home_enter();
+        assert_eq!(a.repo_page().unwrap().info.repo.name, "tree");
+        // Un message pour une page qui n'est plus l'accueil n'est pas perdu : il met la liste à jour
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("a")]),
+        });
+        a.pop();
+        a.home_switch(-3);
+        assert_eq!(a.home_rows()[0].repo.name, "a");
+    }
+
+    // --- pile de pages
+
+    #[test]
+    fn la_pile_ne_se_vide_jamais() {
+        let mut a = app_on_run(Status::Success);
+        assert_eq!(a.stack.len(), 3, "accueil, dépôt, runs");
+        a.open_logs();
+        assert_eq!(a.stack.len(), 4);
+        assert!(a.pop() && a.pop() && a.pop());
+        assert!(!a.pop(), "l'accueil ne se dépile pas");
+        assert!(matches!(a.stack[..], [Page::Home(_)]));
+        assert!(a.logs().is_none() && a.browser().is_none() && a.runs().is_none());
+    }
+
+    #[test]
+    fn fermer_une_page_ne_depile_que_la_bonne() {
+        let mut a = app_on_run(Status::Success);
+        a.open_logs();
+        a.close_browser(); // l'explorateur n'est pas la page affichée : rien ne bouge
+        assert!(a.logs().is_some());
+        a.close_logs();
+        assert!(a.runs().is_some());
+        a.close_logs(); // les logs ne sont plus affichés : sans effet
+        a.close_browser();
+        assert_eq!(a.stack.len(), 3);
+        a.pop();
+        a.list_move(1);
+        a.repo_enter();
+        assert!(a.browser().is_some() && a.logs().is_none());
+        a.close_logs(); // les logs ne sont pas la page affichée
+        assert!(a.browser().is_some());
+        a.close_browser();
+        assert!(a.repo_page().is_some());
+    }
+
+    #[test]
+    fn fil_d_ariane_de_la_pile() {
+        let mut a = app_on_run(Status::Success);
+        a.server_name = "maison".into();
+        assert_eq!(a.breadcrumb(), ["maison", "Accueil", "o/a", "CI"]);
+        a.open_logs();
+        assert_eq!(
+            a.breadcrumb(),
+            ["maison", "Accueil", "o/a", "CI", "ci.yml", "build"]
+        );
+        let anonymous = App::new();
+        assert_eq!(anonymous.breadcrumb()[0], "smithy");
+    }
+
+    // --- explorateur de code
+
+    fn explorer() -> App {
+        let mut a = app_on_repo();
+        a.list_move(1); // « Code »
+        a.repo_enter();
+        a
+    }
+
+    #[test]
+    fn ouverture_de_l_explorateur_et_file_de_requetes() {
+        let mut a = app_on_repo();
+        a.list_move(1);
+        a.repo_enter();
+        assert!(a.browser().is_some());
+        assert_eq!(a.take_requests(), [Request::Branches(repo("a"))]);
+        assert!(a.take_requests().is_empty(), "la file est vidée");
+        feed(&mut a);
+        let reqs = a.take_requests();
+        assert!(matches!(&reqs[..], [Request::Dir { reference, .. }] if reference == "main"));
+        a.close_browser();
+        assert!(a.browser().is_none());
+        assert!(
+            a.take_requests().is_empty(),
+            "sans explorateur, rien à demander"
+        );
     }
 }

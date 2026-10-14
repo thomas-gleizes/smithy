@@ -16,12 +16,6 @@ const FILE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 const BINARY_SNIFF: usize = 8192;
 
 #[derive(Deserialize)]
-struct ApiRepoMeta {
-    #[serde(default)]
-    default_branch: String,
-}
-
-#[derive(Deserialize)]
 struct ApiBranch {
     name: String,
 }
@@ -64,7 +58,7 @@ fn kind(t: &str) -> EntryKind {
 impl Forgejo {
     pub(crate) async fn fetch_branches(&self, repo: &Repo) -> Result<Vec<Branch>> {
         let base = format!("/repos/{}/{}", repo.owner, repo.name);
-        let meta: ApiRepoMeta = self.get(&base, &[]).await?;
+        let default_branch = self.fetch_repo_info(repo).await?.default_branch;
         let mut branches = Vec::new();
         for page in 1..=MAX_BRANCH_PAGES {
             // Un dépôt sans commit répond `null` (et non `[]`) : mesuré sur 10 à 15.
@@ -77,7 +71,7 @@ impl Forgejo {
                 .unwrap_or_default();
             let n = batch.len();
             branches.extend(batch.into_iter().map(|b| Branch {
-                default: b.name == meta.default_branch,
+                default: b.name == default_branch,
                 name: b.name,
             }));
             if n < PAGE_SIZE {
@@ -244,9 +238,9 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/v1/repos/smithy/tree"))
             .and(header("Authorization", "token secret"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({"default_branch": "main"})),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"name": "tree", "owner": {"login": "smithy"}, "default_branch": "main"}),
+            ))
             .mount(&server)
             .await;
         let page = |names: Vec<String>| {
@@ -294,7 +288,7 @@ mod tests {
             .and(path("/api/v1/repos/smithy/tree"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(json!({"default_branch": "main", "empty": true})),
+                    .set_body_json(json!({"name": "tree", "owner": {"login": "smithy"}, "default_branch": "main", "empty": true})),
             )
             .mount(&server)
             .await;
@@ -320,7 +314,7 @@ mod tests {
             .and(path("/api/v1/repos/smithy/tree"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(json!({"default_branch": "main", "empty": true})),
+                    .set_body_json(json!({"name": "tree", "owner": {"login": "smithy"}, "default_branch": "main", "empty": true})),
             )
             .mount(&server)
             .await;
