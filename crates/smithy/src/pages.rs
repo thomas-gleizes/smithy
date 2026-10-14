@@ -331,7 +331,7 @@ pub struct RepoView {
 }
 
 impl RepoView {
-    pub const ITEMS: [&'static str; 4] = ["CI", "Code", "Commits", "Branches"];
+    pub const ITEMS: [&'static str; 5] = ["CI", "Code", "Commits", "Branches", "Pull requests"];
 
     pub fn new(info: RepoInfo) -> Self {
         Self {

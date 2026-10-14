@@ -3,7 +3,8 @@
 use std::cell::Cell;
 
 use smithy_core::{
-    Branch, Entry, Error, FileContent, JobLog, Pipeline, Repo, RepoInfo, RepoSource, Status,
+    Branch, Entry, Error, FileContent, JobLog, Pipeline, PullFilter, Repo, RepoInfo, RepoSource,
+    Status,
 };
 
 use crate::{
@@ -12,6 +13,7 @@ use crate::{
     history::{BranchesView, CommitView, CommitsView},
     logview::{LogState, LogView, Start, TextView},
     pages::{HomeRow, HomeView, RepoView, RunsView},
+    pulls::{PullView, PullsView},
     recent::{self, RecentEntry},
     request::Request,
     session::Session,
@@ -70,6 +72,20 @@ pub enum Msg {
         sha: String,
         result: Result<smithy_core::CommitDetail, Error>,
     },
+    /// Une page des pull requests du dépôt, dans l'état demandé.
+    Pulls {
+        repo: Repo,
+        filter: PullFilter,
+        page: u32,
+        result: Result<smithy_core::PullPage, Error>,
+    },
+    /// Une PR avec ses revues, sa conversation, sa CI et son correctif.
+    PullDetail {
+        repo: Repo,
+        number: u64,
+        /// En boîte : de loin la plus grosse variante.
+        result: Result<Box<smithy_core::PullDetail>, Error>,
+    },
     /// La coloration syntaxique d'un fichier, calculée à part une fois le texte affiché.
     FileStyles {
         repo: Repo,
@@ -125,6 +141,8 @@ pub enum Page {
     Commits(CommitsView),
     Branches(BranchesView),
     Commit(CommitView),
+    Pulls(PullsView),
+    Pull(PullView),
 }
 
 impl Page {
@@ -390,6 +408,27 @@ impl App {
         }
     }
 
+    pub fn pulls(&self) -> Option<&PullsView> {
+        match self.stack.last() {
+            Some(Page::Pulls(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn pulls_mut(&mut self) -> Option<&mut PullsView> {
+        match self.stack.last_mut() {
+            Some(Page::Pulls(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn pull_view(&self) -> Option<&PullView> {
+        match self.stack.last() {
+            Some(Page::Pull(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Explorateur de code, si c'est la page affichée.
     pub fn browser(&self) -> Option<&Browser> {
         match self.stack.last() {
@@ -424,6 +463,8 @@ impl App {
                 Page::Commits(v) => out.extend(["Commits".to_owned(), v.branch_label()]),
                 Page::Branches(_) => out.push("Branches".to_owned()),
                 Page::Commit(v) => out.push(v.sha[..v.sha.len().min(7)].to_owned()),
+                Page::Pulls(_) => out.push("PR".to_owned()),
+                Page::Pull(v) => out.push(format!("#{}", v.number)),
             }
         }
         out
@@ -526,6 +567,7 @@ impl App {
             Some(Page::Browser(b)) => b.move_selection(delta),
             Some(Page::Commits(v)) => requests = v.move_selection(delta),
             Some(Page::Branches(v)) => v.move_selection(delta),
+            Some(Page::Pulls(v)) => requests = v.move_selection(delta),
             _ => {}
         }
         self.queue_all(requests);
@@ -599,10 +641,41 @@ impl App {
             let (view, requests) = CommitsView::open(repo, String::new());
             self.queue_all(requests);
             self.stack.push(Page::Commits(view));
-        } else {
+        } else if item == 3 {
             let (view, requests) = BranchesView::open(repo);
             self.queue_all(requests);
             self.stack.push(Page::Branches(view));
+        } else {
+            let (view, requests) = PullsView::open(repo, PullFilter::Open);
+            self.queue_all(requests);
+            self.stack.push(Page::Pulls(view));
+        }
+    }
+
+    // --- pull requests
+
+    /// Entrée sur une PR de la liste : l'ouvre.
+    pub fn pulls_enter(&mut self) {
+        let Some(v) = self.pulls() else { return };
+        let Some(p) = v.selected_pull() else { return };
+        let (view, requests) = PullView::open(v.repo.clone(), p.number, p.title.clone());
+        self.queue_all(requests);
+        self.stack.push(Page::Pull(view));
+    }
+
+    /// Touche `e` sur une PR (liste ou détail) : le code de sa branche.
+    pub fn pull_code(&mut self) {
+        let target = match self.stack.last() {
+            Some(Page::Pulls(v)) => v.selected_pull().map(|p| (v.repo.clone(), p.head.clone())),
+            Some(Page::Pull(v)) => v.head.clone().map(|h| (v.repo.clone(), h)),
+            _ => None,
+        };
+        let Some((repo, head)) = target.filter(|(_, h)| !h.is_empty()) else {
+            return;
+        };
+        if self.browse_supported {
+            let b = Browser::restore(repo, head, String::new());
+            self.stack.push(Page::Browser(b));
         }
     }
 
@@ -744,6 +817,8 @@ impl App {
             Some(Page::Commits(v)) => requests.extend(v.refresh()),
             Some(Page::Branches(v)) => requests.extend(v.refresh()),
             Some(Page::Commit(v)) => requests.extend(v.refresh()),
+            Some(Page::Pulls(v)) => requests.extend(v.refresh()),
+            Some(Page::Pull(v)) => requests.extend(v.refresh()),
             Some(Page::Logs(_)) => self.refetch_logs(),
             None => {}
         }
@@ -771,6 +846,7 @@ impl App {
             },
             Page::Logs(v) => Some(&mut **v),
             Page::Commit(v) => Some(&mut v.text),
+            Page::Pull(v) => Some(&mut v.text),
             _ => None,
         }
     }
@@ -783,6 +859,7 @@ impl App {
             },
             Page::Logs(v) => Some(&**v),
             Page::Commit(v) => Some(&v.text),
+            Page::Pull(v) => Some(&v.text),
             _ => None,
         }
     }
@@ -804,6 +881,7 @@ impl App {
                 .commits()
                 .is_some_and(|v| v.filter.editing || v.picker.is_some())
             || self.branch_list().is_some_and(|v| v.filter.editing)
+            || self.pulls().is_some_and(|v| v.filter.editing)
             || self.text_prompt_active()
     }
 
@@ -1089,6 +1167,32 @@ impl App {
                     }
                 }
             }
+            Msg::Pulls {
+                repo,
+                filter,
+                page: number,
+                result,
+            } => {
+                let mut follow_up = Vec::new();
+                for page in self.stacks_of(server).into_iter().flatten() {
+                    if let Page::Pulls(v) = page {
+                        follow_up.extend(v.apply_page(&repo, filter, number, result.clone()));
+                    }
+                }
+                self.pending
+                    .extend(follow_up.into_iter().map(|r| (server.to_owned(), r)));
+            }
+            Msg::PullDetail {
+                repo,
+                number,
+                result,
+            } => {
+                for page in self.stacks_of(server).into_iter().flatten() {
+                    if let Page::Pull(v) = page {
+                        v.apply_detail(&repo, number, result.clone().map(|d| *d));
+                    }
+                }
+            }
             Msg::Dir {
                 repo,
                 reference,
@@ -1261,6 +1365,7 @@ impl App {
             Some(Page::Runs(_)) => self.open_logs(),
             Some(Page::Commits(_)) => self.commits_enter(),
             Some(Page::Branches(_)) => self.branches_enter(),
+            Some(Page::Pulls(_)) => self.pulls_enter(),
             Some(Page::Browser(_)) => {
                 if let Some(b) = self.browser_mut() {
                     b.enter();
@@ -1336,6 +1441,14 @@ impl App {
                         Page::Branches(v) => Some(SavedPage::Branches {
                             repo: v.repo.clone(),
                         }),
+                        Page::Pulls(v) => Some(SavedPage::Pulls {
+                            repo: v.repo.clone(),
+                            filter: v.state,
+                        }),
+                        Page::Pull(v) => Some(SavedPage::Pull {
+                            repo: v.repo.clone(),
+                            number: v.number,
+                        }),
                         // Le correctif d'un commit n'est pas restauré : l'onglet revient à la liste.
                         Page::Commit(_) => None,
                         Page::Logs(_) => None,
@@ -1400,6 +1513,16 @@ impl App {
                         let (view, reqs) = BranchesView::open(repo.clone());
                         requests.extend(reqs.into_iter().map(|r| (tab.server.clone(), r)));
                         stack.push(Page::Branches(view));
+                    }
+                    SavedPage::Pulls { repo, filter } => {
+                        let (view, reqs) = PullsView::open(repo.clone(), *filter);
+                        requests.extend(reqs.into_iter().map(|r| (tab.server.clone(), r)));
+                        stack.push(Page::Pulls(view));
+                    }
+                    SavedPage::Pull { repo, number } => {
+                        let (view, reqs) = PullView::open(repo.clone(), *number, String::new());
+                        requests.extend(reqs.into_iter().map(|r| (tab.server.clone(), r)));
+                        stack.push(Page::Pull(view));
                     }
                     SavedPage::Browser {
                         repo,
@@ -1798,6 +1921,8 @@ fn page_title(page: &Page) -> String {
         Page::Commits(v) => format!("{} · Commits", v.repo.name),
         Page::Branches(v) => format!("{} · Branches", v.repo.name),
         Page::Commit(v) => format!("{} · {}", v.repo.name, &v.sha[..v.sha.len().min(7)]),
+        Page::Pulls(v) => format!("{} · PR", v.repo.name),
+        Page::Pull(v) => format!("{} · #{}", v.repo.name, v.number),
         Page::Browser(b) => {
             let leaf = match &b.mode {
                 crate::browser::Mode::File(fv) => fv.path.as_str(),
@@ -2738,10 +2863,10 @@ mod tests {
         l.open_logs();
         l.list_move(3);
         l.list_page(1);
-        // Page du dépôt : quatre rubriques (CI, Code, Commits, Branches)
+        // Page du dépôt : cinq rubriques (CI, Code, Commits, Branches, Pull requests)
         let mut r = app_on_repo();
-        r.list_move(5);
-        assert_eq!(r.repo_page().unwrap().selected, 3);
+        r.list_move(9);
+        assert_eq!(r.repo_page().unwrap().selected, 4);
         // Runs
         let mut u = app_on_run(Status::Success);
         u.apply(Msg::Pipelines {
@@ -4516,6 +4641,199 @@ mod tests {
         assert!(
             a.is_typing(),
             "le sélecteur de branche capte aussi les touches"
+        );
+    }
+
+    // --- pull requests
+
+    fn pull_of(n: u64) -> smithy_core::PullRequest {
+        smithy_core::PullRequest {
+            number: n,
+            title: format!("feat: n°{n}"),
+            body: String::new(),
+            author: "ana".into(),
+            state: smithy_core::PullState::Open,
+            draft: false,
+            head: format!("feature/{n}"),
+            base: "main".into(),
+            head_sha: format!("{n:040x}"),
+            labels: vec![],
+            comments: 0,
+            additions: 1,
+            deletions: 0,
+            changed_files: 1,
+            mergeable: Some(true),
+            created: None,
+            updated: None,
+            closed: None,
+            url: None,
+        }
+    }
+
+    fn pulls_request(filter: PullFilter, page: u32) -> Request {
+        Request::Pulls {
+            repo: repo("a"),
+            filter,
+            page,
+        }
+    }
+
+    /// Sur la liste des PR ouvertes de `o/a`, les PR 1 à 3 chargées (la plus récente d'abord).
+    fn app_on_pulls() -> App {
+        let mut a = app_on_repo();
+        a.list_move(4);
+        a.repo_enter();
+        assert_eq!(a.take_requests(), [pulls_request(PullFilter::Open, 1)]);
+        a.apply(Msg::Pulls {
+            repo: repo("a"),
+            filter: PullFilter::Open,
+            page: 1,
+            result: Ok(smithy_core::PullPage {
+                pulls: (1..=3).rev().map(pull_of).collect(),
+                has_more: false,
+            }),
+        });
+        a
+    }
+
+    fn pull_detail_of(n: u64) -> smithy_core::PullDetail {
+        smithy_core::PullDetail {
+            pull: pull_of(n),
+            commits: vec![],
+            commits_truncated: false,
+            reviews: vec![],
+            comments: Some(vec![]),
+            checks: None,
+            statuses: vec![],
+            patch: String::new(),
+            patch_truncated: false,
+        }
+    }
+
+    #[test]
+    fn la_page_du_depot_ouvre_les_pull_requests() {
+        let mut a = app_on_pulls();
+        assert_eq!(a.breadcrumb().last().map(String::as_str), Some("PR"));
+        assert_eq!(titles(&a), ["a · PR"]);
+        assert_eq!(a.pulls().unwrap().visible().len(), 3);
+        // Entrée : la PR sélectionnée (la plus récente, #3)
+        a.pulls_enter();
+        assert_eq!(
+            a.take_requests(),
+            [Request::PullDetail {
+                repo: repo("a"),
+                number: 3
+            }]
+        );
+        assert_eq!(a.breadcrumb().last().map(String::as_str), Some("#3"));
+        assert_eq!(titles(&a), ["a · #3"]);
+        assert_eq!(a.pull_view().unwrap().title, "feat: n°3");
+        // Une réponse pour une autre PR est ignorée, la bonne remplit le volet
+        a.apply(Msg::PullDetail {
+            repo: repo("a"),
+            number: 2,
+            result: Ok(Box::new(pull_detail_of(2))),
+        });
+        assert!(a.pull_view().unwrap().head.is_none());
+        a.apply(Msg::PullDetail {
+            repo: repo("a"),
+            number: 3,
+            result: Ok(Box::new(pull_detail_of(3))),
+        });
+        assert_eq!(a.pull_view().unwrap().head.as_deref(), Some("feature/3"));
+        assert!(
+            a.active_text().is_some(),
+            "volet de texte : recherche, plis"
+        );
+        // `r` redemande la PR ; `e` ouvre le code de sa branche
+        a.refresh_current();
+        assert_eq!(a.take_requests().len(), 1);
+        a.pull_code();
+        let b = a.browser().expect("explorateur");
+        assert_eq!(b.reference, "feature/3");
+        a.pop();
+        a.pop();
+        // Sur la liste aussi, `e` vise la branche de la PR sélectionnée
+        a.list_move(1);
+        a.pull_code();
+        assert_eq!(a.browser().unwrap().reference, "feature/2");
+    }
+
+    #[test]
+    fn pull_requests_etat_filtre_et_nouvel_onglet() {
+        let mut a = app_on_pulls();
+        a.take_requests();
+        // `s` : fermées, redemandées depuis la page 1 ; la réponse des ouvertes est ignorée
+        let reqs = a.pulls_mut().unwrap().cycle_state();
+        assert_eq!(reqs, [pulls_request(PullFilter::Closed, 1)]);
+        a.apply(Msg::Pulls {
+            repo: repo("a"),
+            filter: PullFilter::Open,
+            page: 1,
+            result: Ok(smithy_core::PullPage {
+                pulls: vec![pull_of(9)],
+                has_more: false,
+            }),
+        });
+        assert!(a.pulls().unwrap().pulls.is_empty());
+        // Le filtre local neutralise les touches de navigation
+        a.pulls_mut().unwrap().filter.start();
+        assert!(a.is_typing());
+        a.pulls_mut().unwrap().filter.cancel();
+        assert!(!a.is_typing());
+        // `t` sur une PR : l'ouvre dans un nouvel onglet, la liste reste dans l'actuel
+        let mut b = app_on_pulls();
+        b.take_requests();
+        b.open_in_new_tab();
+        assert_eq!(b.tab_count(), 2);
+        assert_eq!(b.pull_view().map(|v| v.number), Some(3));
+        b.switch_tab(-1);
+        assert!(b.pulls().is_some());
+    }
+
+    #[test]
+    fn instantane_et_restauration_des_pull_requests() {
+        let mut a = app_on_pulls();
+        a.set_servers(vec![entry("A")]);
+        a.set_caps("A", true, true);
+        a.pulls_mut().unwrap().cycle_state(); // fermées
+        a.pulls_enter(); // liste vide : rien ne s'ouvre
+        assert!(a.pull_view().is_none());
+        let snap = a.snapshot();
+        assert_eq!(
+            snap.tabs[0].pages.last(),
+            Some(&SavedPage::Pulls {
+                repo: repo("a"),
+                filter: PullFilter::Closed
+            })
+        );
+        // Une PR ouverte est sauvegardée par son numéro, et rouverte en la redemandant
+        let mut b = app_on_pulls();
+        b.pulls_enter();
+        let mut saved = b.snapshot();
+        assert_eq!(
+            saved.tabs[0].pages.last(),
+            Some(&SavedPage::Pull {
+                repo: repo("a"),
+                number: 3
+            })
+        );
+        saved.tabs[0].server = "A".into();
+        let mut c = fresh();
+        c.set_servers(vec![entry("A")]);
+        c.set_caps("A", true, true);
+        assert!(c.restore(saved));
+        assert_eq!(c.pull_view().map(|v| v.number), Some(3));
+        let reqs = c.take_tagged_requests();
+        assert!(reqs.iter().all(|(s, _)| s == "A"));
+        assert!(reqs.iter().any(|(_, r)| *r
+            == Request::PullDetail {
+                repo: repo("a"),
+                number: 3
+            }));
+        assert!(
+            reqs.iter()
+                .any(|(_, r)| *r == pulls_request(PullFilter::Open, 1))
         );
     }
 }

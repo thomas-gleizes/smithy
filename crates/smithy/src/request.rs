@@ -1,7 +1,7 @@
 //! Ce que l'état de l'application demande à la boucle principale de lancer. L'état reste pur :
 //! il dépose des requêtes, la boucle les exécute, les réponses reviennent sous forme de `Msg`.
 
-use smithy_core::{Pipeline, Repo, RepoSource};
+use smithy_core::{Pipeline, PullFilter, Repo, RepoSource};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Request {
@@ -22,6 +22,16 @@ pub enum Request {
     CommitDetail {
         repo: Repo,
         sha: String,
+    },
+    /// Une page des pull requests du dépôt, dans l'état demandé.
+    Pulls {
+        repo: Repo,
+        filter: PullFilter,
+        page: u32,
+    },
+    PullDetail {
+        repo: Repo,
+        number: u64,
     },
     Dir {
         repo: Repo,

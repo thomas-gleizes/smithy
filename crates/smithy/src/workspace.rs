@@ -15,7 +15,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use smithy_core::Repo;
+use smithy_core::{PullFilter, Repo};
 
 use crate::session::{create_private_dir, write_private};
 
@@ -41,6 +41,16 @@ pub enum SavedPage {
     },
     Branches {
         repo: Repo,
+    },
+    Pulls {
+        repo: Repo,
+        #[serde(default)]
+        filter: PullFilter,
+    },
+    /// Une PR : seule sa référence est gardée, tout est redemandé.
+    Pull {
+        repo: Repo,
+        number: u64,
     },
     Browser {
         repo: Repo,

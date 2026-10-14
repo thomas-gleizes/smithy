@@ -6,7 +6,8 @@
 use std::cell::Cell;
 
 use smithy_core::{
-    Branch, ChangeKind, Commit, CommitDetail, CommitPage, Error, Repo, Status, clean_text_line,
+    Branch, ChangeKind, Commit, CommitDetail, CommitPage, Error, FileChange, Repo, Status,
+    clean_text_line,
 };
 
 use crate::{
@@ -28,12 +29,12 @@ pub const PATCH_LIMIT_LINES: usize = 20_000;
 const COLLAPSE_FROM_LINES: usize = 400;
 
 /// Tous les mots du filtre (déjà en minuscules) sont-ils dans `haystack` ?
-fn all_words(haystack: &str, words: &[String]) -> bool {
+pub(crate) fn all_words(haystack: &str, words: &[String]) -> bool {
     let hay = haystack.to_lowercase();
     words.iter().all(|w| hay.contains(w.as_str()))
 }
 
-fn words_of(filter: &str) -> Vec<String> {
+pub(crate) fn words_of(filter: &str) -> Vec<String> {
     filter.split_whitespace().map(str::to_lowercase).collect()
 }
 
@@ -446,7 +447,7 @@ impl CommitView {
     }
 }
 
-fn plain(text: impl Into<String>, tok: Option<Tok>) -> LogLine {
+pub(crate) fn plain(text: impl Into<String>, tok: Option<Tok>) -> LogLine {
     let text = clean_text_line(&text.into());
     let mut l = LogLine::text(text);
     if let Some(tok) = tok {
@@ -566,7 +567,25 @@ pub fn diff_layout(d: &CommitDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Opti
     ));
     head.push(plain("", None));
 
-    // Découpe le correctif par fichier.
+    let (parts, line_cut) = diff_parts(&d.patch, &d.files);
+    if parts.is_empty() {
+        head.push(plain(
+            "(aucun changement de fichier à afficher)",
+            Some(Tok::Meta),
+        ));
+    }
+    let notice = if d.patch_truncated || line_cut {
+        Some("correctif tronqué : début affiché".to_owned())
+    } else {
+        None
+    };
+    (head, parts, notice)
+}
+
+/// Découpe un correctif en une section pliable par fichier (titre : chemin et bilan +/−,
+/// couleur : nature du changement, d'après `files` ou, à défaut, les en-têtes du diff).
+/// Renvoie aussi si le plafond de lignes a coupé le correctif.
+pub fn diff_parts(patch: &str, files: &[FileChange]) -> (Vec<Part>, bool) {
     struct Block {
         path: String,
         lines: Vec<LogLine>,
@@ -577,7 +596,7 @@ pub fn diff_layout(d: &CommitDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Opti
     let mut blocks: Vec<Block> = Vec::new();
     let mut total = 0usize;
     let mut line_cut = false;
-    for raw in d.patch.lines() {
+    for raw in patch.lines() {
         if raw.starts_with("diff --git ") {
             blocks.push(Block {
                 path: file_of_header(raw),
@@ -615,8 +634,7 @@ pub fn diff_layout(d: &CommitDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Opti
     let parts: Vec<Part> = blocks
         .into_iter()
         .map(|b| {
-            let kind = d
-                .files
+            let kind = files
                 .iter()
                 .find(|f| f.path == b.path)
                 .map(|f| f.kind)
@@ -630,24 +648,13 @@ pub fn diff_layout(d: &CommitDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Opti
             }
         })
         .collect();
-    if parts.is_empty() {
-        head.push(plain(
-            "(aucun changement de fichier à afficher)",
-            Some(Tok::Meta),
-        ));
-    }
-    let notice = if d.patch_truncated || line_cut {
-        Some("correctif tronqué : début affiché".to_owned())
-    } else {
-        None
-    };
-    (head, parts, notice)
+    (parts, line_cut)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use smithy_core::{BranchHead, FileChange};
+    use smithy_core::BranchHead;
 
     fn repo() -> Repo {
         Repo {

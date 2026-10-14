@@ -7,7 +7,7 @@ use ratatui::{
         Block, Borders, Cell, Clear, List, ListItem, ListState, Paragraph, Row, Table, TableState,
     },
 };
-use smithy_core::{EntryKind, RepoInfo, Status};
+use smithy_core::{EntryKind, PullFilter, RepoInfo, Status};
 
 use crate::{
     app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
@@ -16,6 +16,7 @@ use crate::{
     history::{BranchesView, CommitView, CommitsView},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
+    pulls::{self, PullView, PullsView},
     textsearch::{self, Hit},
     timeago,
 };
@@ -53,6 +54,10 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_browser(f, app, b, body);
     } else if let Some(v) = app.commit_view() {
         draw_commit(f, app, v, body);
+    } else if let Some(v) = app.pull_view() {
+        draw_pull(f, app, v, body);
+    } else if let Some(v) = app.pulls() {
+        draw_pulls(f, app, v, body);
     } else if let Some(v) = app.commits() {
         draw_commits(f, app, v, body);
     } else if let Some(v) = app.branch_list() {
@@ -1313,6 +1318,194 @@ fn draw_commit(f: &mut Frame, app: &App, v: &CommitView, area: Rect) {
     );
 }
 
+fn pulls_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ naviguer · ↵/→ la PR · s état · / filtrer · e code · t onglet · r actualiser · ←/Échap retour",
+            "j/k · ↵ PR · s état · / filtrer · e code · ← retour",
+            "↵ · s · / · e · ←",
+            "Échap",
+        ],
+    )
+}
+
+fn pull_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · e code · w repli · r actualiser · Esc retour",
+            "j/k défiler · ←/→ section · Espace plier · / chercher · e code · w repli · Esc retour",
+            "←/→ · Espace · / · e · w · Esc",
+            "Esc",
+        ],
+    )
+}
+
+fn draw_pulls(f: &mut Frame, app: &App, v: &PullsView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let mut title = format!(" Pull requests · {}", pulls::filter_label(v.state));
+    if v.filter.active() {
+        title.push_str(&format!(" · « {} »", v.filter.text.trim()));
+    }
+    title.push(' ');
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(rows[0]);
+    app.viewport.set((inner.height as usize).saturating_sub(1));
+    let visible = v.visible();
+    if visible.is_empty() {
+        let (text, color) = if let Some(e) = &v.error {
+            (format!("erreur : {e}"), Color::Red)
+        } else if v.loading {
+            ("chargement…".to_owned(), Color::Cyan)
+        } else if v.pulls.is_empty() {
+            (
+                match v.state {
+                    PullFilter::Open => "(aucune pull request ouverte · s change d'état)",
+                    PullFilter::Closed => "(aucune pull request fermée · s change d'état)",
+                    PullFilter::All => "(aucune pull request)",
+                }
+                .to_owned(),
+                Color::DarkGray,
+            )
+        } else {
+            (
+                "(aucune pull request ne correspond au filtre · Échap l'efface)".to_owned(),
+                Color::DarkGray,
+            )
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::new().fg(color)))).block(block),
+            rows[0],
+        );
+    } else {
+        let now = timeago::now_epoch();
+        let dim = Style::new().fg(Color::DarkGray);
+        let table_rows: Vec<Row> = visible
+            .iter()
+            .map(|p| {
+                let (_, color) = status_style(pulls::state_status(p));
+                let mut title = vec![Span::raw(p.title.clone())];
+                for l in &p.labels {
+                    title.push(tag(l));
+                }
+                if p.mergeable == Some(false) {
+                    title.push(Span::styled(" [conflits]", Style::new().fg(Color::Red)));
+                }
+                let when = p
+                    .closed
+                    .as_deref()
+                    .or(p.updated.as_deref())
+                    .or(p.created.as_deref())
+                    .map(|d| timeago::ago_rfc3339(now, d))
+                    .unwrap_or_default();
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        format!("#{}", p.number),
+                        Style::new().fg(Color::Yellow),
+                    )),
+                    Cell::from(Span::styled(pulls::state_label(p), Style::new().fg(color))),
+                    Cell::from(Line::from(title)),
+                    Cell::from(Span::styled(format!("{} → {}", p.head, p.base), dim)),
+                    Cell::from(p.author.clone()),
+                    Cell::from(when),
+                ])
+            })
+            .collect();
+        let more = if v.has_more { "+" } else { "" };
+        let counter = if v.filter.active() {
+            format!(
+                " {}/{} (sur {}{more} chargées) ",
+                v.selected + 1,
+                visible.len(),
+                v.pulls.len()
+            )
+        } else {
+            format!(" {}/{}{more} ", v.selected + 1, visible.len())
+        };
+        let table = Table::new(
+            table_rows,
+            [
+                Constraint::Length(6),
+                Constraint::Length(10),
+                Constraint::Min(20),
+                Constraint::Max(30),
+                Constraint::Length(12),
+                Constraint::Length(14),
+            ],
+        )
+        .header(
+            Row::new(["PR", "État", "Titre", "Branches", "Auteur", "Activité"])
+                .style(Style::new().bold()),
+        )
+        .block(block.title_bottom(Line::from(counter).right_aligned()))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut ts = TableState::default().with_offset(v.list_offset.get());
+        ts.select(Some(v.selected));
+        f.render_stateful_widget(table, rows[0], &mut ts);
+        v.list_offset.set(ts.offset());
+    }
+    let first = if let Some(err) = app.error.as_ref().or(v.error.as_ref()) {
+        Line::from(Span::styled(
+            format!("erreur : {err}"),
+            Style::new().fg(Color::Red),
+        ))
+    } else if v.loading && !v.pulls.is_empty() {
+        Line::from(Span::styled(
+            "chargement de la suite…",
+            Style::new().fg(Color::Cyan),
+        ))
+    } else if let Some(p) = v.selected_pull() {
+        let mut text = format!(
+            "{} · +{} −{} · {} commentaire{}",
+            if p.changed_files > 1 {
+                format!("{} fichiers", p.changed_files)
+            } else {
+                format!("{} fichier", p.changed_files)
+            },
+            p.additions,
+            p.deletions,
+            p.comments,
+            if p.comments > 1 { "s" } else { "" }
+        );
+        if let Some(url) = &p.url {
+            text.push_str(&format!(" · {url}"));
+        }
+        Line::from(text)
+    } else {
+        Line::from("")
+    };
+    list_footer(
+        f,
+        app,
+        rows[1],
+        first,
+        v.filter.editing.then_some(v.filter.text.as_str()),
+        pulls_help(area.width as usize),
+    );
+}
+
+fn draw_pull(f: &mut Frame, app: &App, v: &PullView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let title = if v.title.is_empty() {
+        Line::from(format!(" #{} ", v.number))
+    } else {
+        Line::from(format!(" #{} {} ", v.number, v.title))
+    };
+    draw_text_pane(f, app, rows[0], title, &v.text);
+    let search = search_line(&v.text);
+    draw_footer(
+        f,
+        app,
+        rows[1],
+        pull_help(area.width as usize),
+        search.as_deref(),
+    );
+}
+
 fn tag(text: &str) -> Span<'static> {
     Span::styled(format!(" [{text}]"), Style::new().fg(Color::DarkGray))
 }
@@ -1549,6 +1742,15 @@ fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
                 "toutes les branches, avec leur dernier commit",
                 dim,
             )]
+        } else if n == 4 {
+            vec![Span::styled(
+                match i.open_prs {
+                    0 => "aucune ouverte".to_owned(),
+                    1 => "1 ouverte".to_owned(),
+                    n => format!("{n} ouvertes"),
+                },
+                dim,
+            )]
         } else {
             vec![Span::styled(format!("branche {}", i.default_branch), dim)]
         };
@@ -1559,7 +1761,7 @@ fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
             Style::new().bold()
         };
         let mut spans = vec![
-            Span::styled(format!("{marker}{name:<9}"), style),
+            Span::styled(format!("{marker}{name:<13}"), style),
             Span::raw("  "),
         ];
         spans.extend(summary);
@@ -3123,6 +3325,129 @@ mod tests {
         // Connexion de démarrage, aucun serveur connecté : Échap quitte
         app.forget_caps("A");
         assert!(render(&app, 100, 20).contains("Esc quitter"));
+    }
+
+    fn pull(n: u64) -> smithy_core::PullRequest {
+        smithy_core::PullRequest {
+            number: n,
+            title: format!("titre n°{n}"),
+            body: "Une **description**.".into(),
+            author: "ana".into(),
+            state: smithy_core::PullState::Open,
+            draft: false,
+            head: "feature/garde".into(),
+            base: "main".into(),
+            head_sha: "abc".into(),
+            labels: vec![],
+            comments: 2,
+            additions: 8,
+            deletions: 2,
+            changed_files: 4,
+            mergeable: Some(true),
+            created: None,
+            updated: None,
+            closed: None,
+            url: None,
+        }
+    }
+
+    #[test]
+    fn liste_et_detail_des_pull_requests() {
+        let repo = Repo {
+            owner: "smithy".into(),
+            name: "revue".into(),
+        };
+        let mut app = App::new();
+        app.set_caps("", true, true);
+        let (mut v, _) = PullsView::open(repo.clone(), PullFilter::Open);
+        let mut p1 = pull(1);
+        p1.labels = vec!["docs".into()];
+        let mut p4 = pull(4);
+        p4.mergeable = Some(false);
+        let mut p5 = pull(5);
+        p5.draft = true;
+        p5.mergeable = None;
+        v.apply_page(
+            &repo,
+            PullFilter::Open,
+            1,
+            Ok(smithy_core::PullPage {
+                pulls: vec![p5, p4, p1],
+                has_more: false,
+            }),
+        );
+        app.stack.push(Page::Pulls(v));
+        let text = render(&app, 150, 12);
+        for want in [
+            "Pull requests · ouvertes",
+            "#5",
+            "brouillon",
+            "#4",
+            "[conflits]",
+            "titre n°1 [docs]",
+            "feature/garde → main",
+            "4 fichiers · +8 −2 · 2 commentaires",
+            "s état",
+            " 1/3 ",
+        ] {
+            assert!(text.contains(want), "{want:?} absent de {text}");
+        }
+        // Liste vide
+        let (mut empty, _) = PullsView::open(repo.clone(), PullFilter::Closed);
+        empty.apply_page(
+            &repo,
+            PullFilter::Closed,
+            1,
+            Ok(smithy_core::PullPage {
+                pulls: vec![],
+                has_more: false,
+            }),
+        );
+        app.stack.push(Page::Pulls(empty));
+        assert!(render(&app, 150, 12).contains("aucune pull request fermée"));
+        app.stack.pop();
+
+        // Détail : titre, en-tête, sections
+        let (mut d, _) = PullView::open(repo.clone(), 1, "titre n°1".into());
+        d.apply_detail(
+            &repo,
+            1,
+            Ok(smithy_core::PullDetail {
+                pull: pull(1),
+                commits: vec![],
+                commits_truncated: false,
+                reviews: vec![smithy_core::Review {
+                    author: "relecteur".into(),
+                    state: smithy_core::ReviewState::Approved,
+                    body: "Ça me va.".into(),
+                    date: None,
+                    dismissed: false,
+                    stale: false,
+                    comments: vec![],
+                }],
+                comments: None,
+                checks: Some(Status::Failure),
+                statuses: vec![],
+                patch: "diff --git a/a.txt b/a.txt\n+x\n".into(),
+                patch_truncated: false,
+            }),
+        );
+        app.stack.push(Page::Pull(d));
+        let text = render(&app, 150, 30);
+        for want in [
+            " #1 titre n°1 ",
+            "État     : ouverte",
+            "Branches : feature/garde → main",
+            "CI       : ✘ échec",
+            "Une description.",
+            "Revues (1)",
+            "✔ relecteur a approuvé",
+            "Conversation (2, non affichée)",
+            "a.txt  +1 −0",
+            "e code",
+        ] {
+            assert!(text.contains(want), "{want:?} absent de {text}");
+        }
     }
 
     #[test]

@@ -6,6 +6,7 @@ mod history;
 mod logview;
 mod markdown;
 mod pages;
+mod pulls;
 mod recent;
 mod request;
 mod session;
@@ -359,6 +360,61 @@ fn branch_list_key(app: &mut App, code: KeyCode) {
     }
 }
 
+/// Touches de la liste des pull requests : filtre local (`/`), état (`s`), liste.
+fn pulls_key(app: &mut App, code: KeyCode) {
+    if app.pulls().is_some_and(|v| v.filter.editing) {
+        let mut requests = Vec::new();
+        if let Some(v) = app.pulls_mut() {
+            match code {
+                KeyCode::Enter => v.filter.commit(),
+                KeyCode::Esc => {
+                    v.filter.cancel();
+                    requests = v.filter_changed();
+                }
+                KeyCode::Backspace => {
+                    v.filter.backspace();
+                    requests = v.filter_changed();
+                }
+                KeyCode::Char(c) => {
+                    v.filter.type_char(c);
+                    requests = v.filter_changed();
+                }
+                _ => {}
+            }
+        }
+        app.history_queue(requests);
+        return;
+    }
+    match code {
+        KeyCode::Char('/') => {
+            if let Some(v) = app.pulls_mut() {
+                v.filter.start();
+            }
+        }
+        KeyCode::Char('s') => {
+            let requests = app.pulls_mut().map(|v| v.cycle_state()).unwrap_or_default();
+            app.history_queue(requests);
+        }
+        // Échap retire d'abord le filtre, puis il revient en arrière.
+        KeyCode::Esc if app.pulls_mut().is_some_and(|v| v.filter.clear()) => {
+            let requests = app
+                .pulls_mut()
+                .map(|v| v.filter_changed())
+                .unwrap_or_default();
+            app.history_queue(requests);
+        }
+        KeyCode::Enter | KeyCode::Right => app.pulls_enter(),
+        KeyCode::Char('e') => app.pull_code(),
+        KeyCode::Char('r') => app.refresh_current(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
+            app.pop();
+        }
+        _ => {
+            list_nav(app, code);
+        }
+    }
+}
+
 /// Touches du détail d'un commit : comme les logs (sections par fichier, recherche).
 fn commit_key(app: &mut App, code: KeyCode) {
     match code {
@@ -552,6 +608,26 @@ fn run_request<P: Provider + 'static>(
                     .commit_detail(&repo, &sha, history::PATCH_LIMIT_BYTES)
                     .await;
                 Msg::CommitDetail { repo, sha, result }
+            }
+            Request::Pulls { repo, filter, page } => {
+                let result = p.list_pulls(&repo, filter, page).await;
+                Msg::Pulls {
+                    repo,
+                    filter,
+                    page,
+                    result,
+                }
+            }
+            Request::PullDetail { repo, number } => {
+                let result = p
+                    .pull_detail(&repo, number, pulls::PATCH_LIMIT_BYTES)
+                    .await
+                    .map(Box::new);
+                Msg::PullDetail {
+                    repo,
+                    number,
+                    result,
+                }
             }
             Request::Dir {
                 repo,
@@ -998,6 +1074,15 @@ async fn run(
                 branch_list_key(&mut app, k.code);
             } else if app.commit_view().is_some() {
                 commit_key(&mut app, k.code);
+            } else if app.pulls().is_some() {
+                pulls_key(&mut app, k.code);
+            } else if app.pull_view().is_some() {
+                // Comme un commit (sections, recherche), plus `e` : le code de la branche.
+                if k.code == KeyCode::Char('e') {
+                    app.pull_code();
+                } else {
+                    commit_key(&mut app, k.code);
+                }
             } else if app.runs().is_some() {
                 runs_key(&mut app, k.code);
             } else if app.logs().is_some() {

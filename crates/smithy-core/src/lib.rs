@@ -243,6 +243,130 @@ pub struct CommitDetail {
     pub patch_truncated: bool,
 }
 
+/// Quelles pull requests lister.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PullFilter {
+    #[default]
+    Open,
+    /// Fermées, fusionnées ou non.
+    Closed,
+    All,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullState {
+    Open,
+    Merged,
+    /// Fermée sans fusion.
+    Closed,
+}
+
+/// Une pull request, telle que la liste la donne (déjà complète : la liste suffit à l'afficher).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullRequest {
+    pub number: u64,
+    pub title: String,
+    /// Description (Markdown), peut être vide.
+    pub body: String,
+    pub author: String,
+    pub state: PullState,
+    pub draft: bool,
+    /// Branche proposée et branche visée.
+    pub head: String,
+    pub base: String,
+    /// Commit de tête de la branche proposée (pour son statut de CI).
+    pub head_sha: String,
+    pub labels: Vec<String>,
+    /// Commentaires de la conversation (hors revues).
+    pub comments: u64,
+    pub additions: u64,
+    pub deletions: u64,
+    pub changed_files: u64,
+    /// `None` : inconnu (calcul en cours côté serveur, ou PR fermée).
+    pub mergeable: Option<bool>,
+    /// Dates RFC 3339 telles que le serveur les donne.
+    pub created: Option<String>,
+    pub updated: Option<String>,
+    /// Fusion ou fermeture.
+    pub closed: Option<String>,
+    pub url: Option<String>,
+}
+
+/// Une page de la liste des pull requests, de la plus récente à la plus ancienne.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullPage {
+    pub pulls: Vec<PullRequest>,
+    /// Il peut y en avoir d'autres à la page suivante.
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    /// Demandée, pas encore rendue.
+    Requested,
+    Other,
+}
+
+/// Un commentaire de ligne d'une revue.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewComment {
+    pub path: String,
+    pub body: String,
+    /// Dernière ligne du morceau de diff commenté (celle visée par le commentaire).
+    pub context: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Review {
+    pub author: String,
+    pub state: ReviewState,
+    pub body: String,
+    pub date: Option<String>,
+    /// Écartée (rejetée, ou remplacée par une revue plus récente du même relecteur).
+    pub dismissed: bool,
+    /// Rendue sur un commit qui n'est plus la tête de la branche.
+    pub stale: bool,
+    pub comments: Vec<ReviewComment>,
+}
+
+/// Un commentaire de la conversation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Comment {
+    pub author: String,
+    pub body: String,
+    pub date: Option<String>,
+}
+
+/// Un statut de CI posé sur un commit (`context` : son nom, ex. `ci/build`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckStatus {
+    pub context: String,
+    pub status: Status,
+    pub description: String,
+    pub url: Option<String>,
+}
+
+/// Une pull request avec tout ce qu'il faut pour la lire.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullDetail {
+    pub pull: PullRequest,
+    pub commits: Vec<Commit>,
+    /// Il y a plus de commits que ceux listés.
+    pub commits_truncated: bool,
+    pub reviews: Vec<Review>,
+    /// `None` : le token n'a pas le droit de lire la conversation.
+    pub comments: Option<Vec<Comment>>,
+    /// Statut de CI combiné de la tête (`None` : aucun statut posé) et le détail.
+    pub checks: Option<Status>,
+    pub statuses: Vec<CheckStatus>,
+    /// Correctif complet au format unifié, borné par l'appelant.
+    pub patch: String,
+    pub patch_truncated: bool,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EntryKind {
     Dir,
@@ -300,7 +424,7 @@ pub fn clean_text_line(raw: &str) -> String {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Capabilities {
     pub logs: bool,
-    /// Branches, dossiers et fichiers du dépôt (l'explorateur).
+    /// Branches, dossiers et fichiers du dépôt (l'explorateur), historique et pull requests.
     pub browse: bool,
 }
 
@@ -337,6 +461,28 @@ pub trait Provider: Send + Sync {
         _max_bytes: usize,
     ) -> impl Future<Output = Result<CommitDetail>> + Send {
         async { Err(Error::Unsupported("historique")) }
+    }
+
+    /// Une page des pull requests du dépôt (`page` commence à 1). Réservé aux backends dont
+    /// `capabilities().browse` est vrai.
+    fn list_pulls(
+        &self,
+        _repo: &Repo,
+        _filter: PullFilter,
+        _page: u32,
+    ) -> impl Future<Output = Result<PullPage>> + Send {
+        async { Err(Error::Unsupported("pull requests")) }
+    }
+
+    /// Une pull request : commits, revues, conversation, statuts de CI et correctif (lu sur au
+    /// plus `max_bytes` octets).
+    fn pull_detail(
+        &self,
+        _repo: &Repo,
+        _number: u64,
+        _max_bytes: usize,
+    ) -> impl Future<Output = Result<PullDetail>> + Send {
+        async { Err(Error::Unsupported("pull requests")) }
     }
 
     /// Contenu d'un dossier (`path` vide = racine) à une référence (branche, étiquette, commit).

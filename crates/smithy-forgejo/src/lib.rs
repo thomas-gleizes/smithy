@@ -7,6 +7,7 @@ mod history;
 mod login;
 mod logs;
 mod ping;
+mod pulls;
 mod repos;
 mod version;
 
@@ -18,7 +19,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use smithy_core::{
     Branch, Capabilities, CommitDetail, CommitPage, Entry, Error, FileContent, JobLog, Pipeline,
-    Provider, Repo, RepoInfo, RepoSource, Result, Status,
+    Provider, PullDetail, PullFilter, PullPage, Repo, RepoInfo, RepoSource, Result, Status,
 };
 use std::collections::BTreeMap;
 
@@ -218,6 +219,14 @@ impl Provider for Forgejo {
         max_bytes: usize,
     ) -> Result<CommitDetail> {
         self.fetch_commit_detail(repo, sha, max_bytes).await
+    }
+
+    async fn list_pulls(&self, repo: &Repo, filter: PullFilter, page: u32) -> Result<PullPage> {
+        self.fetch_pulls(repo, filter, page).await
+    }
+
+    async fn pull_detail(&self, repo: &Repo, number: u64, max_bytes: usize) -> Result<PullDetail> {
+        self.fetch_pull_detail(repo, number, max_bytes).await
     }
 
     async fn read_dir(&self, repo: &Repo, reference: &str, path: &str) -> Result<Vec<Entry>> {

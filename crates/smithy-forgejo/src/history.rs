@@ -12,7 +12,7 @@ use crate::{Forgejo, PAGE_SIZE, browse::decode};
 const PATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 #[derive(Deserialize)]
-struct ApiCommit {
+pub(crate) struct ApiCommit {
     #[serde(default)]
     sha: String,
     #[serde(default)]
@@ -68,7 +68,7 @@ struct ApiStats {
 }
 
 impl ApiCommit {
-    fn into_commit(self) -> (Commit, ApiRest) {
+    pub(crate) fn into_commit(self) -> (Commit, ApiRest) {
         let date = Some(self.commit.author.date)
             .filter(|d| !d.is_empty())
             .or_else(|| Some(self.created).filter(|d| !d.is_empty()));
@@ -89,7 +89,7 @@ impl ApiCommit {
     }
 }
 
-struct ApiRest {
+pub(crate) struct ApiRest {
     parents: Vec<ApiParent>,
     files: Option<Vec<ApiFile>>,
     stats: Option<ApiStats>,
@@ -210,7 +210,7 @@ impl Forgejo {
     }
 
     /// Le correctif en texte, lu sur au plus `max_bytes` octets.
-    async fn fetch_patch(&self, api: &str, max_bytes: usize) -> Result<(String, bool)> {
+    pub(crate) async fn fetch_patch(&self, api: &str, max_bytes: usize) -> Result<(String, bool)> {
         let net = |e: reqwest::Error| Error::Network(e.without_url().to_string());
         let mut resp = self
             .client
