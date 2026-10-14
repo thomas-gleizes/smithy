@@ -13,6 +13,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme. **Markdown files** (`.md`) open rendered: headings, emphasis, lists (nested, ordered, task lists), quotes, tables, links (the target is shown), images (alt text), rules, and code blocks coloured by their language; raw HTML is shown dimmed. Press `m` to switch to the highlighted source.
 - Sign in from the TUI on Forgejo (username and password, entered once and never stored); GitHub uses a token.
 - A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`; each tab has its own server, which you can change from the tab (`S`) without touching the other tabs.
+- **Mouse and trackpad**: click a row to select it, click it again (or double-click) to open it; click a tab, a home section or a breadcrumb segment to go there; the wheel scrolls lists and text; clicking a step title in the logs folds or unfolds it.
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
 - Backends are pluggable through the `Provider` trait; the UI adapts to what a backend supports (`Capabilities`).
@@ -133,6 +134,19 @@ Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (dire
 ## Key bindings
 
 Everywhere: `Esc` goes back one page (it never quits), `Ctrl+C` quits, `r` refreshes the current page.
+
+Mouse and trackpad, everywhere:
+
+| Action                         | Effect                          |
+|--------------------------------|---------------------------------|
+| Click a row                    | Select it; click the selected row again (or double-click) to open it, like `Enter` |
+| Wheel / two-finger scroll      | Move the selection in a list, scroll a text pane (3 lines per notch) |
+| Click a tab or a home section  | Go to it                        |
+| Click a breadcrumb segment     | Go back to that page (the server name opens the server list, like `S`) |
+| Click a step or file title     | Fold / unfold it (logs, commit and pull request diffs) |
+| Click outside a pop-up list    | Close it, like `Esc` (tabs, servers, branches) |
+
+Forms (login, server) are keyboard only. While smithy captures the mouse, the terminal no longer selects text on its own: hold `Shift` (most terminals) or `Option` (iTerm2, Terminal.app) to select and copy.
 
 Tabs, on every page (except while typing a filter):
 
@@ -275,6 +289,7 @@ A new forge is a new crate implementing `Provider`.
 - [x] GitHub backend with a token (jobs and logs, code, history, pull requests)
 - [ ] GitHub sign-in from the TUI (device flow: a code to enter on github.com)
 - [x] Multiple instances in the config file (selected per tab from the TUI)
+- [x] Mouse and trackpad (click, wheel)
 - [ ] GitLab, Bitbucket, Azure DevOps backends
 
 ## License

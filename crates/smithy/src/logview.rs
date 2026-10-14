@@ -636,6 +636,24 @@ impl TextView {
         self.reveal_section(width, height, step);
     }
 
+    /// Clic sur la ligne d'écran `row` de la fenêtre (0 = celle du haut) : sur le titre d'une
+    /// section, la plie ou la déplie ; ailleurs, rien.
+    pub fn click_row(&mut self, row: usize, width: usize, height: usize) {
+        let Some(line) = self.window(width, height).get(row).map(|r| r.line_no) else {
+            return;
+        };
+        let Some(step) = self
+            .lines()
+            .get(line)
+            .filter(|l| matches!(l.kind, LineKind::Step(_)))
+            .and_then(|l| l.step)
+        else {
+            return;
+        };
+        self.selected = Some(step);
+        self.toggle_section(width, height);
+    }
+
     /// Tout déplier, ou tout plier si tout est déjà déplié. La section courante reste visible.
     pub fn toggle_all(&mut self, width: usize, height: usize) {
         if self.sections.is_empty() {

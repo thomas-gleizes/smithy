@@ -17,6 +17,7 @@ use crate::{
     highlight::{self, Tok},
     history::{BranchesView, CommitView, CommitsView},
     logview::{LineKind, LogState, LogView, TextView},
+    mouse::{self, Area, Target, Zones},
     pages::{HomeView, LastRun, Load, RepoView, RunPos, RunsView, Section, run_positions},
     pulls::{self, PullView, PullsView},
     textsearch::{self, Hit},
@@ -36,6 +37,7 @@ pub fn status_style(s: Status) -> (&'static str, Color) {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
+    app.zones.clear();
     // En haut : la barre d'onglets (s'il y en a plusieurs), puis une ligne pour dire où l'on est ;
     // le reste est pour la page.
     let tabs = app.tab_count() > 1;
@@ -78,9 +80,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_server_picker(f, app, selected);
     }
     if let Some(form) = &app.server_form {
+        app.zones.add(zone(f.area()), Target::Overlay);
         draw_server_form(f, form);
     }
     if let Some(form) = &app.login {
+        app.zones.add(zone(f.area()), Target::Overlay);
         let quits = app.login_quits(form);
         draw_login(f, form, quits);
     }
@@ -97,6 +101,8 @@ struct TabCell {
 #[derive(Debug, PartialEq, Eq)]
 struct TabBar {
     cells: Vec<TabCell>,
+    /// Indice (parmi tous les onglets) de la première case affichée.
+    first: usize,
     more_left: bool,
     more_right: bool,
 }
@@ -150,6 +156,7 @@ fn fit_tabs(titles: &[TabTitle], width: usize) -> TabBar {
     let Some(active) = cells.iter().position(|c| c.active) else {
         return TabBar {
             cells: Vec::new(),
+            first: 0,
             more_left: false,
             more_right: false,
         };
@@ -184,6 +191,7 @@ fn fit_tabs(titles: &[TabTitle], width: usize) -> TabBar {
     TabBar {
         more_left: lo > 0,
         more_right: hi + 1 < cells.len(),
+        first: lo,
         cells: cells[lo..=hi].to_vec(),
     }
 }
@@ -200,17 +208,53 @@ fn display_titles(app: &App) -> Vec<TabTitle> {
     titles
 }
 
+fn zone(r: Rect) -> Area {
+    Area {
+        x: r.x,
+        y: r.y,
+        width: r.width,
+        height: r.height,
+    }
+}
+
+/// Les lignes d'un tableau encadré (une ligne d'en-tête) : `inner` est l'intérieur du cadre,
+/// `offset` l'élément de la ligne du haut après le rendu.
+fn list_zone(app: &App, inner: Rect, offset: usize, len: usize) {
+    let body = Rect {
+        y: inner.y + 1,
+        height: inner.height.saturating_sub(1),
+        ..inner
+    };
+    app.zones.rows(zone(body), offset, len, Target::Row);
+}
+
+/// Une liste ouverte par-dessus la page : un clic autour la ferme, son cadre est inerte,
+/// ses lignes se choisissent.
+fn picker_zone(zones: &Zones, screen: Rect, area: Rect, offset: usize, len: usize) {
+    zones.add(zone(screen), Target::Outside);
+    zones.add(zone(area), Target::Overlay);
+    let inner = Block::default().borders(Borders::ALL).inner(area);
+    zones.rows(zone(inner), offset, len, Target::PickerRow);
+}
+
 fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     let bar = fit_tabs(&display_titles(app), area.width as usize);
     let dim = Style::new().fg(Color::DarkGray);
     let mut spans: Vec<Span> = Vec::new();
+    let mut x = area.x;
     if bar.more_left {
         spans.push(Span::styled("‹ ", dim));
+        x += 2;
     }
     for (i, c) in bar.cells.iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled("│", dim));
+            x += 1;
         }
+        let w = cell_width(c) as u16;
+        let cell = Rect::new(x, area.y, w, 1).intersection(area);
+        app.zones.add(zone(cell), Target::Tab(bar.first + i));
+        x = x.saturating_add(w);
         let style = if c.active {
             Style::new().add_modifier(Modifier::REVERSED).bold()
         } else {
@@ -293,9 +337,11 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
     let list = List::new(items)
         .block(block)
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let len = app.servers.len();
     let mut ls = ListState::default();
     ls.select(Some(selected));
     f.render_stateful_widget(list, area, &mut ls);
+    picker_zone(&app.zones, f.area(), area, ls.offset(), len);
 }
 
 fn draw_server_form(f: &mut Frame, form: &ServerForm) {
@@ -418,6 +464,7 @@ fn draw_tab_picker(f: &mut Frame, app: &App, selected: usize) {
     let mut ls = ListState::default();
     ls.select(Some(selected));
     f.render_stateful_widget(list, area, &mut ls);
+    picker_zone(&app.zones, f.area(), area, ls.offset(), titles.len());
 }
 
 const CRUMB_SEP: &str = " › ";
@@ -473,13 +520,24 @@ fn fit_breadcrumb(crumbs: &[String], width: usize) -> Vec<String> {
 }
 
 fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
-    let parts = fit_breadcrumb(&app.breadcrumb(), area.width as usize);
+    let pages = app.breadcrumb_pages();
+    let crumbs: Vec<String> = pages.iter().map(|(s, _)| s.clone()).collect();
+    let parts = fit_breadcrumb(&crumbs, area.width as usize);
+    let sources = mouse::crumb_sources(&parts, crumbs.len());
     let last = parts.len().saturating_sub(1);
     let mut spans = Vec::new();
+    let mut x = area.x;
     for (i, p) in parts.into_iter().enumerate() {
         if i > 0 {
             spans.push(Span::styled(CRUMB_SEP, Style::new().fg(Color::DarkGray)));
+            x = x.saturating_add(text_width(CRUMB_SEP) as u16);
         }
+        let w = text_width(&p) as u16;
+        if let Some(page) = sources[i].and_then(|j| pages.get(j)).map(|(_, page)| *page) {
+            let cell = Rect::new(x, area.y, w, 1).intersection(area);
+            app.zones.add(zone(cell), Target::Crumb(page));
+        }
+        x = x.saturating_add(w);
         let style = if i == last {
             Style::new().bold()
         } else {
@@ -665,6 +723,9 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
             format!(" ⚠ {notice} "),
             Style::new().fg(Color::Yellow),
         )));
+    }
+    if matches!(view.state, LogState::Ready(_)) {
+        app.zones.rows(zone(inner), 0, height, Target::TextRow);
     }
     f.render_widget(Paragraph::new(body).block(block), area);
 }
@@ -871,7 +932,7 @@ fn draw_browser(f: &mut Frame, app: &App, b: &Browser, area: Rect) {
         prompt.as_deref().or(b.info.as_deref()),
     );
     if let Mode::Branches { selected } = b.mode {
-        draw_branch_picker(f, b, selected);
+        draw_branch_picker(f, app, b, selected);
     }
 }
 
@@ -959,6 +1020,7 @@ fn draw_dir(f: &mut Frame, app: &App, b: &Browser, area: Rect, title: String) {
             ts.select(Some(b.selected));
             f.render_stateful_widget(table, area, &mut ts);
             b.list_offset.set(ts.offset());
+            list_zone(app, inner, ts.offset(), visible.len());
         }
     }
 }
@@ -969,9 +1031,10 @@ fn draw_message(f: &mut Frame, area: Rect, block: Block, text: String, color: Co
     f.render_widget(Paragraph::new(line).block(block), area);
 }
 
-fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
+fn draw_branch_picker(f: &mut Frame, app: &App, b: &Browser, selected: usize) {
     draw_branch_modal(
         f,
+        &app.zones,
         &b.branches,
         &b.branches_error,
         &b.reference,
@@ -983,6 +1046,7 @@ fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
 /// La liste des branches par-dessus la page (explorateur et historique) : `●` marque la courante.
 fn draw_branch_modal(
     f: &mut Frame,
+    zones: &Zones,
     branches: &Option<Vec<smithy_core::Branch>>,
     error: &Option<String>,
     current_name: &str,
@@ -1019,6 +1083,7 @@ fn draw_branch_modal(
             false,
         ),
     };
+    let len = if state { items.len() } else { 0 };
     let height = (items.len() as u16).clamp(1, 14) + 2;
     let area = centered(f.area(), 56, height);
     f.render_widget(Clear, area);
@@ -1036,6 +1101,7 @@ fn draw_branch_modal(
     }
     f.render_stateful_widget(list, area, &mut ls);
     offset.set(ls.offset());
+    picker_zone(zones, f.area(), area, ls.offset(), len);
 }
 
 fn history_help(width: usize) -> &'static str {
@@ -1180,6 +1246,7 @@ fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
         ts.select(Some(v.selected));
         f.render_stateful_widget(table, rows[0], &mut ts);
         v.list_offset.set(ts.offset());
+        list_zone(app, inner, ts.offset(), visible.len());
     }
     let first = if let Some(err) = app.error.as_ref().or(v.error.as_ref()) {
         Line::from(Span::styled(
@@ -1207,6 +1274,7 @@ fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
     if let Some(selected) = v.picker {
         draw_branch_modal(
             f,
+            &app.zones,
             &v.branches,
             &None,
             if v.reference.is_empty() {
@@ -1307,6 +1375,7 @@ fn draw_branch_list(f: &mut Frame, app: &App, v: &BranchesView, area: Rect) {
         ts.select(Some(v.selected));
         f.render_stateful_widget(table, rows[0], &mut ts);
         v.list_offset.set(ts.offset());
+        list_zone(app, inner, ts.offset(), visible.len());
     }
     let first = if let Some(err) = app.error.as_ref().or(v.error.as_ref()) {
         Line::from(Span::styled(
@@ -1469,6 +1538,7 @@ fn draw_pulls(f: &mut Frame, app: &App, v: &PullsView, area: Rect) {
         ts.select(Some(v.selected));
         f.render_stateful_widget(table, rows[0], &mut ts);
         v.list_offset.set(ts.offset());
+        list_zone(app, inner, ts.offset(), visible.len());
     }
     let first = if let Some(err) = app.error.as_ref().or(v.error.as_ref()) {
         Line::from(Span::styled(
@@ -1556,7 +1626,13 @@ fn draw_home(f: &mut Frame, app: &App, h: &HomeView, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
     // Les sections sont le titre du cadre, la courante en vidéo inverse.
     let mut title: Vec<Span> = Vec::new();
-    for s in Section::ALL {
+    // Les titres du cadre commencent après le coin.
+    let mut x = rows[0].x + 1;
+    for (n, s) in Section::ALL.into_iter().enumerate() {
+        let w = text_width(s.label()) as u16 + 2;
+        let cell = Rect::new(x, rows[0].y, w, 1).intersection(rows[0]);
+        app.zones.add(zone(cell), Target::Section(n));
+        x = x.saturating_add(w);
         let style = if s == h.section {
             Style::new()
                 .fg(Color::Yellow)
@@ -1676,6 +1752,7 @@ fn draw_home(f: &mut Frame, app: &App, h: &HomeView, area: Rect) {
             ts.select(Some(selected));
             f.render_stateful_widget(table, rows[0], &mut ts);
             h.list_offset.set(ts.offset());
+            list_zone(app, inner, ts.offset(), list.len());
         }
     }
 
@@ -1800,6 +1877,15 @@ fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
             Style::new().fg(Color::Red),
         )));
     }
+    // Les rubriques suivent la description, les faits et une ligne vide.
+    let inner = block.inner(rows[0]);
+    let items = Rect {
+        y: inner.y + 3,
+        height: inner.height.saturating_sub(3),
+        ..inner
+    };
+    app.zones
+        .rows(zone(items), 0, RepoView::ITEMS.len(), Target::Row);
     f.render_widget(Paragraph::new(lines).block(block), rows[0]);
     draw_footer(f, app, rows[1], repo_help(area.width as usize), None);
 }
@@ -1915,6 +2001,7 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
         ts.select(Some(r.selected));
         f.render_stateful_widget(table, rows[0], &mut ts);
         r.list_offset.set(ts.offset());
+        list_zone(app, inner, ts.offset(), visible.len());
     }
 
     let first = if r.editing {
@@ -4052,5 +4139,146 @@ mod tests {
         assert_eq!(fg("V"), Some(Color::Red), "ligne retirée");
         assert_eq!(fg("N"), Some(Color::Green), "ligne ajoutée");
         assert_eq!(fg("@"), Some(Color::Cyan), "en-tête de hunk");
+    }
+
+    /// Dessine l'application et renvoie la position (colonne, ligne) de la première occurrence
+    /// de `needle` à l'écran, en parcourant les lignes de haut en bas.
+    fn locate(app: &App, w: u16, h: u16, needle: &str) -> (u16, u16) {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| draw(f, app)).unwrap();
+        let buf = term.backend().buffer();
+        for y in 0..h {
+            for x in 0..w {
+                let rest: String = (x..w).map(|c| buf[(c, y)].symbol()).collect();
+                if rest.starts_with(needle) {
+                    return (x, y);
+                }
+            }
+        }
+        panic!("absent de l'écran : {needle}");
+    }
+
+    fn hit_on(app: &App, w: u16, h: u16, needle: &str) -> Option<Target> {
+        let (x, y) = locate(app, w, h, needle);
+        app.zones.hit(x, y)
+    }
+
+    #[test]
+    fn souris_accueil_lignes_sections_et_fil_d_ariane() {
+        let app = home_app(vec![info_full("a"), info_full("b"), info_full("c")]);
+        let (w, h) = (100, 14);
+        assert_eq!(hit_on(&app, w, h, "smithy/a"), Some(Target::Row(0)));
+        assert_eq!(hit_on(&app, w, h, "smithy/c"), Some(Target::Row(2)));
+        // Sous la dernière ligne : rien.
+        let (x, y) = locate(&app, w, h, "smithy/c");
+        assert_eq!(app.zones.hit(x, y + 1), None);
+        // L'en-tête du tableau n'est pas une ligne.
+        assert_eq!(hit_on(&app, w, h, "Mis à jour"), None);
+        assert_eq!(hit_on(&app, w, h, "Étoilés"), Some(Target::Section(2)));
+        assert_eq!(hit_on(&app, w, h, "maison"), Some(Target::Crumb(None)));
+        assert_eq!(hit_on(&app, w, h, "Accueil"), Some(Target::Crumb(Some(0))));
+    }
+
+    #[test]
+    fn souris_section_de_l_accueil_et_retour_par_le_fil_d_ariane() {
+        let mut app = home_app(vec![info_full("a")]);
+        app.home_section(2);
+        assert_eq!(app.home().unwrap().section, Section::Starred);
+        app.home_section(0);
+        assert_eq!(app.home().unwrap().section, Section::Mine);
+
+        app.home_enter();
+        app.repo_enter();
+        assert!(app.runs().is_some());
+        let (w, h) = (100, 14);
+        // Le dépôt est la 2e page de la pile : son segment y ramène.
+        assert_eq!(hit_on(&app, w, h, "smithy/a"), Some(Target::Crumb(Some(1))));
+        app.pop_to(1);
+        assert!(app.repo_page().is_some());
+        app.pop_to(0);
+        assert!(app.home().is_some());
+        app.pop_to(0);
+        assert_eq!(app.stack.len(), 1, "l'accueil reste");
+    }
+
+    #[test]
+    fn souris_rubriques_de_la_page_du_depot() {
+        let app = repo_app(info_full("demo"));
+        let (w, h) = (100, 16);
+        assert_eq!(hit_on(&app, w, h, "▸ CI"), Some(Target::Row(0)));
+        assert_eq!(hit_on(&app, w, h, "Code"), Some(Target::Row(1)));
+        assert_eq!(hit_on(&app, w, h, "Branches"), Some(Target::Row(3)));
+        assert_eq!(app.list_selected(), Some(0));
+    }
+
+    #[test]
+    fn souris_liste_defilee_vise_la_bonne_ligne() {
+        let pipelines = (1..=40)
+            .rev()
+            .map(|i| pipe(i, "ci.yml", Status::Success))
+            .collect();
+        let mut app = app_on_runs(pipelines);
+        let (w, h) = (120, 12);
+        render(&app, w, h);
+        app.list_move(30);
+        let selected = app.list_selected().unwrap();
+        let title = app
+            .runs()
+            .unwrap()
+            .selected_pipeline()
+            .unwrap()
+            .title
+            .clone();
+        assert_eq!(
+            hit_on(&app, w, h, &format!("{title} ")),
+            Some(Target::Row(selected))
+        );
+        // La ligne au-dessus est l'élément précédent, malgré le défilement.
+        let (x, y) = locate(&app, w, h, &format!("{title} "));
+        assert_eq!(app.zones.hit(x, y - 1), Some(Target::Row(selected - 1)));
+    }
+
+    #[test]
+    fn souris_onglets_et_liste_par_dessus_la_page() {
+        let mut app = home_app(vec![info_full("a")]);
+        app.open_in_new_tab();
+        let (w, h) = (100, 16);
+        // Deux onglets : « Accueil » puis le dépôt, affiché.
+        assert_eq!(hit_on(&app, w, h, "Accueil"), Some(Target::Tab(0)));
+        app.go_tab(0);
+        app.open_tab_picker();
+        let (_, y) = locate(&app, w, h, " 2. ");
+        let (x, _) = locate(&app, w, h, " 1. ");
+        assert_eq!(app.zones.hit(x + 2, y), Some(Target::PickerRow(1)));
+        assert_eq!(app.picker_selected(), Some(0));
+        app.picker_move(1);
+        assert_eq!(app.picker_selected(), Some(1));
+        // Autour de la liste : la fermer ; sur son cadre : rien.
+        assert_eq!(app.zones.hit(0, h - 1), Some(Target::Outside));
+        assert_eq!(hit_on(&app, w, h, "Onglets"), Some(Target::Overlay));
+    }
+
+    #[test]
+    fn souris_un_clic_sur_un_titre_de_section_le_deplie() {
+        let mut app = app_with_job(vec![
+            step("Preparation", Status::Success, 3),
+            step("Tests", Status::Failure, 2),
+        ]);
+        let (w, h) = (100, 14);
+        let Some(Target::TextRow(row)) = hit_on(&app, w, h, "▸ Preparation") else {
+            panic!("le titre de section n'est pas cliquable");
+        };
+        app.text_click(row);
+        assert!(render(&app, w, h).contains("Preparation-ligne-1"));
+        // Un clic sur une ligne de texte ne change rien.
+        let Some(Target::TextRow(row)) = hit_on(&app, w, h, "Preparation-ligne-2") else {
+            panic!("ligne de texte hors zone");
+        };
+        app.text_click(row);
+        assert!(render(&app, w, h).contains("Preparation-ligne-1"));
+        // Un formulaire par-dessus masque tout.
+        app.open_login("maison", "", false);
+        render(&app, w, h);
+        assert_eq!(app.zones.hit(0, h - 1), Some(Target::Overlay));
     }
 }

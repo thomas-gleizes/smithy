@@ -5,6 +5,7 @@ mod highlight;
 mod history;
 mod logview;
 mod markdown;
+mod mouse;
 mod pages;
 mod pulls;
 mod recent;
@@ -23,7 +24,9 @@ use std::{
 };
 
 use anyhow::Result;
-use crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use ratatui::DefaultTerminal;
 use smithy_core::{Error, Provider};
 use smithy_forgejo::Forgejo;
@@ -33,6 +36,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use app::{App, Msg};
 use browser::{Browser, FILE_LIMIT_BYTES, Screen};
 use config::{Server, ServerKind};
+use mouse::Target;
 use recent::RecentStore;
 use request::Request;
 use session::{Session, SessionStore};
@@ -54,9 +58,30 @@ async fn main() -> Result<()> {
     let store = SessionStore::default_location();
 
     let mut terminal = ratatui::init();
+    mouse_capture(true);
     let result = run(&mut terminal, cfg.servers.clone(), wanted, store, fresh).await;
+    mouse_capture(false);
     ratatui::restore();
     result
+}
+
+/// Souris et trackpad (clic, molette). Le terminal ne sélectionne alors plus le texte de
+/// lui-même : la plupart le permettent encore avec Maj (Option sur iTerm2 / Terminal.app).
+fn mouse_capture(on: bool) {
+    use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    let mut out = std::io::stdout();
+    if on {
+        let _ = crossterm::execute!(out, EnableMouseCapture);
+        // `ratatui::init` remet le terminal en état après un plantage, mais pas la souris : sans
+        // cela, le shell recevrait ensuite chaque mouvement sous forme de séquences.
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let _ = crossterm::execute!(std::io::stdout(), DisableMouseCapture);
+            previous(info);
+        }));
+    } else {
+        let _ = crossterm::execute!(out, DisableMouseCapture);
+    }
 }
 
 const USAGE: &str = "smithy : consulter la CI et le code de vos forges git dans le terminal
@@ -1042,6 +1067,222 @@ fn delete_server(
     Ok(())
 }
 
+/// Une touche, sur la page affichée ou la fenêtre ouverte par-dessus.
+fn on_key(
+    app: &mut App,
+    code: KeyCode,
+    ctrl: bool,
+    backends: &mut HashMap<String, Backend>,
+    store: Option<&SessionStore>,
+    tx: &UnboundedSender<(String, Msg)>,
+) {
+    if ctrl && code == KeyCode::Char('c') {
+        app.should_quit = true;
+    } else if let Some(form) = app.login.as_ref().map(|f| f.server.clone()) {
+        match code {
+            KeyCode::Esc => app.should_quit = app.login_escape(),
+            KeyCode::Enter => {
+                if let Some((user, pass)) = app.login_enter() {
+                    let b = &backends[&form];
+                    spawn_login(&b.server, tx, user, pass, b.known_token());
+                }
+            }
+            KeyCode::Tab | KeyCode::Up | KeyCode::Down => app.login_toggle_field(),
+            KeyCode::Backspace => app.login_backspace(),
+            KeyCode::Char(c) if !ctrl => app.login_type(c),
+            _ => {}
+        }
+    } else if app.server_form.is_some() {
+        match code {
+            KeyCode::Esc => app.should_quit = app.server_form_escape(),
+            KeyCode::Enter => {
+                if let Some(draft) = app.server_form_enter()
+                    && let Err(e) = save_server(app, backends, store, draft)
+                {
+                    app.server_form_fail(e);
+                }
+            }
+            KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
+                if app
+                    .server_form
+                    .as_ref()
+                    .is_some_and(|f| f.field == app::ServerField::Kind) =>
+            {
+                app.server_form_toggle_kind()
+            }
+            KeyCode::Tab | KeyCode::Down => app.server_form_move(1),
+            KeyCode::BackTab | KeyCode::Up => app.server_form_move(-1),
+            KeyCode::Backspace => app.server_form_backspace(),
+            KeyCode::Char(c) if !ctrl => app.server_form_type(c),
+            _ => {}
+        }
+    } else if app.server_picker.is_some() {
+        if app.server_delete.is_some() {
+            match code {
+                KeyCode::Char('y' | 'o') => {
+                    if let Some(name) = app.server_delete_confirm()
+                        && let Err(e) = delete_server(app, backends, store, &name)
+                    {
+                        app.server_note = Some(e);
+                    }
+                }
+                _ => app.server_delete_cancel(),
+            }
+        } else {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q' | 'S') => app.close_server_picker(),
+                KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => app.server_picker_move(1),
+                KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => app.server_picker_move(-1),
+                KeyCode::Char('a') => app.server_form_add(),
+                KeyCode::Char('e') => app.server_form_edit(),
+                KeyCode::Char('d') => app.server_delete_ask(),
+                KeyCode::Enter => {
+                    // Pas encore connecté : le login d'abord, la bascule ensuite.
+                    if let Some(name) = app.server_picker_choose() {
+                        ask_credentials(app, backends, &name, true);
+                    }
+                }
+                _ => {}
+            }
+        }
+    } else if app.tab_picker.is_some() {
+        tab_picker_key(app, code);
+    } else if code == KeyCode::Char('S') && !app.is_typing() {
+        app.open_server_picker();
+    } else if tab_key(app, code) {
+        // pris par les onglets
+    } else if app.text_prompt_active() {
+        text_prompt_key(app, code);
+    } else if app.home().is_some() {
+        home_key(app, code);
+    } else if app.repo_page().is_some() {
+        list_key(app, code, App::repo_enter);
+    } else if app.commits().is_some() {
+        commits_key(app, code);
+    } else if app.branch_list().is_some() {
+        branch_list_key(app, code);
+    } else if app.commit_view().is_some() {
+        commit_key(app, code);
+    } else if app.pulls().is_some() {
+        pulls_key(app, code);
+    } else if app.pull_view().is_some() {
+        // Comme un commit (sections, recherche), plus `e` : le code de la branche.
+        if code == KeyCode::Char('e') {
+            app.pull_code();
+        } else {
+            commit_key(app, code);
+        }
+    } else if app.runs().is_some() {
+        runs_key(app, code);
+    } else if app.logs().is_some() {
+        match code {
+            KeyCode::Esc => {
+                if !app.text_escape() {
+                    app.close_logs();
+                }
+            }
+            KeyCode::Char('q') | KeyCode::Backspace => app.close_logs(),
+            KeyCode::Char('/') => app.text_search_begin(),
+            KeyCode::Char('n') => app.text_search_step(1),
+            KeyCode::Char('N') => app.text_search_step(-1),
+            KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
+            KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
+            KeyCode::Char(' ') => app.text_toggle_section(),
+            KeyCode::Right => app.text_select_section(1),
+            KeyCode::Left => app.text_select_section(-1),
+            KeyCode::Char('a') => app.text_toggle_all(),
+            KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
+            KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
+            KeyCode::Char('g') | KeyCode::Home => app.text_top(),
+            KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
+            KeyCode::Char('w') => app.text_toggle_wrap(),
+            KeyCode::Char('r') => app.refetch_logs(),
+            _ => {}
+        }
+    } else if app.browser().is_some() {
+        browser_key(app, code);
+    }
+}
+
+/// Lignes défilées par un cran de molette dans un volet de texte.
+const WHEEL_LINES: isize = 3;
+
+/// Souris et trackpad : la molette fait défiler, un clic choisit ce qui est sous le pointeur
+/// (les zones viennent du rendu, voir `mouse`). Un clic sur la ligne déjà sélectionnée l'ouvre,
+/// comme `Entrée` : un double-clic revient donc au même.
+fn on_mouse(
+    app: &mut App,
+    m: MouseEvent,
+    backends: &mut HashMap<String, Backend>,
+    store: Option<&SessionStore>,
+    tx: &UnboundedSender<(String, Msg)>,
+) {
+    // Les formulaires se remplissent au clavier.
+    if app.login.is_some() || app.server_form.is_some() {
+        return;
+    }
+    let delta = match m.kind {
+        MouseEventKind::ScrollDown => 1,
+        MouseEventKind::ScrollUp => -1,
+        MouseEventKind::Down(MouseButton::Left) => {
+            if let Some(target) = app.zones.hit(m.column, m.row) {
+                click(app, target, backends, store, tx);
+            }
+            return;
+        }
+        _ => return,
+    };
+    if app.picker_selected().is_some() {
+        app.picker_move(delta);
+    } else if app.list_selected().is_some() {
+        app.list_move(delta);
+    } else {
+        app.text_scroll(delta * WHEEL_LINES);
+    }
+}
+
+fn click(
+    app: &mut App,
+    target: Target,
+    backends: &mut HashMap<String, Backend>,
+    store: Option<&SessionStore>,
+    tx: &UnboundedSender<(String, Msg)>,
+) {
+    // Une suppression attend sa confirmation : comme au clavier, autre chose l'annule.
+    if app.server_delete.is_some() {
+        app.server_delete_cancel();
+        return;
+    }
+    let typing = app.is_typing();
+    match target {
+        Target::Tab(i) => app.go_tab(i),
+        Target::Section(i) if !typing => app.home_section(i),
+        Target::Crumb(None) if !typing => app.open_server_picker(),
+        Target::Crumb(Some(page)) => app.pop_to(page),
+        Target::Row(i) if !typing => {
+            if let Some(current) = app.list_selected() {
+                if current == i {
+                    on_key(app, KeyCode::Enter, false, backends, store, tx);
+                } else {
+                    app.list_move(i as isize - current as isize);
+                }
+            }
+        }
+        Target::PickerRow(i) => {
+            if let Some(current) = app.picker_selected() {
+                if current == i {
+                    on_key(app, KeyCode::Enter, false, backends, store, tx);
+                } else {
+                    app.picker_move(i as isize - current as isize);
+                }
+            }
+        }
+        Target::TextRow(row) if !typing => app.text_click(row),
+        Target::Outside => on_key(app, KeyCode::Esc, false, backends, store, tx),
+        _ => {}
+    }
+}
+
 async fn run(
     terminal: &mut DefaultTerminal,
     servers: Vec<Server>,
@@ -1123,142 +1364,14 @@ async fn run(
     while !app.should_quit {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if event::poll(TICK)?
-            && let Event::Key(k) = event::read()?
-            && k.kind == KeyEventKind::Press
-        {
-            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-            if ctrl && k.code == KeyCode::Char('c') {
-                app.should_quit = true;
-            } else if let Some(form) = app.login.as_ref().map(|f| f.server.clone()) {
-                match k.code {
-                    KeyCode::Esc => app.should_quit = app.login_escape(),
-                    KeyCode::Enter => {
-                        if let Some((user, pass)) = app.login_enter() {
-                            let b = &backends[&form];
-                            spawn_login(&b.server, &tx, user, pass, b.known_token());
-                        }
-                    }
-                    KeyCode::Tab | KeyCode::Up | KeyCode::Down => app.login_toggle_field(),
-                    KeyCode::Backspace => app.login_backspace(),
-                    KeyCode::Char(c) if !ctrl => app.login_type(c),
-                    _ => {}
+        if event::poll(TICK)? {
+            match event::read()? {
+                Event::Key(k) if k.kind == KeyEventKind::Press => {
+                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+                    on_key(&mut app, k.code, ctrl, &mut backends, store.as_ref(), &tx);
                 }
-            } else if app.server_form.is_some() {
-                match k.code {
-                    KeyCode::Esc => app.should_quit = app.server_form_escape(),
-                    KeyCode::Enter => {
-                        if let Some(draft) = app.server_form_enter()
-                            && let Err(e) =
-                                save_server(&mut app, &mut backends, store.as_ref(), draft)
-                        {
-                            app.server_form_fail(e);
-                        }
-                    }
-                    KeyCode::Left | KeyCode::Right | KeyCode::Char(' ')
-                        if app
-                            .server_form
-                            .as_ref()
-                            .is_some_and(|f| f.field == app::ServerField::Kind) =>
-                    {
-                        app.server_form_toggle_kind()
-                    }
-                    KeyCode::Tab | KeyCode::Down => app.server_form_move(1),
-                    KeyCode::BackTab | KeyCode::Up => app.server_form_move(-1),
-                    KeyCode::Backspace => app.server_form_backspace(),
-                    KeyCode::Char(c) if !ctrl => app.server_form_type(c),
-                    _ => {}
-                }
-            } else if app.server_picker.is_some() {
-                if app.server_delete.is_some() {
-                    match k.code {
-                        KeyCode::Char('y' | 'o') => {
-                            if let Some(name) = app.server_delete_confirm()
-                                && let Err(e) =
-                                    delete_server(&mut app, &mut backends, store.as_ref(), &name)
-                            {
-                                app.server_note = Some(e);
-                            }
-                        }
-                        _ => app.server_delete_cancel(),
-                    }
-                } else {
-                    match k.code {
-                        KeyCode::Esc | KeyCode::Char('q' | 'S') => app.close_server_picker(),
-                        KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
-                            app.server_picker_move(1)
-                        }
-                        KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
-                            app.server_picker_move(-1)
-                        }
-                        KeyCode::Char('a') => app.server_form_add(),
-                        KeyCode::Char('e') => app.server_form_edit(),
-                        KeyCode::Char('d') => app.server_delete_ask(),
-                        KeyCode::Enter => {
-                            // Pas encore connecté : le login d'abord, la bascule ensuite.
-                            if let Some(name) = app.server_picker_choose() {
-                                ask_credentials(&mut app, &backends, &name, true);
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else if app.tab_picker.is_some() {
-                tab_picker_key(&mut app, k.code);
-            } else if k.code == KeyCode::Char('S') && !app.is_typing() {
-                app.open_server_picker();
-            } else if tab_key(&mut app, k.code) {
-                // pris par les onglets
-            } else if app.text_prompt_active() {
-                text_prompt_key(&mut app, k.code);
-            } else if app.home().is_some() {
-                home_key(&mut app, k.code);
-            } else if app.repo_page().is_some() {
-                list_key(&mut app, k.code, App::repo_enter);
-            } else if app.commits().is_some() {
-                commits_key(&mut app, k.code);
-            } else if app.branch_list().is_some() {
-                branch_list_key(&mut app, k.code);
-            } else if app.commit_view().is_some() {
-                commit_key(&mut app, k.code);
-            } else if app.pulls().is_some() {
-                pulls_key(&mut app, k.code);
-            } else if app.pull_view().is_some() {
-                // Comme un commit (sections, recherche), plus `e` : le code de la branche.
-                if k.code == KeyCode::Char('e') {
-                    app.pull_code();
-                } else {
-                    commit_key(&mut app, k.code);
-                }
-            } else if app.runs().is_some() {
-                runs_key(&mut app, k.code);
-            } else if app.logs().is_some() {
-                match k.code {
-                    KeyCode::Esc => {
-                        if !app.text_escape() {
-                            app.close_logs();
-                        }
-                    }
-                    KeyCode::Char('q') | KeyCode::Backspace => app.close_logs(),
-                    KeyCode::Char('/') => app.text_search_begin(),
-                    KeyCode::Char('n') => app.text_search_step(1),
-                    KeyCode::Char('N') => app.text_search_step(-1),
-                    KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
-                    KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
-                    KeyCode::Char(' ') => app.text_toggle_section(),
-                    KeyCode::Right => app.text_select_section(1),
-                    KeyCode::Left => app.text_select_section(-1),
-                    KeyCode::Char('a') => app.text_toggle_all(),
-                    KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
-                    KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
-                    KeyCode::Char('g') | KeyCode::Home => app.text_top(),
-                    KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
-                    KeyCode::Char('w') => app.text_toggle_wrap(),
-                    KeyCode::Char('r') => app.refetch_logs(),
-                    _ => {}
-                }
-            } else if app.browser().is_some() {
-                browser_key(&mut app, k.code);
+                Event::Mouse(m) => on_mouse(&mut app, m, &mut backends, store.as_ref(), &tx),
+                _ => {}
             }
         }
 

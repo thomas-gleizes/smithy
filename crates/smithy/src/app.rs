@@ -279,6 +279,8 @@ pub struct App {
     /// Hauteur et largeur utiles de la page, écrites par le rendu qui seul les connaît.
     pub viewport: Cell<usize>,
     pub viewport_width: Cell<usize>,
+    /// Zones cliquables de l'image affichée, déposées par le rendu (souris).
+    pub zones: crate::mouse::Zones,
     /// Dépôts ouverts récemment (tous serveurs) ; à sauvegarder quand `recents_dirty`.
     pub recents: Vec<RecentEntry>,
     pub recents_dirty: bool,
@@ -320,6 +322,7 @@ impl App {
             logs_wrap: false,
             viewport: Cell::new(20),
             viewport_width: Cell::new(80),
+            zones: crate::mouse::Zones::default(),
             recents: Vec::new(),
             recents_dirty: false,
             pending,
@@ -452,28 +455,44 @@ impl App {
 
     /// Où l'on est, du serveur à la page affichée : chaque page ajoute son segment.
     /// `maison › Accueil › smithy/demo › CI › fail.yml › test`.
+    #[cfg(test)]
     pub fn breadcrumb(&self) -> Vec<String> {
+        self.breadcrumb_pages()
+            .into_iter()
+            .map(|(s, _)| s)
+            .collect()
+    }
+
+    /// Le fil d'Ariane, chaque segment avec la position dans la pile de la page qui l'a
+    /// ajouté (`None` pour le serveur) : un clic sur un segment y revient.
+    pub fn breadcrumb_pages(&self) -> Vec<(String, Option<usize>)> {
         let server = if self.server_name.is_empty() {
             "smithy"
         } else {
             &self.server_name
         };
-        let mut out = vec![server.to_owned()];
-        for page in &self.stack {
-            match page {
-                Page::Home(_) => out.push("Accueil".to_owned()),
-                Page::Repo(r) => out.push(r.info.repo.full_name()),
-                Page::Runs(_) => out.push("CI".to_owned()),
-                Page::Logs(v) => out.extend([v.pipeline.workflow.clone(), v.pipeline.job.clone()]),
-                Page::Browser(b) => out.extend(b.breadcrumb()),
-                Page::Commits(v) => out.extend(["Commits".to_owned(), v.branch_label()]),
-                Page::Branches(_) => out.push("Branches".to_owned()),
-                Page::Commit(v) => out.push(v.sha[..v.sha.len().min(7)].to_owned()),
-                Page::Pulls(_) => out.push("PR".to_owned()),
-                Page::Pull(v) => out.push(format!("#{}", v.number)),
-            }
+        let mut out = vec![(server.to_owned(), None)];
+        for (i, page) in self.stack.iter().enumerate() {
+            let parts = match page {
+                Page::Home(_) => vec!["Accueil".to_owned()],
+                Page::Repo(r) => vec![r.info.repo.full_name()],
+                Page::Runs(_) => vec!["CI".to_owned()],
+                Page::Logs(v) => vec![v.pipeline.workflow.clone(), v.pipeline.job.clone()],
+                Page::Browser(b) => b.breadcrumb(),
+                Page::Commits(v) => vec!["Commits".to_owned(), v.branch_label()],
+                Page::Branches(_) => vec!["Branches".to_owned()],
+                Page::Commit(v) => vec![v.sha[..v.sha.len().min(7)].to_owned()],
+                Page::Pulls(_) => vec!["PR".to_owned()],
+                Page::Pull(v) => vec![format!("#{}", v.number)],
+            };
+            out.extend(parts.into_iter().map(|p| (p, Some(i))));
         }
         out
+    }
+
+    /// Revient à la page `i` de la pile (clic sur le fil d'Ariane), comme autant d'`Échap`.
+    pub fn pop_to(&mut self, i: usize) {
+        while self.stack.len() > i + 1 && self.pop() {}
     }
 
     /// Dépile la page affichée ; l'accueil ne se dépile jamais. Renvoie `true` si une page est partie.
@@ -589,6 +608,76 @@ impl App {
     pub fn home_switch(&mut self, delta: isize) {
         if let Some(r) = self.home_mut().and_then(|h| h.switch(delta)) {
             self.queue(r);
+        }
+    }
+
+    /// Clic sur le titre d'une section de l'accueil (indice dans `Section::ALL`).
+    pub fn home_section(&mut self, i: usize) {
+        if let Some(current) = self.home().map(|h| h.section.index())
+            && current != i
+        {
+            self.home_switch(i as isize - current as isize);
+        }
+    }
+
+    // --- souris
+
+    /// Ligne sélectionnée de la liste de la page (celle que `list_move` déplace).
+    pub fn list_selected(&self) -> Option<usize> {
+        match self.stack.last()? {
+            Page::Home(h) => Some(h.selected(self.home_rows().len())),
+            Page::Repo(r) => Some(r.selected),
+            Page::Runs(r) => Some(r.selected),
+            Page::Browser(b) if matches!(b.mode, Mode::Dir) => Some(b.selected),
+            Page::Commits(v) => Some(v.selected),
+            Page::Branches(v) => Some(v.selected),
+            Page::Pulls(v) => Some(v.selected),
+            _ => None,
+        }
+    }
+
+    /// Ligne choisie dans la liste ouverte par-dessus la page (serveurs, onglets, branches),
+    /// dans l'ordre où le clavier les sert.
+    pub fn picker_selected(&self) -> Option<usize> {
+        if self.server_picker.is_some() {
+            return self.server_picker;
+        }
+        if self.tab_picker.is_some() {
+            return self.tab_picker;
+        }
+        match self.stack.last()? {
+            Page::Browser(b) => match &b.mode {
+                Mode::Branches { selected } => Some(*selected),
+                _ => None,
+            },
+            Page::Commits(v) => v.picker,
+            _ => None,
+        }
+    }
+
+    /// Déplace la sélection de la liste ouverte par-dessus la page.
+    pub fn picker_move(&mut self, delta: isize) {
+        if self.server_picker.is_some() {
+            self.server_picker_move(delta);
+        } else if self.tab_picker.is_some() {
+            self.tab_picker_move(delta);
+        } else {
+            match self.stack.last_mut() {
+                Some(Page::Browser(b)) if matches!(b.mode, Mode::Branches { .. }) => {
+                    b.move_selection(delta);
+                }
+                Some(Page::Commits(v)) if v.picker.is_some() => v.picker_move(delta),
+                _ => {}
+            }
+        }
+    }
+
+    /// Clic sur la ligne d'écran `row` d'un volet de texte : un titre de section se plie
+    /// ou se déplie.
+    pub fn text_click(&mut self, row: usize) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.active_text_mut() {
+            v.click_row(row, w, h);
         }
     }
 
