@@ -93,11 +93,46 @@ def main():
         })
         print(f"{len(code)} fichiers de code/markdown créés dans tree")
 
+    # --- historique : une branche `history` avec 60 commits (au-delà d'une page de 50), un message
+    # sur plusieurs lignes, de l'unicode, un commit qui ajoute + modifie + supprime, un fichier
+    # binaire. Sur une branche à part : la racine de `main` ne bouge pas. Les fusions ne sont pas
+    # créables par l'API : non couvertes. Idempotent.
+    def seed_history():
+        if call("GET", f"/repos/{user}/tree/branches/history", ok=(200, 404))[0] == 200:
+            return
+        call("POST", f"/repos/{user}/tree/branches", {"new_branch_name": "history", "old_branch_name": "main"})
+        path = f"/repos/{user}/tree/contents"
+
+        def blob_sha(p):
+            return call("GET", f"{path}/{p}?ref=history")[1]["sha"]
+
+        def commit(message, files):
+            call("POST", path, {"message": message, "branch": "history", "files": files})
+
+        commit("docs: premier historique\n\nCorps du message sur plusieurs lignes,\navec une seconde ligne.\n\n- puce un\n- puce deux",
+               [{"operation": "create", "path": "history/log.txt", "content": b64(b"ligne 0\n")},
+                {"operation": "create", "path": "history/old.txt", "content": b64(b"a supprimer\n")}])
+        for i in range(1, 56):
+            msg = f"chore: mise à jour {i:02d}" if i != 7 else "fix: accents é à ü, 日本語 et ✔ dans un message"
+            body = "".join(f"ligne {k}\n" for k in range(i + 1)).encode()
+            commit(msg, [{"operation": "update", "path": "history/log.txt", "sha": blob_sha("history/log.txt"), "content": b64(body)}])
+        # ajoute + modifie + supprime en un seul commit
+        commit("refactor: ajoute, modifie et supprime",
+               [{"operation": "create", "path": "history/new.txt", "content": b64(b"nouveau fichier\n")},
+                {"operation": "update", "path": "history/log.txt", "sha": blob_sha("history/log.txt"), "content": b64(b"remplace\n")},
+                {"operation": "delete", "path": "history/old.txt", "sha": blob_sha("history/old.txt")}])
+        # fichier binaire, puis sa modification
+        commit("feat: ajoute un binaire", [{"operation": "create", "path": "history/data.bin", "content": b64(bytes(range(256)))}])
+        commit("fix: modifie le binaire", [{"operation": "update", "path": "history/data.bin", "sha": blob_sha("history/data.bin"), "content": b64(bytes(range(255, -1, -1)))}])
+        commit("feat: ajoute\nun message dont la première ligne est courte", [{"operation": "create", "path": "history/last.txt", "content": b64(b"fin\n")}])
+        print("branche history créée (60 commits)")
+
     b64 = lambda b: base64.b64encode(b).decode()
     # Idempotence : le dépôt est complet quand le dernier fichier de la liste est là.
     if call("GET", f"/repos/{user}/tree/contents/big.txt?ref=main", ok=(200, 404))[0] == 200:
         star()
         seed_code()
+        seed_history()
         print("dépôt tree déjà présent")
         return
     if not exists("tree"):
@@ -140,6 +175,7 @@ def main():
     print("branches créées : main, feature/x, b00..b59")
     star()
     seed_code()
+    seed_history()
 
 
 main()

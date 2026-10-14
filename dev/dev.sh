@@ -6,6 +6,7 @@
 #   ./dev.sh env     affiche SMITHY_URL / SMITHY_TOKEN
 #   ./dev.sh probe   seed + sonde des routes de logs (voir probe-logs.py), JSON sur stdout
 #   ./dev.sh probe-browse  seed + sonde de l'API de contenu de l'explorateur (probe-browse.py)
+#   ./dev.sh probe-history seed + sonde de l'API d'historique (commits, branches : probe-history.py)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -155,8 +156,10 @@ case "${1:-up}" in
   wait) wait_runs ;;
   probe-browse) seed >/dev/null && set -a && . "./$ENV_FILE" && set +a &&
          python3 -I ./probe-browse.py "$SMITHY_URL" "$SMITHY_TOKEN" ;;
+  probe-history) seed >/dev/null && set -a && . "./$ENV_FILE" && set +a &&
+         python3 -I ./probe-history.py "$SMITHY_URL" "$SMITHY_TOKEN" ;;
   probe) seed >/dev/null && wait_runs && set -a && . "./$ENV_FILE" && set +a &&
          python3 -I ./probe-logs.py "$SMITHY_URL" "$USER_NAME" "$USER_PASS" "$SMITHY_TOKEN" ;;
   env) cat "$ENV_FILE" ;;
-  *) echo "usage: $0 up|seed|reset|env|wait|probe|probe-browse" >&2; exit 2 ;;
+  *) echo "usage: $0 up|seed|reset|env|wait|probe|probe-browse|probe-history" >&2; exit 2 ;;
 esac
