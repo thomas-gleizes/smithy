@@ -13,6 +13,7 @@ use crate::{
     app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
     highlight::{self, Tok},
+    history::{BranchesView, CommitView, CommitsView},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
     textsearch::{self, Hit},
@@ -50,6 +51,12 @@ pub fn draw(f: &mut Frame, app: &App) {
         draw_logs(f, app, view, body);
     } else if let Some(b) = app.browser() {
         draw_browser(f, app, b, body);
+    } else if let Some(v) = app.commit_view() {
+        draw_commit(f, app, v, body);
+    } else if let Some(v) = app.commits() {
+        draw_commits(f, app, v, body);
+    } else if let Some(v) = app.branch_list() {
+        draw_branch_list(f, app, v, body);
     } else if let Some(r) = app.runs() {
         draw_runs(f, app, r, body);
     } else if let Some(r) = app.repo_page() {
@@ -498,6 +505,10 @@ fn tok_style(tok: Tok) -> Style {
         Tok::Strike => Style::new().add_modifier(Modifier::CROSSED_OUT),
         Tok::Link => fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
         Tok::Code => fg(Color::Green),
+        Tok::Added => fg(Color::Green),
+        Tok::Removed => fg(Color::Red),
+        Tok::Hunk => fg(Color::Cyan),
+        Tok::Meta => fg(Color::DarkGray),
     }
 }
 
@@ -923,11 +934,34 @@ fn draw_message(f: &mut Frame, area: Rect, block: Block, text: String, color: Co
 }
 
 fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
-    let (items, state): (Vec<ListItem>, bool) = match (&b.branches, &b.branches_error) {
+    draw_branch_modal(
+        f,
+        &b.branches,
+        &b.branches_error,
+        &b.reference,
+        &b.picker_offset,
+        selected,
+    );
+}
+
+/// La liste des branches par-dessus la page (explorateur et historique) : `●` marque la courante.
+fn draw_branch_modal(
+    f: &mut Frame,
+    branches: &Option<Vec<smithy_core::Branch>>,
+    error: &Option<String>,
+    current_name: &str,
+    offset: &std::cell::Cell<usize>,
+    selected: usize,
+) {
+    let (items, state): (Vec<ListItem>, bool) = match (branches, error) {
         (Some(list), _) => (
             list.iter()
                 .map(|br| {
-                    let current = if br.name == b.reference { "● " } else { "  " };
+                    let current = if br.name == current_name {
+                        "● "
+                    } else {
+                        "  "
+                    };
                     let default = if br.default { " (défaut)" } else { "" };
                     ListItem::new(format!("{current}{}{default}", br.name))
                 })
@@ -960,12 +994,314 @@ fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
                 .border_style(Style::new().fg(Color::Yellow)),
         )
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
-    let mut ls = ListState::default().with_offset(b.picker_offset.get());
+    let mut ls = ListState::default().with_offset(offset.get());
     if state {
         ls.select(Some(selected));
     }
     f.render_stateful_widget(list, area, &mut ls);
-    b.picker_offset.set(ls.offset());
+    offset.set(ls.offset());
+}
+
+fn history_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ naviguer · ↵/→ le commit · / filtrer · B branche · t onglet · r actualiser · ←/Échap retour",
+            "j/k · ↵ commit · / filtrer · B branche · ← retour",
+            "↵ · / · B · ←",
+            "Échap",
+        ],
+    )
+}
+
+fn branch_list_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ naviguer · ↵/→ historique · e code · / filtrer · t onglet · r actualiser · ←/Échap retour",
+            "j/k · ↵ historique · e code · / filtrer · ← retour",
+            "↵ · e · / · ←",
+            "Échap",
+        ],
+    )
+}
+
+fn commit_help(width: usize) -> &'static str {
+    pick_help(
+        width,
+        &[
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ fichier · Espace plier · a tout · / chercher · n/N · w repli · r actualiser · Esc retour",
+            "j/k défiler · ←/→ fichier · Espace plier · / chercher · w repli · Esc retour",
+            "←/→ · Espace · / · w · Esc",
+            "Esc",
+        ],
+    )
+}
+
+/// Pied de page d'une liste filtrable : la saisie du filtre, sinon l'erreur ou le message, sinon
+/// l'aide.
+fn list_footer(
+    f: &mut Frame,
+    app: &App,
+    area: Rect,
+    first: Line<'static>,
+    editing: Option<&str>,
+    help: &'static str,
+) {
+    let first = match editing {
+        Some(text) => Line::from(Span::styled(
+            format!("filtrer : {text}▏"),
+            Style::new().fg(Color::Yellow),
+        )),
+        None => first,
+    };
+    let help = if editing.is_some() {
+        "Entrée valider · Échap annuler"
+    } else {
+        help
+    };
+    let _ = app;
+    let help = Line::from(Span::styled(help, Style::new().fg(Color::DarkGray)));
+    f.render_widget(Paragraph::new(vec![first, help]), area);
+}
+
+fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let mut title = format!(" Commits · {}", v.branch_label());
+    if v.filter.active() {
+        title.push_str(&format!(" · « {} »", v.filter.text.trim()));
+    }
+    title.push(' ');
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(rows[0]);
+    app.viewport.set((inner.height as usize).saturating_sub(1));
+    let visible = v.visible();
+    if visible.is_empty() {
+        let (text, color) = if let Some(e) = &v.error {
+            (format!("erreur : {e}"), Color::Red)
+        } else if v.loading {
+            ("chargement…".to_owned(), Color::Cyan)
+        } else if v.commits.is_empty() {
+            ("(aucun commit)".to_owned(), Color::DarkGray)
+        } else {
+            (
+                "(aucun commit ne correspond au filtre · Échap l'efface)".to_owned(),
+                Color::DarkGray,
+            )
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::new().fg(color)))).block(block),
+            rows[0],
+        );
+    } else {
+        let now = timeago::now_epoch();
+        let table_rows: Vec<Row> = visible
+            .iter()
+            .map(|c| {
+                Row::new(vec![
+                    Cell::from(Span::styled(
+                        c.short_sha().to_owned(),
+                        Style::new().fg(Color::Yellow),
+                    )),
+                    Cell::from(
+                        c.date
+                            .as_deref()
+                            .map(|d| timeago::ago_rfc3339(now, d))
+                            .unwrap_or_default(),
+                    ),
+                    Cell::from(c.author.clone()),
+                    Cell::from(c.summary().to_owned()),
+                ])
+            })
+            .collect();
+        let more = if v.has_more { "+" } else { "" };
+        let counter = if v.filter.active() {
+            format!(
+                " {}/{} (sur {}{more} chargés) ",
+                v.selected + 1,
+                visible.len(),
+                v.commits.len()
+            )
+        } else {
+            format!(" {}/{}{more} ", v.selected + 1, visible.len())
+        };
+        let table = Table::new(
+            table_rows,
+            [
+                Constraint::Length(8),
+                Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Min(10),
+            ],
+        )
+        .header(Row::new(["Commit", "Date", "Auteur", "Message"]).style(Style::new().bold()))
+        .block(block.title_bottom(Line::from(counter).right_aligned()))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut ts = TableState::default().with_offset(v.list_offset.get());
+        ts.select(Some(v.selected));
+        f.render_stateful_widget(table, rows[0], &mut ts);
+        v.list_offset.set(ts.offset());
+    }
+    let first = if let Some(err) = app.error.as_ref().or(v.error.as_ref()) {
+        Line::from(Span::styled(
+            format!("erreur : {err}"),
+            Style::new().fg(Color::Red),
+        ))
+    } else if v.loading && !v.commits.is_empty() {
+        Line::from(Span::styled(
+            "chargement de la suite…",
+            Style::new().fg(Color::Cyan),
+        ))
+    } else if let Some(url) = v.selected_commit().and_then(|c| c.url.clone()) {
+        Line::from(format!("commit : {url}"))
+    } else {
+        Line::from("")
+    };
+    list_footer(
+        f,
+        app,
+        rows[1],
+        first,
+        v.filter.editing.then_some(v.filter.text.as_str()),
+        history_help(area.width as usize),
+    );
+    if let Some(selected) = v.picker {
+        draw_branch_modal(
+            f,
+            &v.branches,
+            &None,
+            if v.reference.is_empty() {
+                v.default_branch.as_deref().unwrap_or("")
+            } else {
+                &v.reference
+            },
+            &v.picker_offset,
+            selected,
+        );
+    }
+}
+
+fn draw_branch_list(f: &mut Frame, app: &App, v: &BranchesView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    let mut title = String::from(" Branches");
+    if v.filter.active() {
+        title.push_str(&format!(" · « {} »", v.filter.text.trim()));
+    }
+    title.push(' ');
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .border_style(Style::new().fg(Color::Yellow));
+    let inner = block.inner(rows[0]);
+    app.viewport.set((inner.height as usize).saturating_sub(1));
+    let visible = v.visible();
+    if visible.is_empty() {
+        let (text, color) = match (&v.branches, &v.error) {
+            (_, Some(e)) if v.branches.is_none() => (format!("erreur : {e}"), Color::Red),
+            (None, _) => ("chargement…".to_owned(), Color::Cyan),
+            (Some(b), _) if b.is_empty() => ("(aucune branche)".to_owned(), Color::DarkGray),
+            _ => (
+                "(aucune branche ne correspond au filtre · Échap l'efface)".to_owned(),
+                Color::DarkGray,
+            ),
+        };
+        f.render_widget(
+            Paragraph::new(Line::from(Span::styled(text, Style::new().fg(color)))).block(block),
+            rows[0],
+        );
+    } else {
+        let now = timeago::now_epoch();
+        let table_rows: Vec<Row> = visible
+            .iter()
+            .map(|b| {
+                let mut name = vec![
+                    Span::raw(if b.default { "● " } else { "  " }),
+                    Span::raw(b.name.clone()),
+                ];
+                if b.protected {
+                    name.push(Span::styled(
+                        " [protégée]",
+                        Style::new().fg(Color::DarkGray),
+                    ));
+                }
+                let head = b.head.as_ref();
+                Row::new(vec![
+                    Cell::from(Line::from(name)),
+                    Cell::from(Span::styled(
+                        head.map_or(String::new(), |h| h.sha.chars().take(7).collect()),
+                        Style::new().fg(Color::Yellow),
+                    )),
+                    Cell::from(
+                        head.and_then(|h| h.date.as_deref())
+                            .map(|d| timeago::ago_rfc3339(now, d))
+                            .unwrap_or_default(),
+                    ),
+                    Cell::from(head.map_or(String::new(), |h| h.author.clone())),
+                    Cell::from(head.map_or(String::new(), |h| {
+                        h.message.lines().next().unwrap_or("").trim().to_owned()
+                    })),
+                ])
+            })
+            .collect();
+        let total = v.branches.as_ref().map_or(0, Vec::len);
+        let counter = if v.filter.active() {
+            format!(" {}/{} (sur {total}) ", v.selected + 1, visible.len())
+        } else {
+            format!(" {}/{} ", v.selected + 1, visible.len())
+        };
+        let table = Table::new(
+            table_rows,
+            [
+                Constraint::Length(28),
+                Constraint::Length(8),
+                Constraint::Length(14),
+                Constraint::Length(14),
+                Constraint::Min(10),
+            ],
+        )
+        .header(
+            Row::new(["Branche", "Commit", "Date", "Auteur", "Message"]).style(Style::new().bold()),
+        )
+        .block(block.title_bottom(Line::from(counter).right_aligned()))
+        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut ts = TableState::default().with_offset(v.list_offset.get());
+        ts.select(Some(v.selected));
+        f.render_stateful_widget(table, rows[0], &mut ts);
+        v.list_offset.set(ts.offset());
+    }
+    let first = if let Some(err) = app.error.as_ref().or(v.error.as_ref()) {
+        Line::from(Span::styled(
+            format!("erreur : {err}"),
+            Style::new().fg(Color::Red),
+        ))
+    } else {
+        Line::from("")
+    };
+    list_footer(
+        f,
+        app,
+        rows[1],
+        first,
+        v.filter.editing.then_some(v.filter.text.as_str()),
+        branch_list_help(area.width as usize),
+    );
+}
+
+fn draw_commit(f: &mut Frame, app: &App, v: &CommitView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let title = Line::from(format!(" {} ", v.summary));
+    draw_text_pane(f, app, rows[0], title, &v.text);
+    let search = search_line(&v.text);
+    draw_footer(
+        f,
+        app,
+        rows[1],
+        commit_help(area.width as usize),
+        search.as_deref(),
+    );
 }
 
 fn tag(text: &str) -> Span<'static> {
@@ -1194,6 +1530,16 @@ fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
             }
         } else if i.empty {
             vec![Span::styled("dépôt vide", dim)]
+        } else if n == 2 {
+            vec![Span::styled(
+                format!("historique de {}", i.default_branch),
+                dim,
+            )]
+        } else if n == 3 {
+            vec![Span::styled(
+                "toutes les branches, avec leur dernier commit",
+                dim,
+            )]
         } else {
             vec![Span::styled(format!("branche {}", i.default_branch), dim)]
         };
@@ -1204,7 +1550,7 @@ fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
             Style::new().bold()
         };
         let mut spans = vec![
-            Span::styled(format!("{marker}{name:<6}"), style),
+            Span::styled(format!("{marker}{name:<9}"), style),
             Span::raw("  "),
         ];
         spans.extend(summary);
@@ -1670,14 +2016,8 @@ mod tests {
         b.on_branches(
             &tree_repo(),
             Ok(vec![
-                Branch {
-                    name: "main".into(),
-                    default: true,
-                },
-                Branch {
-                    name: "feature/x".into(),
-                    default: false,
-                },
+                Branch::new("main", true),
+                Branch::new("feature/x", false),
             ]),
         );
         b.on_dir(&tree_repo(), "main", path, Ok(entries));
@@ -2967,13 +3307,7 @@ mod tests {
             name: "r".into(),
         };
         let mut b = Browser::open(repo.clone());
-        b.on_branches(
-            &repo,
-            Ok(vec![smithy_core::Branch {
-                name: "main".into(),
-                default: true,
-            }]),
-        );
+        b.on_branches(&repo, Ok(vec![smithy_core::Branch::new("main", true)]));
         let e = |n: &str, k| smithy_core::Entry {
             name: n.into(),
             path: n.into(),
@@ -3019,5 +3353,245 @@ mod tests {
         app.browser_mut().unwrap().clear_filter();
         let text = render(&app, 110, 12);
         assert!(text.contains("notes.md") && text.contains("1/3"), "{text}");
+    }
+
+    // --- historique
+
+    fn commit_n(n: usize, msg: &str) -> smithy_core::Commit {
+        smithy_core::Commit {
+            sha: format!("{n:07x}{}", "a".repeat(33)),
+            message: msg.into(),
+            author: "ana".into(),
+            date: Some("2026-10-14T10:00:00Z".into()),
+            url: Some(format!("http://x/commit/{n}")),
+        }
+    }
+
+    fn on_repo_page() -> App {
+        let mut app = app_on_runs(vec![]);
+        app.pop(); // retour à la page du dépôt
+        app
+    }
+
+    #[test]
+    fn la_page_du_depot_propose_commits_et_branches() {
+        let app = on_repo_page();
+        let text = render(&app, 110, 16);
+        for needle in [
+            "CI",
+            "Code",
+            "Commits",
+            "Branches",
+            "historique de",
+            "toutes les branches",
+        ] {
+            assert!(text.contains(needle), "absent : {needle}\n{text}");
+        }
+    }
+
+    #[test]
+    fn liste_des_commits_a_l_ecran() {
+        let mut app = on_repo_page();
+        app.list_move(2);
+        app.repo_enter();
+        app.apply(Msg::Branches {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "demo".into(),
+            },
+            result: Ok(vec![
+                smithy_core::Branch::new("main", true),
+                smithy_core::Branch::new("feature/x", false),
+            ]),
+        });
+        let text = render(&app, 120, 14);
+        assert!(
+            text.contains("Commits · main") && text.contains("chargement…"),
+            "{text}"
+        );
+        app.apply(Msg::Commits {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "demo".into(),
+            },
+            reference: String::new(),
+            page: 1,
+            result: Ok(smithy_core::CommitPage {
+                commits: vec![
+                    commit_n(1, "feat: une chose\n\ncorps"),
+                    commit_n(2, "fix: autre chose"),
+                ],
+                has_more: true,
+            }),
+        });
+        let text = render(&app, 120, 14);
+        for needle in [
+            "Commit",
+            "Date",
+            "Auteur",
+            "Message",
+            "0000001",
+            "feat: une chose",
+            "fix: autre chose",
+            "ana",
+            "1/2+",
+        ] {
+            assert!(text.contains(needle), "absent : {needle}\n{text}");
+        }
+        assert!(
+            !text.contains("corps"),
+            "seule la première ligne du message est listée"
+        );
+        // Liste courte avec une suite possible : la page suivante est déjà demandée
+        assert!(text.contains("chargement de la suite…"), "{text}");
+        // Filtre : saisie, titre, compteur
+        {
+            let v = app.commits_mut().unwrap();
+            v.filter.start();
+            "autre".chars().for_each(|c| {
+                v.filter.type_char(c);
+            });
+        }
+        let text = render(&app, 120, 14);
+        assert!(
+            text.contains("filtrer : autre▏") && text.contains("« autre »"),
+            "{text}"
+        );
+        assert!(
+            text.contains("1/1 (sur 2+ chargés)") && !text.contains("feat: une chose"),
+            "{text}"
+        );
+        app.commits_mut().unwrap().filter.commit();
+        // Sélecteur de branche par-dessus
+        app.commits_mut().unwrap().filter.clear();
+        app.commits_mut().unwrap().open_picker();
+        let text = render(&app, 120, 18);
+        assert!(
+            text.contains("● main") && text.contains("(défaut)") && text.contains("feature/x"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn liste_des_branches_a_l_ecran() {
+        let mut app = on_repo_page();
+        app.list_move(3);
+        app.repo_enter();
+        let repo = Repo {
+            owner: "smithy".into(),
+            name: "demo".into(),
+        };
+        assert!(render(&app, 120, 12).contains("chargement…"));
+        let head = |sha: &str, msg: &str| {
+            Some(smithy_core::BranchHead {
+                sha: sha.into(),
+                message: msg.into(),
+                author: "bob".into(),
+                date: Some("2026-10-14T10:00:00Z".into()),
+            })
+        };
+        app.apply(Msg::Branches {
+            repo,
+            result: Ok(vec![
+                smithy_core::Branch {
+                    head: head("abcdef0123", "fix: le bug\n\ndétail"),
+                    ..smithy_core::Branch::new("main", true)
+                },
+                smithy_core::Branch {
+                    head: head("1234567890", "feat: nouveau"),
+                    protected: true,
+                    ..smithy_core::Branch::new("release", false)
+                },
+            ]),
+        });
+        let text = render(&app, 130, 12);
+        for needle in [
+            "Branche",
+            "● main",
+            "release",
+            "[protégée]",
+            "abcdef0",
+            "fix: le bug",
+            "bob",
+            "1/2",
+        ] {
+            assert!(text.contains(needle), "absent : {needle}\n{text}");
+        }
+        assert!(!text.contains("détail"));
+        // Filtre sur le message du dernier commit
+        let v = app.branch_list_mut().unwrap();
+        v.filter.start();
+        "nouveau".chars().for_each(|c| {
+            v.filter.type_char(c);
+        });
+        v.filter_changed();
+        let text = render(&app, 130, 12);
+        assert!(
+            text.contains("1/1 (sur 2)") && !text.contains("● main"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn le_correctif_d_un_commit_est_colore() {
+        use crate::highlight::Tok as T;
+        let _ = T::Added;
+        let mut app = on_repo_page();
+        app.list_move(2);
+        app.repo_enter();
+        let repo = Repo {
+            owner: "smithy".into(),
+            name: "demo".into(),
+        };
+        let c = commit_n(1, "fix: titre\n\nCorps du commit");
+        app.apply(Msg::Commits {
+            repo: repo.clone(),
+            reference: String::new(),
+            page: 1,
+            result: Ok(smithy_core::CommitPage {
+                commits: vec![c.clone()],
+                has_more: false,
+            }),
+        });
+        app.commits_enter();
+        assert!(render(&app, 100, 12).contains("chargement…"));
+        app.apply(Msg::CommitDetail {
+            repo,
+            sha: c.sha.clone(),
+            result: Ok(smithy_core::CommitDetail {
+                commit: c,
+                parents: vec!["abcdef0123".into()],
+                files: vec![smithy_core::FileChange { path: "f.txt".into(), kind: smithy_core::ChangeKind::Modified }],
+                additions: 1,
+                deletions: 1,
+                patch: "diff --git a/f.txt b/f.txt\nindex 1..2 100644\n--- a/f.txt\n+++ b/f.txt\n@@ -1 +1 @@\n-VIEUXQ\n+NEUFQ\n".into(),
+                patch_truncated: true,
+            }),
+        });
+        let mut term = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text: String = buf.content().iter().map(|c| c.symbol()).collect();
+        for needle in [
+            "fix: titre",
+            "Parent : abcdef0",
+            "Corps du commit",
+            "1 fichier modifié",
+            "f.txt  +1 −1",
+            "@@ -1 +1 @@",
+            "correctif tronqué",
+        ] {
+            assert!(text.contains(needle), "absent : {needle}\n{text}");
+        }
+        assert!(!text.contains("index 1..2"), "la ligne index est masquée");
+        let fg = |sym: &str| {
+            buf.content()
+                .iter()
+                .find(|c| c.symbol() == sym)
+                .map(|c| c.fg)
+        };
+        assert_eq!(fg("V"), Some(Color::Red), "ligne retirée");
+        assert_eq!(fg("N"), Some(Color::Green), "ligne ajoutée");
+        assert_eq!(fg("@"), Some(Color::Cyan), "en-tête de hunk");
     }
 }

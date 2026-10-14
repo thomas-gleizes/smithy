@@ -13,6 +13,16 @@ pub enum Request {
         pipeline: Pipeline,
     },
     Branches(Repo),
+    /// Une page de l'historique d'une branche (`reference` vide : la branche par défaut).
+    Commits {
+        repo: Repo,
+        reference: String,
+        page: u32,
+    },
+    CommitDetail {
+        repo: Repo,
+        sha: String,
+    },
     Dir {
         repo: Repo,
         reference: String,

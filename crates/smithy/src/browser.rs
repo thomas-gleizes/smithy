@@ -641,10 +641,7 @@ mod tests {
     }
 
     fn branch(name: &str, default: bool) -> Branch {
-        Branch {
-            name: name.into(),
-            default,
-        }
+        Branch::new(name, default)
     }
 
     fn entry(name: &str, path: &str, kind: EntryKind, size: u64) -> Entry {

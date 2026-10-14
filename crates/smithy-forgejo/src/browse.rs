@@ -4,7 +4,7 @@
 
 use reqwest::StatusCode;
 use serde::Deserialize;
-use smithy_core::{Branch, Entry, EntryKind, Error, FileContent, Repo, Result};
+use smithy_core::{Branch, BranchHead, Entry, EntryKind, Error, FileContent, Repo, Result};
 
 use crate::{Forgejo, PAGE_SIZE};
 
@@ -17,6 +17,29 @@ const BINARY_SNIFF: usize = 8192;
 
 #[derive(Deserialize)]
 struct ApiBranch {
+    name: String,
+    #[serde(default)]
+    protected: bool,
+    /// Dernier commit de la branche (absent d'un backend ancien : la branche reste listée).
+    #[serde(default)]
+    commit: Option<ApiHead>,
+}
+
+#[derive(Deserialize)]
+struct ApiHead {
+    #[serde(default)]
+    id: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    timestamp: String,
+    #[serde(default)]
+    author: Option<ApiHeadAuthor>,
+}
+
+#[derive(Deserialize)]
+struct ApiHeadAuthor {
+    #[serde(default)]
     name: String,
 }
 
@@ -72,6 +95,13 @@ impl Forgejo {
             let n = batch.len();
             branches.extend(batch.into_iter().map(|b| Branch {
                 default: b.name == default_branch,
+                protected: b.protected,
+                head: b.commit.filter(|c| !c.id.is_empty()).map(|c| BranchHead {
+                    sha: c.id,
+                    message: c.message,
+                    author: c.author.map(|a| a.name).unwrap_or_default(),
+                    date: Some(c.timestamp).filter(|d| !d.is_empty()),
+                }),
                 name: b.name,
             }));
             if n < PAGE_SIZE {
@@ -172,7 +202,7 @@ impl Forgejo {
 
 /// UTF-8, avec remplacement des octets invalides. Une troncature en plein milieu d'un
 /// caractère ne laisse pas de caractère de remplacement parasite en fin de fichier.
-fn decode(buf: &[u8], truncated: bool) -> String {
+pub(crate) fn decode(buf: &[u8], truncated: bool) -> String {
     match std::str::from_utf8(buf) {
         Ok(s) => s.to_owned(),
         Err(e) if truncated && e.error_len().is_none() => {
@@ -268,16 +298,49 @@ mod tests {
 
         let b = forgejo(&server).list_branches(&repo()).await.unwrap();
         assert_eq!(b.len(), PAGE_SIZE + 2);
-        assert_eq!(
-            b[0],
-            Branch {
-                name: "main".into(),
-                default: true
-            }
-        );
+        assert_eq!((b[0].name.as_str(), b[0].default), ("main", true));
+        assert_eq!(b[0].head.as_ref().map(|h| h.sha.as_str()), Some("abc"));
         assert!(b[1..].iter().all(|x| !x.default));
         assert_eq!(b[1].name, "b00", "puis l'ordre alphabétique");
         assert!(b.iter().any(|x| x.name == "feature/x"));
+    }
+
+    #[tokio::test]
+    async fn branche_avec_son_dernier_commit_et_sa_protection() {
+        // Réponse réduite d'une capture réelle (Forgejo 10, 13 et 15 : mêmes champs).
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/smithy/tree"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                json!({"name": "tree", "owner": {"login": "smithy"}, "default_branch": "main"}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/repos/smithy/tree/branches"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                {"name": "main", "protected": true, "required_approvals": 0,
+                 "commit": {"id": "c5b5e44", "message": "fix: x\n\ncorps\n", "url": "u",
+                            "author": {"name": "smithy", "email": "e", "username": "smithy"},
+                            "committer": {"name": "smithy"}, "verification": {"verified": false},
+                            "timestamp": "2026-10-14T13:25:30Z", "added": null}},
+                {"name": "ancienne", "commit": null},
+                {"name": "sans-commit"}
+            ])))
+            .mount(&server)
+            .await;
+        let b = forgejo(&server).list_branches(&repo()).await.unwrap();
+        let main = &b[0];
+        assert!(main.default && main.protected);
+        let head = main.head.as_ref().unwrap();
+        assert_eq!(
+            (head.sha.as_str(), head.author.as_str()),
+            ("c5b5e44", "smithy")
+        );
+        assert_eq!(head.message, "fix: x\n\ncorps\n");
+        assert_eq!(head.date.as_deref(), Some("2026-10-14T13:25:30Z"));
+        // Champs absents ou nuls : la branche reste listée, sans dernier commit
+        assert!(b[1..].iter().all(|x| x.head.is_none() && !x.protected));
     }
 
     #[tokio::test]

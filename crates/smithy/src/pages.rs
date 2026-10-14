@@ -324,13 +324,14 @@ pub enum LastRun {
 pub struct RepoView {
     pub info: RepoInfo,
     pub last_run: LastRun,
-    /// Entrée du menu : 0 = CI, 1 = Code.
+    /// Entrée du menu : 0 = CI, 1 = Code, 2 = Commits, 3 = Branches (les anciennes d'abord : les
+    /// indices sauvegardés avec les onglets restent valables).
     pub selected: usize,
     pub info_error: Option<String>,
 }
 
 impl RepoView {
-    pub const ITEMS: [&'static str; 2] = ["CI", "Code"];
+    pub const ITEMS: [&'static str; 4] = ["CI", "Code", "Commits", "Branches"];
 
     pub fn new(info: RepoInfo) -> Self {
         Self {
@@ -841,7 +842,7 @@ mod tests {
         let mut r = RepoView::new(info("a", "d"));
         assert!(matches!(r.last_run, LastRun::Loading));
         r.move_selection(5);
-        assert_eq!(r.selected, 1);
+        assert_eq!(r.selected, RepoView::ITEMS.len() - 1);
         r.move_selection(-5);
         assert_eq!(r.selected, 0);
         r.apply_pipelines(&repo("a"), &Ok(vec![pipe(9), pipe(8)]));

@@ -8,7 +8,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 
 ## Features
 
-- A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list and the code explorer.
+- A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list, the code explorer, the **commit history** and the **branches**.
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step. Filter the list of runs (`/` for text, `s` for status) and search inside logs, files and rendered Markdown (`/`, then `n` / `N`).
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme. **Markdown files** (`.md`) open rendered: headings, emphasis, lists (nested, ordered, task lists), quotes, tables, links (the target is shown), images (alt text), rules, and code blocks coloured by their language; raw HTML is shown dimmed. Press `m` to switch to the highlighted source.
 - Sign in from the TUI (username and password, entered once and never stored).
@@ -123,6 +123,14 @@ On the home page:
 | `Esc`                 | Clear the filter (while typing: cancel) |
 | `q`                   | Quit                            |
 
+The repository page lists four sections: *CI*, *Code*, *Commits* and *Branches*.
+
+**Commits** (history of a branch, newest first): `j`/`k` move, `Enter` or `→` opens the commit with its diff, `B` chooses another branch (the default one is the start), `/` filters the loaded commits by message, author or hash (live, every word must match), `r` reloads, `Esc` removes the filter then goes back. Commits load 50 at a time as you approach the end of the list (up to 1,000); with a filter active, more pages are fetched while the list is short, so filtering searches progressively through the history (the counter reads `2/5 (sur 150+ chargés)`; `+` means there are older commits).
+
+**A commit**: the header (hash, author, date, parents, message, `+/−` totals), then one foldable section per file with the diff coloured (`+` green, `-` red, `@@` cyan). It behaves like the logs: `Space` folds the file, `←`/`→` change file, `a` folds or unfolds all, `/` `n` `N` search, `w` wraps. A very large patch is read up to 1 MiB and 20,000 lines and says so (*correctif tronqué*); files of 400 lines or more start folded; binary files show *Binary files … differ*.
+
+**Branches**: every branch with its last commit (hash, date, author, message), the default one marked `●` and protected ones tagged. `Enter` opens the branch's history, `e` its code, `/` filters by name, message or author.
+
 On a repository page and on the list of runs: `j`/`k` move, `Enter` or `→` opens (CI or Code; a run's logs), `←`, `Esc`, `q` or `Backspace` go back, `PgDn`/`PgUp`, `g`/`G` as above.
 
 On the list of runs, two filters combine:
@@ -206,6 +214,7 @@ A new forge is a new crate implementing `Provider`.
 - [x] Restore the open tabs at startup (one instance owns them, `--fresh` to skip)
 - [ ] Pull requests, notifications and runners
 - [x] Filters on the runs list (text, status) and search in logs, files and rendered Markdown
+- [x] Commit history (with diffs) and the list of branches
 - [x] Filter by name in the code explorer's folders
 - [ ] Filter the steps of a job's logs by name
 - [x] Job steps and logs for Forgejo

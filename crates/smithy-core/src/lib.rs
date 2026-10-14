@@ -154,6 +154,93 @@ pub struct Branch {
     pub name: String,
     /// Branche par défaut du dépôt.
     pub default: bool,
+    /// Dernier commit de la branche, quand le backend le donne dans la liste.
+    pub head: Option<BranchHead>,
+    /// Branche protégée (poussée directe interdite).
+    pub protected: bool,
+}
+
+impl Branch {
+    pub fn new(name: impl Into<String>, default: bool) -> Self {
+        Self {
+            name: name.into(),
+            default,
+            head: None,
+            protected: false,
+        }
+    }
+}
+
+/// Le dernier commit d'une branche, tel que la liste des branches le résume.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BranchHead {
+    pub sha: String,
+    pub message: String,
+    pub author: String,
+    /// Date RFC 3339 telle que le serveur la donne.
+    pub date: Option<String>,
+}
+
+/// Un commit de l'historique.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub sha: String,
+    /// Message complet (plusieurs lignes possibles).
+    pub message: String,
+    pub author: String,
+    /// Date RFC 3339 telle que le serveur la donne.
+    pub date: Option<String>,
+    /// Page web du commit.
+    pub url: Option<String>,
+}
+
+impl Commit {
+    /// Première ligne du message, sans espaces autour.
+    pub fn summary(&self) -> &str {
+        self.message.lines().next().unwrap_or("").trim()
+    }
+
+    /// Les 7 premiers caractères de l'empreinte, comme `git log --oneline`.
+    pub fn short_sha(&self) -> &str {
+        &self.sha[..self.sha.len().min(7)]
+    }
+}
+
+/// Une page de l'historique d'une branche, du plus récent au plus ancien.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitPage {
+    pub commits: Vec<Commit>,
+    /// Il peut y avoir des commits plus anciens à la page suivante.
+    pub has_more: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeKind {
+    Added,
+    Modified,
+    Removed,
+    Renamed,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileChange {
+    pub path: String,
+    pub kind: ChangeKind,
+}
+
+/// Un commit avec ce qu'il change : fichiers, volume et correctif (diff).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitDetail {
+    pub commit: Commit,
+    pub parents: Vec<String>,
+    pub files: Vec<FileChange>,
+    pub additions: u64,
+    pub deletions: u64,
+    /// Correctif au format unifié (`diff --git …`), borné par l'appelant.
+    pub patch: String,
+    /// Le correctif a été coupé au plafond demandé.
+    pub patch_truncated: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -228,6 +315,28 @@ pub trait Provider: Send + Sync {
     /// `capabilities().browse` est vrai, comme [`Provider::read_dir`] et [`Provider::read_file`].
     fn list_branches(&self, _repo: &Repo) -> impl Future<Output = Result<Vec<Branch>>> + Send {
         async { Err(Error::Unsupported("explorateur")) }
+    }
+
+    /// Une page de l'historique d'une branche (`reference` vide = branche par défaut), du plus
+    /// récent au plus ancien ; `page` commence à 1. Réservé aux backends dont
+    /// `capabilities().browse` est vrai.
+    fn list_commits(
+        &self,
+        _repo: &Repo,
+        _reference: &str,
+        _page: u32,
+    ) -> impl Future<Output = Result<CommitPage>> + Send {
+        async { Err(Error::Unsupported("historique")) }
+    }
+
+    /// Un commit avec ses fichiers et son correctif (lu sur au plus `max_bytes` octets).
+    fn commit_detail(
+        &self,
+        _repo: &Repo,
+        _sha: &str,
+        _max_bytes: usize,
+    ) -> impl Future<Output = Result<CommitDetail>> + Send {
+        async { Err(Error::Unsupported("historique")) }
     }
 
     /// Contenu d'un dossier (`path` vide = racine) à une référence (branche, étiquette, commit).

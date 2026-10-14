@@ -33,6 +33,11 @@ pub enum Tok {
     Link,
     Quote,
     Code,
+    /// Un diff : ligne ajoutée, ligne retirée, en-tête de hunk, métadonnées (---, +++, mode…).
+    Added,
+    Removed,
+    Hunk,
+    Meta,
 }
 
 /// Une région colorée d'une ligne : octets `start..end` du texte affiché.

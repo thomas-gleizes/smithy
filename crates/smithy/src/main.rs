@@ -2,6 +2,7 @@ mod app;
 mod browser;
 mod config;
 mod highlight;
+mod history;
 mod logview;
 mod markdown;
 mod pages;
@@ -213,6 +214,172 @@ fn runs_key(app: &mut App, code: KeyCode) {
     }
 }
 
+/// Déplacements communs aux listes (`j`/`k`, pages, début et fin).
+fn list_nav(app: &mut App, code: KeyCode) -> bool {
+    match code {
+        KeyCode::Char('j') | KeyCode::Down => app.list_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.list_move(-1),
+        KeyCode::PageDown | KeyCode::Char('f') => app.list_page(1),
+        KeyCode::PageUp | KeyCode::Char('b') => app.list_page(-1),
+        KeyCode::Home | KeyCode::Char('g') => app.list_move(isize::MIN / 2),
+        KeyCode::End | KeyCode::Char('G') => app.list_move(isize::MAX / 2),
+        _ => return false,
+    }
+    true
+}
+
+/// Touches de la liste des commits : sélecteur de branche, filtre, liste.
+fn commits_key(app: &mut App, code: KeyCode) {
+    if app.commits().is_some_and(|v| v.picker.is_some()) {
+        let mut requests = Vec::new();
+        if let Some(v) = app.commits_mut() {
+            match code {
+                KeyCode::Esc | KeyCode::Char('q' | 'B') => v.picker = None,
+                KeyCode::Char('j') | KeyCode::Down => v.picker_move(1),
+                KeyCode::Char('k') | KeyCode::Up => v.picker_move(-1),
+                KeyCode::Home | KeyCode::Char('g') => v.picker_move(isize::MIN / 2),
+                KeyCode::End | KeyCode::Char('G') => v.picker_move(isize::MAX / 2),
+                KeyCode::Enter => requests = v.picker_choose(),
+                _ => {}
+            }
+        }
+        app.history_queue(requests);
+        return;
+    }
+    if app.commits().is_some_and(|v| v.filter.editing) {
+        let mut requests = Vec::new();
+        if let Some(v) = app.commits_mut() {
+            match code {
+                KeyCode::Enter => v.filter.commit(),
+                KeyCode::Esc => {
+                    v.filter.cancel();
+                    requests = v.filter_changed();
+                }
+                KeyCode::Backspace => {
+                    v.filter.backspace();
+                    requests = v.filter_changed();
+                }
+                KeyCode::Char(c) => {
+                    v.filter.type_char(c);
+                    requests = v.filter_changed();
+                }
+                _ => {}
+            }
+        }
+        app.history_queue(requests);
+        return;
+    }
+    match code {
+        KeyCode::Char('/') => {
+            if let Some(v) = app.commits_mut() {
+                v.filter.start();
+            }
+        }
+        KeyCode::Char('B') => {
+            let requests = app
+                .commits_mut()
+                .map(|v| v.open_picker())
+                .unwrap_or_default();
+            app.history_queue(requests);
+        }
+        // Échap retire d'abord le filtre, puis il revient en arrière.
+        KeyCode::Esc if app.commits_mut().is_some_and(|v| v.filter.clear()) => {
+            let requests = app
+                .commits_mut()
+                .map(|v| v.filter_changed())
+                .unwrap_or_default();
+            app.history_queue(requests);
+        }
+        KeyCode::Enter | KeyCode::Right => app.commits_enter(),
+        KeyCode::Char('r') => app.refresh_current(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
+            app.pop();
+        }
+        _ => {
+            list_nav(app, code);
+        }
+    }
+}
+
+/// Touches de la liste des branches.
+fn branch_list_key(app: &mut App, code: KeyCode) {
+    if app.branch_list().is_some_and(|v| v.filter.editing) {
+        if let Some(v) = app.branch_list_mut() {
+            match code {
+                KeyCode::Enter => v.filter.commit(),
+                KeyCode::Esc => {
+                    v.filter.cancel();
+                    v.filter_changed();
+                }
+                KeyCode::Backspace => {
+                    v.filter.backspace();
+                    v.filter_changed();
+                }
+                KeyCode::Char(c) => {
+                    v.filter.type_char(c);
+                    v.filter_changed();
+                }
+                _ => {}
+            }
+        }
+        return;
+    }
+    match code {
+        KeyCode::Char('/') => {
+            if let Some(v) = app.branch_list_mut() {
+                v.filter.start();
+            }
+        }
+        KeyCode::Esc
+            if app.branch_list_mut().is_some_and(|v| {
+                let had = v.filter.clear();
+                if had {
+                    v.filter_changed();
+                }
+                had
+            }) => {}
+        KeyCode::Enter | KeyCode::Right => app.branches_enter(),
+        KeyCode::Char('e') => app.branches_code(),
+        KeyCode::Char('r') => app.refresh_current(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
+            app.pop();
+        }
+        _ => {
+            list_nav(app, code);
+        }
+    }
+}
+
+/// Touches du détail d'un commit : comme les logs (sections par fichier, recherche).
+fn commit_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc => {
+            if !app.text_escape() {
+                app.pop();
+            }
+        }
+        KeyCode::Char('q') | KeyCode::Backspace => {
+            app.pop();
+        }
+        KeyCode::Char('/') => app.text_search_begin(),
+        KeyCode::Char('n') => app.text_search_step(1),
+        KeyCode::Char('N') => app.text_search_step(-1),
+        KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
+        KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
+        KeyCode::Char(' ') => app.text_toggle_section(),
+        KeyCode::Right => app.text_select_section(1),
+        KeyCode::Left => app.text_select_section(-1),
+        KeyCode::Char('a') => app.text_toggle_all(),
+        KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
+        KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
+        KeyCode::Char('g') | KeyCode::Home => app.text_top(),
+        KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
+        KeyCode::Char('w') => app.text_toggle_wrap(),
+        KeyCode::Char('r') => app.refresh_current(),
+        _ => {}
+    }
+}
+
 /// Touches de la page d'un dépôt et de la liste de ses runs.
 fn list_key(app: &mut App, code: KeyCode, enter: fn(&mut App)) {
     match code {
@@ -357,6 +524,25 @@ fn run_request<P: Provider + 'static>(
             Request::Branches(repo) => {
                 let result = p.list_branches(&repo).await;
                 Msg::Branches { repo, result }
+            }
+            Request::Commits {
+                repo,
+                reference,
+                page,
+            } => {
+                let result = p.list_commits(&repo, &reference, page).await;
+                Msg::Commits {
+                    repo,
+                    reference,
+                    page,
+                    result,
+                }
+            }
+            Request::CommitDetail { repo, sha } => {
+                let result = p
+                    .commit_detail(&repo, &sha, history::PATCH_LIMIT_BYTES)
+                    .await;
+                Msg::CommitDetail { repo, sha, result }
             }
             Request::Dir {
                 repo,
@@ -790,6 +976,12 @@ async fn run(
                 home_key(&mut app, k.code);
             } else if app.repo_page().is_some() {
                 list_key(&mut app, k.code, App::repo_enter);
+            } else if app.commits().is_some() {
+                commits_key(&mut app, k.code);
+            } else if app.branch_list().is_some() {
+                branch_list_key(&mut app, k.code);
+            } else if app.commit_view().is_some() {
+                commit_key(&mut app, k.code);
             } else if app.runs().is_some() {
                 runs_key(&mut app, k.code);
             } else if app.logs().is_some() {

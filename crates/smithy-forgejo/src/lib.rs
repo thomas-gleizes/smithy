@@ -3,6 +3,7 @@
 //! qui demandent un cookie de session (voir `login`).
 
 mod browse;
+mod history;
 mod login;
 mod logs;
 mod ping;
@@ -16,8 +17,8 @@ pub use version::{Decision, Flavor, Support, Version, decide};
 use reqwest::StatusCode;
 use serde::{Deserialize, de::DeserializeOwned};
 use smithy_core::{
-    Branch, Capabilities, Entry, Error, FileContent, JobLog, Pipeline, Provider, Repo, RepoInfo,
-    RepoSource, Result, Status,
+    Branch, Capabilities, CommitDetail, CommitPage, Entry, Error, FileContent, JobLog, Pipeline,
+    Provider, Repo, RepoInfo, RepoSource, Result, Status,
 };
 use std::collections::BTreeMap;
 
@@ -204,6 +205,19 @@ impl Provider for Forgejo {
 
     async fn list_branches(&self, repo: &Repo) -> Result<Vec<Branch>> {
         self.fetch_branches(repo).await
+    }
+
+    async fn list_commits(&self, repo: &Repo, reference: &str, page: u32) -> Result<CommitPage> {
+        self.fetch_commits(repo, reference, page).await
+    }
+
+    async fn commit_detail(
+        &self,
+        repo: &Repo,
+        sha: &str,
+        max_bytes: usize,
+    ) -> Result<CommitDetail> {
+        self.fetch_commit_detail(repo, sha, max_bytes).await
     }
 
     async fn read_dir(&self, repo: &Repo, reference: &str, path: &str) -> Result<Vec<Entry>> {

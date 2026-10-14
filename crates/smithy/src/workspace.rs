@@ -35,6 +35,13 @@ pub enum SavedPage {
     Runs {
         repo: Repo,
     },
+    Commits {
+        repo: Repo,
+        reference: String,
+    },
+    Branches {
+        repo: Repo,
+    },
     Browser {
         repo: Repo,
         reference: String,

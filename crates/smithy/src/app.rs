@@ -9,6 +9,7 @@ use smithy_core::{
 use crate::{
     browser::{Browser, Mode},
     highlight::Run,
+    history::{BranchesView, CommitView, CommitsView},
     logview::{LogState, LogView, Start, TextView},
     pages::{HomeRow, HomeView, RepoView, RunsView},
     recent::{self, RecentEntry},
@@ -55,6 +56,19 @@ pub enum Msg {
         repo: Repo,
         pipeline_id: u64,
         result: Result<JobLog, Error>,
+    },
+    /// Une page de l'historique d'une branche (`reference` vide : la branche par défaut).
+    Commits {
+        repo: Repo,
+        reference: String,
+        page: u32,
+        result: Result<smithy_core::CommitPage, Error>,
+    },
+    /// Un commit avec son correctif.
+    CommitDetail {
+        repo: Repo,
+        sha: String,
+        result: Result<smithy_core::CommitDetail, Error>,
     },
     /// La coloration syntaxique d'un fichier, calculée à part une fois le texte affiché.
     FileStyles {
@@ -108,6 +122,9 @@ pub enum Page {
     Runs(RunsView),
     Logs(LogView),
     Browser(Browser),
+    Commits(CommitsView),
+    Branches(BranchesView),
+    Commit(CommitView),
 }
 
 impl Page {
@@ -335,6 +352,41 @@ impl App {
         }
     }
 
+    pub fn commits(&self) -> Option<&CommitsView> {
+        match self.stack.last() {
+            Some(Page::Commits(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn commits_mut(&mut self) -> Option<&mut CommitsView> {
+        match self.stack.last_mut() {
+            Some(Page::Commits(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn branch_list(&self) -> Option<&BranchesView> {
+        match self.stack.last() {
+            Some(Page::Branches(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn branch_list_mut(&mut self) -> Option<&mut BranchesView> {
+        match self.stack.last_mut() {
+            Some(Page::Branches(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn commit_view(&self) -> Option<&CommitView> {
+        match self.stack.last() {
+            Some(Page::Commit(v)) => Some(v),
+            _ => None,
+        }
+    }
+
     /// Explorateur de code, si c'est la page affichée.
     pub fn browser(&self) -> Option<&Browser> {
         match self.stack.last() {
@@ -366,6 +418,9 @@ impl App {
                 Page::Runs(_) => out.push("CI".to_owned()),
                 Page::Logs(v) => out.extend([v.pipeline.workflow.clone(), v.pipeline.job.clone()]),
                 Page::Browser(b) => out.extend(b.breadcrumb()),
+                Page::Commits(v) => out.extend(["Commits".to_owned(), v.branch_label()]),
+                Page::Branches(_) => out.push("Branches".to_owned()),
+                Page::Commit(v) => out.push(v.sha[..v.sha.len().min(7)].to_owned()),
             }
         }
         out
@@ -460,13 +515,17 @@ impl App {
     /// Haut, bas, page : déplace la sélection de la liste affichée (accueil, runs ou dossier).
     pub fn list_move(&mut self, delta: isize) {
         let len = self.home_rows().len();
+        let mut requests = Vec::new();
         match self.stack.last_mut() {
             Some(Page::Home(h)) => h.move_selection(delta, len),
             Some(Page::Repo(r)) => r.move_selection(delta),
             Some(Page::Runs(r)) => r.move_selection(delta),
             Some(Page::Browser(b)) => b.move_selection(delta),
+            Some(Page::Commits(v)) => requests = v.move_selection(delta),
+            Some(Page::Branches(v)) => v.move_selection(delta),
             _ => {}
         }
+        self.queue_all(requests);
     }
 
     /// Une page (`1`) ou la précédente (`-1`) : la hauteur affichée moins une ligne.
@@ -529,11 +588,61 @@ impl App {
         if item == 0 {
             self.queue(Request::Pipelines(repo.clone()));
             self.stack.push(Page::Runs(RunsView::new(repo)));
-        } else if self.browse_supported {
-            self.stack.push(Page::Browser(Browser::open(repo)));
-        } else {
+        } else if !self.browse_supported {
             self.error = Some("ce backend ne permet pas d'explorer le code".to_owned());
+        } else if item == 1 {
+            self.stack.push(Page::Browser(Browser::open(repo)));
+        } else if item == 2 {
+            let (view, requests) = CommitsView::open(repo, String::new());
+            self.queue_all(requests);
+            self.stack.push(Page::Commits(view));
+        } else {
+            let (view, requests) = BranchesView::open(repo);
+            self.queue_all(requests);
+            self.stack.push(Page::Branches(view));
         }
+    }
+
+    // --- historique
+
+    /// Entrée sur un commit de la liste : ouvre son correctif.
+    pub fn commits_enter(&mut self) {
+        let Some(v) = self.commits() else { return };
+        let Some(commit) = v.selected_commit().cloned() else {
+            return;
+        };
+        let (view, requests) = CommitView::open(v.repo.clone(), &commit, self.logs_wrap);
+        self.queue_all(requests);
+        self.stack.push(Page::Commit(view));
+    }
+
+    /// Entrée sur une branche : son historique.
+    pub fn branches_enter(&mut self) {
+        let Some(v) = self.branch_list() else { return };
+        let Some(branch) = v.selected_branch() else {
+            return;
+        };
+        let (view, requests) = CommitsView::open(v.repo.clone(), branch.name.clone());
+        self.queue_all(requests);
+        self.stack.push(Page::Commits(view));
+    }
+
+    /// Touche `e` sur une branche : son code.
+    pub fn branches_code(&mut self) {
+        let Some(v) = self.branch_list() else { return };
+        let Some(branch) = v.selected_branch() else {
+            return;
+        };
+        if self.browse_supported {
+            let b = Browser::restore(v.repo.clone(), branch.name.clone(), String::new());
+            self.stack.push(Page::Browser(b));
+        }
+    }
+
+    /// Fonctions de filtre et de sélecteur des listes d'historique : les requêtes qu'elles
+    /// produisent partent avec celles de l'application.
+    pub fn history_queue(&mut self, requests: Vec<Request>) {
+        self.queue_all(requests);
     }
 
     // --- runs et logs
@@ -629,6 +738,9 @@ impl App {
             }
             Some(Page::Runs(r)) => requests.push(Request::Pipelines(r.repo.clone())),
             Some(Page::Browser(b)) => b.refresh(),
+            Some(Page::Commits(v)) => requests.extend(v.refresh()),
+            Some(Page::Branches(v)) => requests.extend(v.refresh()),
+            Some(Page::Commit(v)) => requests.extend(v.refresh()),
             Some(Page::Logs(_)) => self.refetch_logs(),
             None => {}
         }
@@ -655,6 +767,7 @@ impl App {
                 _ => None, // la liste d'un dossier n'est pas un volet de texte
             },
             Page::Logs(v) => Some(&mut **v),
+            Page::Commit(v) => Some(&mut v.text),
             _ => None,
         }
     }
@@ -666,6 +779,7 @@ impl App {
                 _ => None,
             },
             Page::Logs(v) => Some(&**v),
+            Page::Commit(v) => Some(&v.text),
             _ => None,
         }
     }
@@ -683,6 +797,10 @@ impl App {
         self.home().is_some_and(|h| h.editing)
             || self.runs().is_some_and(|r| r.editing)
             || self.browser().is_some_and(|b| b.editing)
+            || self
+                .commits()
+                .is_some_and(|v| v.filter.editing || v.picker.is_some())
+            || self.branch_list().is_some_and(|v| v.filter.editing)
             || self.text_prompt_active()
     }
 
@@ -937,8 +1055,34 @@ impl App {
             }
             Msg::Branches { repo, result } => {
                 for page in self.stacks_of(server).into_iter().flatten() {
-                    if let Page::Browser(b) = page {
-                        b.on_branches(&repo, result.clone());
+                    match page {
+                        Page::Browser(b) => b.on_branches(&repo, result.clone()),
+                        Page::Commits(v) => v.apply_branches(&repo, result.clone()),
+                        Page::Branches(v) => v.apply_branches(&repo, result.clone()),
+                        _ => {}
+                    }
+                }
+            }
+            Msg::Commits {
+                repo,
+                reference,
+                page: number,
+                result,
+            } => {
+                let mut follow_up = Vec::new();
+                for page in self.stacks_of(server).into_iter().flatten() {
+                    if let Page::Commits(v) = page {
+                        follow_up.extend(v.apply_page(&repo, &reference, number, result.clone()));
+                    }
+                }
+                // Les pages suivantes partent vers le serveur qui vient de répondre.
+                self.pending
+                    .extend(follow_up.into_iter().map(|r| (server.to_owned(), r)));
+            }
+            Msg::CommitDetail { repo, sha, result } => {
+                for page in self.stacks_of(server).into_iter().flatten() {
+                    if let Page::Commit(v) = page {
+                        v.apply_detail(&repo, &sha, result.clone());
                     }
                 }
             }
@@ -1112,6 +1256,8 @@ impl App {
             Some(Page::Home(_)) => self.home_enter(),
             Some(Page::Repo(_)) => self.repo_enter(),
             Some(Page::Runs(_)) => self.open_logs(),
+            Some(Page::Commits(_)) => self.commits_enter(),
+            Some(Page::Branches(_)) => self.branches_enter(),
             Some(Page::Browser(_)) => {
                 if let Some(b) = self.browser_mut() {
                     b.enter();
@@ -1180,6 +1326,15 @@ impl App {
                             reference: b.reference.clone(),
                             path: b.path.clone(),
                         }),
+                        Page::Commits(v) => Some(SavedPage::Commits {
+                            repo: v.repo.clone(),
+                            reference: v.reference.clone(),
+                        }),
+                        Page::Branches(v) => Some(SavedPage::Branches {
+                            repo: v.repo.clone(),
+                        }),
+                        // Le correctif d'un commit n'est pas restauré : l'onglet revient à la liste.
+                        Page::Commit(_) => None,
                         Page::Logs(_) => None,
                     })
                     .collect(),
@@ -1232,6 +1387,16 @@ impl App {
                     SavedPage::Runs { repo } => {
                         requests.push((tab.server.clone(), Request::Pipelines(repo.clone())));
                         stack.push(Page::Runs(RunsView::new(repo.clone())));
+                    }
+                    SavedPage::Commits { repo, reference } => {
+                        let (view, reqs) = CommitsView::open(repo.clone(), reference.clone());
+                        requests.extend(reqs.into_iter().map(|r| (tab.server.clone(), r)));
+                        stack.push(Page::Commits(view));
+                    }
+                    SavedPage::Branches { repo } => {
+                        let (view, reqs) = BranchesView::open(repo.clone());
+                        requests.extend(reqs.into_iter().map(|r| (tab.server.clone(), r)));
+                        stack.push(Page::Branches(view));
                     }
                     SavedPage::Browser {
                         repo,
@@ -1612,6 +1777,9 @@ fn page_title(page: &Page) -> String {
         Page::Repo(r) => r.info.repo.name.clone(),
         Page::Runs(r) => format!("{} · CI", r.repo.name),
         Page::Logs(v) => format!("{} · {}", v.repo.name, v.pipeline.job),
+        Page::Commits(v) => format!("{} · Commits", v.repo.name),
+        Page::Branches(v) => format!("{} · Branches", v.repo.name),
+        Page::Commit(v) => format!("{} · {}", v.repo.name, &v.sha[..v.sha.len().min(7)]),
         Page::Browser(b) => {
             let leaf = match &b.mode {
                 crate::browser::Mode::File(fv) => fv.path.as_str(),
@@ -1776,10 +1944,7 @@ mod tests {
         let r = repo("a");
         a.apply(Msg::Branches {
             repo: r.clone(),
-            result: Ok(vec![Branch {
-                name: "main".into(),
-                default: true,
-            }]),
+            result: Ok(vec![Branch::new("main", true)]),
         });
         a.apply(Msg::Dir {
             repo: r,
@@ -2555,10 +2720,10 @@ mod tests {
         l.open_logs();
         l.list_move(3);
         l.list_page(1);
-        // Page du dépôt : deux rubriques
+        // Page du dépôt : quatre rubriques (CI, Code, Commits, Branches)
         let mut r = app_on_repo();
         r.list_move(5);
-        assert_eq!(r.repo_page().unwrap().selected, 1);
+        assert_eq!(r.repo_page().unwrap().selected, 3);
         // Runs
         let mut u = app_on_run(Status::Success);
         u.apply(Msg::Pipelines {
@@ -3241,6 +3406,7 @@ mod tests {
         a.repo_enter(); // CI
         a.pop();
         // Code : ouvre l'explorateur dans l'onglet 1, puis onglet 2 sur B
+        a.list_move(isize::MIN / 2);
         a.list_move(1);
         a.repo_enter();
         assert!(a.browser().is_some());
@@ -4012,5 +4178,294 @@ mod tests {
         assert!(a.runs_clear_filters());
         assert!(!a.runs_clear_filters());
         assert_eq!(a.runs().unwrap().visible().len(), 2);
+    }
+
+    // --- historique des commits et branches
+
+    fn commit_of(n: usize) -> smithy_core::Commit {
+        smithy_core::Commit {
+            sha: format!("{n:040x}"),
+            message: format!("feat: n°{n}\n\ncorps\n"),
+            author: "ana".into(),
+            date: Some("2026-10-14T10:00:00Z".into()),
+            url: Some(format!("http://x/c/{n}")),
+        }
+    }
+
+    fn commit_page(range: std::ops::Range<usize>, more: bool) -> smithy_core::CommitPage {
+        smithy_core::CommitPage {
+            commits: range.map(commit_of).collect(),
+            has_more: more,
+        }
+    }
+
+    /// Sur la liste des commits de `o/a` (branche par défaut), 50 commits chargés.
+    fn app_on_commits() -> App {
+        let mut a = app_on_repo();
+        a.list_move(2);
+        a.repo_enter();
+        assert!(a.commits().is_some());
+        a.apply(Msg::Commits {
+            repo: repo("a"),
+            reference: String::new(),
+            page: 1,
+            result: Ok(commit_page(0..50, true)),
+        });
+        a.take_requests();
+        a
+    }
+
+    #[test]
+    fn la_page_du_depot_ouvre_les_commits_et_les_branches() {
+        let mut a = app_on_repo();
+        a.list_move(2);
+        a.repo_enter();
+        assert_eq!(
+            a.take_requests(),
+            [
+                Request::Commits {
+                    repo: repo("a"),
+                    reference: String::new(),
+                    page: 1
+                },
+                Request::Branches(repo("a"))
+            ]
+        );
+        assert_eq!(
+            a.breadcrumb().last().map(String::as_str),
+            Some("branche par défaut")
+        );
+        a.apply(Msg::Branches {
+            repo: repo("a"),
+            result: Ok(vec![Branch::new("main", true), Branch::new("dev", false)]),
+        });
+        assert_eq!(
+            a.breadcrumb()[a.breadcrumb().len() - 2..],
+            ["Commits", "main"]
+        );
+        assert_eq!(titles(&a), ["a · Commits"]);
+        a.pop();
+        a.list_move(1);
+        a.repo_enter();
+        assert_eq!(a.take_requests(), [Request::Branches(repo("a"))]);
+        assert_eq!(a.breadcrumb().last().map(String::as_str), Some("Branches"));
+        assert_eq!(titles(&a), ["a · Branches"]);
+        // Un backend sans exploration n'ouvre ni l'un ni l'autre
+        let mut b = app_on_repo();
+        b.set_caps("", true, false);
+        b.list_move(2);
+        b.repo_enter();
+        assert!(b.commits().is_none() && b.error.is_some());
+    }
+
+    #[test]
+    fn les_pages_suivantes_partent_vers_le_serveur_qui_a_repondu() {
+        let mut a = app_on_commits();
+        a.set_initial_server("A");
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_caps("A", true, true);
+        a.set_caps("B", true, true);
+        a.take_requests();
+        // La sélection descend : la page 2 est demandée, étiquetée du serveur de l'onglet
+        a.list_move(46);
+        let reqs = a.take_tagged_requests();
+        assert_eq!(
+            reqs,
+            [(
+                "A".to_owned(),
+                Request::Commits {
+                    repo: repo("a"),
+                    reference: String::new(),
+                    page: 2
+                }
+            )]
+        );
+        // L'onglet passe sur B pendant la réponse : la réponse de A n'atteint plus cet onglet
+        a.open_in_new_tab(); // onglet 2 : le commit sélectionné
+        a.take_requests();
+        a.switch_server("B");
+        a.apply_for(
+            "A",
+            Msg::Commits {
+                repo: repo("a"),
+                reference: String::new(),
+                page: 2,
+                result: Ok(commit_page(50..63, false)),
+            },
+        );
+        a.switch_tab(-1);
+        assert_eq!(
+            a.commits().unwrap().commits.len(),
+            63,
+            "l'onglet resté sur A l'a reçue"
+        );
+    }
+
+    #[test]
+    fn ouvrir_un_commit_demande_son_correctif_et_l_affiche() {
+        let mut a = app_on_commits();
+        a.list_move(3);
+        a.commits_enter();
+        assert_eq!(
+            a.take_requests(),
+            [Request::CommitDetail {
+                repo: repo("a"),
+                sha: commit_of(3).sha
+            }]
+        );
+        assert_eq!(a.breadcrumb().last().map(String::as_str), Some("0000000"));
+        assert_eq!(titles(&a), ["a · 0000000"]);
+        a.apply(Msg::CommitDetail {
+            repo: repo("a"),
+            sha: commit_of(3).sha,
+            result: Ok(smithy_core::CommitDetail {
+                commit: commit_of(3),
+                parents: vec![],
+                files: vec![smithy_core::FileChange {
+                    path: "a.txt".into(),
+                    kind: smithy_core::ChangeKind::Added,
+                }],
+                additions: 1,
+                deletions: 0,
+                patch: "diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+x\n".into(),
+                patch_truncated: false,
+            }),
+        });
+        a.viewport.set(20);
+        a.viewport_width.set(60);
+        // Les touches de texte (recherche, sections) agissent sur le correctif
+        a.text_search_begin();
+        "ajout".chars().for_each(|c| a.text_prompt_type(c));
+        a.text_prompt_commit();
+        assert!(a.commit_view().unwrap().text.has_search());
+        assert!(a.text_escape());
+        // Le correctif d'un autre commit est ignoré
+        a.apply(Msg::CommitDetail {
+            repo: repo("a"),
+            sha: commit_of(9).sha,
+            result: Err(Error::Network("x".into())),
+        });
+        assert!(matches!(
+            a.commit_view().unwrap().text.state,
+            crate::logview::LogState::Ready(_)
+        ));
+        // r : redemande
+        a.refresh_current();
+        assert_eq!(a.take_requests().len(), 1);
+        // Échap : retour à la liste, dans l'état où elle était
+        assert!(a.pop());
+        assert_eq!(a.commits().unwrap().selected, 3);
+    }
+
+    #[test]
+    fn t_sur_un_commit_ou_une_branche_les_ouvre_dans_un_nouvel_onglet() {
+        let mut a = app_on_commits();
+        a.list_move(2);
+        a.open_in_new_tab();
+        assert_eq!(a.tab_count(), 2);
+        assert!(a.commit_view().is_some_and(|v| v.sha == commit_of(2).sha));
+        a.switch_tab(-1);
+        assert!(
+            a.commits().is_some(),
+            "l'onglet d'origine est resté sur la liste"
+        );
+        // Branches : Entrée ouvre l'historique de la branche
+        let mut b = app_on_repo();
+        b.list_move(3);
+        b.repo_enter();
+        b.apply(Msg::Branches {
+            repo: repo("a"),
+            result: Ok(vec![Branch::new("main", true), Branch::new("dev", false)]),
+        });
+        b.take_requests();
+        b.list_move(1);
+        b.open_in_new_tab();
+        let v = b.commits().expect("historique de la branche");
+        assert_eq!(v.reference, "dev");
+        assert_eq!(
+            b.take_requests()[0],
+            Request::Commits {
+                repo: repo("a"),
+                reference: "dev".into(),
+                page: 1
+            }
+        );
+    }
+
+    #[test]
+    fn e_sur_une_branche_ouvre_son_code() {
+        let mut a = app_on_repo();
+        a.list_move(3);
+        a.repo_enter();
+        a.apply(Msg::Branches {
+            repo: repo("a"),
+            result: Ok(vec![Branch::new("main", true), Branch::new("dev", false)]),
+        });
+        a.take_requests();
+        a.list_move(1);
+        a.branches_code();
+        let b = a.browser().expect("explorateur");
+        assert_eq!((b.reference.as_str(), b.path.as_str()), ("dev", ""));
+        let reqs = a.take_requests();
+        assert!(reqs.contains(&Request::Dir {
+            repo: repo("a"),
+            reference: "dev".into(),
+            path: String::new()
+        }));
+    }
+
+    #[test]
+    fn instantane_et_restauration_des_pages_d_historique() {
+        let mut a = app_on_commits();
+        a.set_servers(vec![entry("A")]);
+        a.set_caps("A", true, true);
+        a.commits_mut().unwrap().reference = "dev".into();
+        a.list_move(1);
+        a.commits_enter(); // le correctif n'est pas sauvegardé
+        let snap = a.snapshot();
+        let pages = &snap.tabs[0].pages;
+        assert_eq!(
+            pages.last(),
+            Some(&SavedPage::Commits {
+                repo: repo("a"),
+                reference: "dev".into()
+            })
+        );
+        // Restauration : la liste revient avec ses requêtes, étiquetées du serveur de l'onglet
+        let mut b = fresh();
+        b.set_servers(vec![entry("A")]);
+        b.set_caps("A", true, true);
+        let mut saved = snap.clone();
+        saved.tabs[0].server = "A".into();
+        assert!(b.restore(saved));
+        assert_eq!(b.commits().unwrap().reference, "dev");
+        let reqs = b.take_tagged_requests();
+        assert!(reqs.iter().all(|(s, _)| s == "A"));
+        assert!(reqs.iter().any(
+            |(_, r)| matches!(r, Request::Commits { reference, page: 1, .. } if reference == "dev")
+        ));
+        // Les branches aussi
+        let mut c = app_on_repo();
+        c.list_move(3);
+        c.repo_enter();
+        let snap = c.snapshot();
+        assert_eq!(
+            snap.tabs[0].pages.last(),
+            Some(&SavedPage::Branches { repo: repo("a") })
+        );
+    }
+
+    #[test]
+    fn saisie_du_filtre_et_du_selecteur_bloque_les_touches_de_navigation() {
+        let mut a = app_on_commits();
+        assert!(!a.is_typing());
+        a.commits_mut().unwrap().filter.start();
+        assert!(a.is_typing());
+        a.commits_mut().unwrap().filter.commit();
+        a.commits_mut().unwrap().open_picker();
+        assert!(
+            a.is_typing(),
+            "le sélecteur de branche capte aussi les touches"
+        );
     }
 }

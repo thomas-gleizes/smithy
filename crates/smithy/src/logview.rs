@@ -38,7 +38,27 @@ pub struct LogLine {
     pub words: bool,
 }
 
+/// Une section à afficher : son titre (coloré selon `status`), ses lignes et si elle démarre pliée.
+pub struct Part {
+    pub name: String,
+    pub status: Status,
+    pub lines: Vec<LogLine>,
+    pub collapsed: bool,
+}
+
 impl LogLine {
+    /// Une ligne de texte sans couleur ni section.
+    pub fn text(text: String) -> Self {
+        Self {
+            kind: LineKind::Text,
+            text,
+            step: None,
+            runs: Vec::new(),
+            hang: String::new(),
+            words: false,
+        }
+    }
+
     fn hang_width(&self) -> usize {
         unicode_width::UnicodeWidthStr::width(self.hang.as_str())
     }
@@ -442,44 +462,50 @@ impl TextView {
     /// vue pour la première fois prend le réglage par défaut selon son statut (donc une étape
     /// ouverte parce qu'elle tournait le reste après sa fin). Le défilement est à recaler.
     pub fn set_log(&mut self, log: &JobLog) {
-        let previous: Vec<bool> = self.sections.iter().map(|s| s.collapsed).collect();
-        let mut lines = Vec::new();
-        let mut sections = Vec::new();
-        if log.steps.is_empty() {
-            lines.push(LogLine {
-                kind: LineKind::Text,
-                text: "(aucune étape : le job n'a pas démarré)".to_owned(),
-                step: None,
-                runs: Vec::new(),
-                hang: String::new(),
-                words: false,
-            });
-        }
-        for (i, step) in log.steps.iter().enumerate() {
-            sections.push(Section {
+        let preface = if log.steps.is_empty() {
+            vec![LogLine::text(
+                "(aucune étape : le job n'a pas démarré)".to_owned(),
+            )]
+        } else {
+            Vec::new()
+        };
+        let parts = log
+            .steps
+            .iter()
+            .map(|step| Part {
                 name: step.name.clone(),
+                status: step.status,
+                lines: step.lines.iter().cloned().map(LogLine::text).collect(),
+                collapsed: default_collapsed(step.status),
+            })
+            .collect();
+        self.set_sectioned(preface, parts);
+    }
+
+    /// Remplace le contenu par des lignes libres suivies de sections pliables. L'état plié/déplié
+    /// des sections déjà vues (par indice) est conservé ; une nouvelle prend `Part::collapsed`.
+    pub fn set_sectioned(&mut self, preface: Vec<LogLine>, parts: Vec<Part>) {
+        let previous: Vec<bool> = self.sections.iter().map(|s| s.collapsed).collect();
+        let mut lines = preface;
+        let mut sections = Vec::new();
+        for (i, part) in parts.into_iter().enumerate() {
+            sections.push(Section {
+                name: part.name,
                 header: lines.len(),
-                len: step.lines.len(),
-                collapsed: previous
-                    .get(i)
-                    .copied()
-                    .unwrap_or_else(|| default_collapsed(step.status)),
+                len: part.lines.len(),
+                collapsed: previous.get(i).copied().unwrap_or(part.collapsed),
             });
             lines.push(LogLine {
-                kind: LineKind::Step(step.status),
+                kind: LineKind::Step(part.status),
                 text: String::new(), // rempli par `refresh_headers`
                 step: Some(i),
                 runs: Vec::new(),
                 hang: String::new(),
                 words: false,
             });
-            lines.extend(step.lines.iter().map(|l| LogLine {
-                kind: LineKind::Text,
-                text: l.clone(),
-                step: Some(i),
-                runs: Vec::new(),
-                hang: String::new(),
-                words: false,
+            lines.extend(part.lines.into_iter().map(|mut l| {
+                l.step = Some(i);
+                l
             }));
         }
         self.sections = sections;
