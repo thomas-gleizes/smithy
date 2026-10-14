@@ -7,6 +7,7 @@
 #   ./dev.sh probe   seed + sonde des routes de logs (voir probe-logs.py), JSON sur stdout
 #   ./dev.sh probe-browse  seed + sonde de l'API de contenu de l'explorateur (probe-browse.py)
 #   ./dev.sh probe-history seed + sonde de l'API d'historique (commits, branches : probe-history.py)
+#   ./dev.sh probe-pulls   seed + sonde de l'API des pull requests (probe-pulls.py)
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -131,6 +132,7 @@ jobs:
 ' "ci: workflow rouge"
   seed_private
   python3 -I ./seed-tree.py "$URL" "$USER_NAME" "$USER_PASS" >/dev/null
+  python3 -I ./seed-pulls.py "$URL" "$USER_NAME" "$USER_PASS" >/dev/null
   echo "workflows poussés ; runs visibles sur ${URL}/${USER_NAME}/${REPO}/actions"
 }
 
@@ -158,8 +160,10 @@ case "${1:-up}" in
          python3 -I ./probe-browse.py "$SMITHY_URL" "$SMITHY_TOKEN" ;;
   probe-history) seed >/dev/null && set -a && . "./$ENV_FILE" && set +a &&
          python3 -I ./probe-history.py "$SMITHY_URL" "$SMITHY_TOKEN" ;;
+  probe-pulls) seed >/dev/null &&
+         python3 -I ./probe-pulls.py "$URL" "$USER_NAME" "$USER_PASS" ;;
   probe) seed >/dev/null && wait_runs && set -a && . "./$ENV_FILE" && set +a &&
          python3 -I ./probe-logs.py "$SMITHY_URL" "$USER_NAME" "$USER_PASS" "$SMITHY_TOKEN" ;;
   env) cat "$ENV_FILE" ;;
-  *) echo "usage: $0 up|seed|reset|env|wait|probe|probe-browse|probe-history" >&2; exit 2 ;;
+  *) echo "usage: $0 up|seed|reset|env|wait|probe|probe-browse|probe-history|probe-pulls" >&2; exit 2 ;;
 esac
