@@ -43,8 +43,14 @@ def main():
         call("POST", "/user/repos", {"name": "vide", "private": True, "auto_init": False})
         print("dépôt vide créé")
 
+    # Un favori, pour que la liste « Étoilés » de l'accueil ne soit pas vide (idempotent).
+    def star():
+        if exists("tree"):
+            call("PUT", f"/user/starred/{user}/tree", ok=(204,))
+
     # Idempotence : le dépôt est complet quand le dernier fichier de la liste est là.
     if call("GET", f"/repos/{user}/tree/contents/big.txt?ref=main", ok=(200, 404))[0] == 200:
+        star()
         print("dépôt tree déjà présent")
         return
     if not exists("tree"):
@@ -86,6 +92,7 @@ def main():
     for i in range(60):
         call("POST", f"/repos/{user}/tree/branches", {"new_branch_name": f"b{i:02d}", "old_branch_name": "main"})
     print("branches créées : main, feature/x, b00..b59")
+    star()
 
 
 main()

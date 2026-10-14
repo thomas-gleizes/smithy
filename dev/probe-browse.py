@@ -143,6 +143,40 @@ def main():
     s, d, _ = get("/repos/smithy/vide/contents")
     out["empty_repo_contents"] = (s, d if not isinstance(d, list) else len(d))
 
+    # --- accueil : listes de dépôts (voir smithy-forgejo/src/home.rs)
+    need = ["name", "owner", "description", "private", "fork", "archived", "empty",
+            "stars_count", "open_issues_count", "open_pr_counter", "updated_at", "default_branch"]
+    for label, path, query in (
+        ("mine", "/user/repos", {"limit": 50}),
+        ("watched", "/user/subscriptions", {"limit": 50}),
+        ("starred", "/user/starred", {"limit": 50}),
+    ):
+        s, d, h = get(path, query)
+        out[f"home_{label}"] = {
+            "status": s,
+            "is_list": isinstance(d, list),
+            "count": len(d) if isinstance(d, list) else d,
+            "total_header": h.get("x-total-count"),
+            "missing_fields": [k for k in need if isinstance(d, list) and d and k not in d[0]],
+        }
+    s, d, _ = get("/repos/search", {"q": "tree", "limit": 50, "sort": "updated", "order": "desc"})
+    out["home_search"] = {
+        "status": s,
+        "shape": sorted(d) if isinstance(d, dict) else type(d).__name__,
+        "count": len(d["data"]) if isinstance(d, dict) and "data" in d else None,
+        "ok_flag": d.get("ok") if isinstance(d, dict) else None,
+        "missing_fields": [k for k in need if isinstance(d, dict) and d.get("data") and k not in d["data"][0]],
+    }
+    s, d, _ = get("/repos/search", {"q": "zzz-aucun-resultat", "limit": 50})
+    out["home_search_empty"] = {"status": s, "body": d if not isinstance(d, dict) else {"ok": d.get("ok"), "data": d.get("data")}}
+    s, d, _ = get("/repos/search", {"limit": 50, "page": 1})
+    out["home_search_no_query_count"] = len(d["data"]) if isinstance(d, dict) and d.get("data") is not None else d
+    s, d, _ = get("/repos/smithy/tree")
+    out["repo_info_missing_fields"] = [k for k in need if k not in d]
+    out["repo_info_types"] = {k: type(d.get(k)).__name__ for k in ("stars_count", "open_pr_counter", "open_issues_count", "updated_at", "empty")}
+    s, d, _ = get("/repos/smithy/nexiste")
+    out["repo_info_unknown"] = s
+
     print(json.dumps(out, ensure_ascii=False, indent=1, default=str))
 
 
