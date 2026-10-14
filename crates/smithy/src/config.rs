@@ -141,15 +141,7 @@ fn resolve(file: Option<&str>, env: impl Fn(&str) -> Option<String>) -> Result<C
         }
     }
 
-    if servers.is_empty() {
-        let hint = config_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_default();
-        bail!(
-            "aucun serveur configuré : définir SMITHY_URL (et SMITHY_TOKEN), \
-             ou déclarer des `[[server]]` dans {hint}"
-        )
-    }
+    // Aucun serveur : ce n'est pas une erreur, l'application demande d'en configurer un.
     let mut seen = HashSet::new();
     for s in &servers {
         if !valid_name(&s.name) {
@@ -303,7 +295,7 @@ mod tests {
 
     #[test]
     fn configurations_invalides() {
-        assert!(resolve(None, no_env).is_err());
+        assert!(resolve(None, no_env).unwrap().servers.is_empty());
         let dup = "[[server]]\nname=\"a\"\nurl=\"x\"\n[[server]]\nname=\"a\"\nurl=\"y\"";
         assert!(
             resolve(Some(dup), no_env)

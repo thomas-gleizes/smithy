@@ -78,6 +78,8 @@ cargo build --release -p smithy   # binary: target/release/smithy
 
 ## Configuration
 
+**First launch**: with no server configured (no `config.toml`, no `SMITHY_URL`), smithy opens a *Welcome* form and asks for one (name, URL, optional token) before anything else; `Esc` quits without writing anything. The server is saved to `config.toml` and the login form follows.
+
 Servers are declared in a TOML file at `~/.config/smithy/config.toml` (platform config dir). It holds no secret other than the optional API token:
 
 ```toml

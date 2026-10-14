@@ -177,6 +177,9 @@ pub struct ServerForm {
     pub token: String,
     pub field: ServerField,
     pub error: Option<String>,
+    /// Premier lancement, aucun serveur configuré : le formulaire ne peut pas être annulé
+    /// (Échap quitte), il n'y aurait rien à afficher sans lui.
+    pub first_run: bool,
 }
 
 /// Ce que le formulaire demande à `main` de faire (écrire la config, créer le fournisseur).
@@ -1546,7 +1549,16 @@ impl App {
             token: String::new(),
             field: ServerField::Name,
             error: None,
+            first_run: false,
         });
+    }
+
+    /// Premier lancement : le formulaire d'ajout, sans liste derrière et sans annulation possible.
+    pub fn open_first_server_form(&mut self) {
+        self.server_form_add();
+        if let Some(f) = self.server_form.as_mut() {
+            f.first_run = true;
+        }
     }
 
     /// `e` dans la liste : formulaire prérempli avec le serveur choisi (le nom n'est pas modifiable).
@@ -1566,6 +1578,7 @@ impl App {
             token: String::new(),
             field: ServerField::Url,
             error: None,
+            first_run: false,
         });
     }
 
@@ -1653,13 +1666,18 @@ impl App {
         // L'URL a pu changer : on remesure.
         self.reach.insert(name.to_owned(), Reach::Checking);
         self.probe(name);
-        if let Some(i) = self.servers.iter().position(|s| s.name == name) {
+        // Au premier lancement, il n'y a pas de liste à rouvrir derrière le formulaire.
+        if self.server_picker.is_some()
+            && let Some(i) = self.servers.iter().position(|s| s.name == name)
+        {
             self.server_picker = Some(i);
         }
     }
 
-    pub fn server_form_cancel(&mut self) {
-        self.server_form = None;
+    /// Échap dans le formulaire. Renvoie `true` s'il faut quitter : au premier lancement, il
+    /// n'y a rien derrière ; sinon il se ferme et la liste des serveurs revient.
+    pub fn server_form_escape(&mut self) -> bool {
+        self.server_form.take().is_some_and(|f| f.first_run)
     }
 
     /// `d` dans la liste : demande confirmation, sauf si la suppression est refusée.
@@ -3613,6 +3631,38 @@ mod tests {
         a.server_form_done(vec![entry("A"), entry("B")], "B");
         assert!(a.server_form.is_none());
         assert_eq!((a.servers.len(), a.server_picker), (2, Some(1)));
+    }
+
+    #[test]
+    fn premier_lancement_sans_serveur() {
+        // Pas `fresh()` : on garde la demande de l'accueil faite au démarrage
+        let mut a = App::new();
+        a.open_first_server_form();
+        assert!(a.server_form.as_ref().unwrap().first_run);
+        // Échap quitte : il n'y a rien derrière le formulaire
+        assert!(a.server_form_escape());
+        assert!(a.server_form.is_none());
+        a.open_first_server_form();
+        type_str(&mut a, "maison");
+        a.server_form_enter();
+        type_str(&mut a, "git.example");
+        a.server_form_enter();
+        let draft = a.server_form_enter().unwrap();
+        assert_eq!(
+            (draft.name.as_str(), draft.url.as_str()),
+            ("maison", "https://git.example")
+        );
+        // Enregistré : pas de liste des serveurs ouverte derrière, et l'accueil déjà demandé
+        // revient au nouveau serveur
+        a.server_form_done(vec![entry("maison")], "maison");
+        assert_eq!((a.server_form.is_none(), a.server_picker), (true, None));
+        a.set_initial_server("maison");
+        let sent = a.take_tagged_requests();
+        assert!(!sent.is_empty() && sent.iter().all(|(server, _)| server == "maison"));
+        // Un formulaire ordinaire, lui, ne fait que se fermer
+        a.open_server_picker();
+        a.server_form_add();
+        assert!(!a.server_form_escape());
     }
 
     #[test]

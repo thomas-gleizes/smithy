@@ -312,7 +312,14 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
     } else {
         "(facultatif : sinon connexion par mot de passe)"
     };
-    let mut lines = vec![
+    let mut lines = Vec::new();
+    if form.first_run {
+        lines.push(Line::from(Span::styled(
+            "Aucun serveur configuré : indiquez la forge à consulter.",
+            Style::new().fg(Color::DarkGray),
+        )));
+    }
+    lines.extend([
         field("Nom", form.name.clone(), ServerField::Name, editing),
         field("URL", form.url.clone(), ServerField::Url, false),
         field(
@@ -326,17 +333,19 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
             Style::new().fg(Color::DarkGray),
         )),
         Line::from(""),
-    ];
+    ]);
     lines.push(match &form.error {
         Some(e) => Line::from(Span::styled(e.clone(), Style::new().fg(Color::Red))),
         None => Line::from(""),
     });
+    let escape = if form.first_run { "quitter" } else { "annuler" };
     lines.push(Line::from(Span::styled(
-        "Entrée suivant / enregistrer · Tab changer de champ · Esc annuler",
+        format!("Entrée suivant / enregistrer · Tab changer de champ · Esc {escape}"),
         Style::new().fg(Color::DarkGray),
     )));
     let title = match &form.original {
         Some(n) => format!(" Modifier le serveur · {n} "),
+        None if form.first_run => " Bienvenue dans smithy · premier serveur ".to_owned(),
         None => " Nouveau serveur ".to_owned(),
     };
     let block = Block::default()
@@ -3117,6 +3126,20 @@ mod tests {
     }
 
     #[test]
+    fn premier_lancement_formulaire_impose() {
+        let mut app = App::new();
+        app.open_first_server_form();
+        let text = render(&app, 100, 20);
+        assert!(
+            text.contains("premier serveur")
+                && text.contains("Aucun serveur configuré")
+                && text.contains("Esc quitter")
+                && text.contains("https://"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn formulaire_et_confirmation_des_serveurs() {
         let mut app = two_servers();
         app.open_server_picker();
@@ -3136,7 +3159,7 @@ mod tests {
         );
         app.server_form_fail("nom invalide".into());
         assert!(render(&app, 110, 20).contains("nom invalide"));
-        app.server_form_cancel();
+        app.server_form_escape();
         app.server_picker_move(1);
         app.server_form_edit();
         let text = render(&app, 110, 20);
@@ -3144,7 +3167,7 @@ mod tests {
             text.contains("Modifier le serveur · B") && text.contains("inchangé"),
             "{text}"
         );
-        app.server_form_cancel();
+        app.server_form_escape();
         app.server_delete_ask();
         assert!(render(&app, 110, 20).contains("Supprimer « B » ?"));
         app.server_delete_cancel();

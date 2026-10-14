@@ -44,8 +44,11 @@ async fn main() -> Result<()> {
     let fresh = parse_args()?;
     let cfg = config::load()?;
     let wanted = std::env::var("SMITHY_SERVER").ok();
-    // Vérifie le nom demandé (erreur claire) avant d'ouvrir le terminal.
-    cfg.server(wanted.as_deref())?;
+    // Vérifie le nom demandé (erreur claire) avant d'ouvrir le terminal. Sans serveur, rien à
+    // vérifier : l'application en fait configurer un au lancement.
+    if wanted.is_some() {
+        cfg.server(wanted.as_deref())?;
+    }
     let store = SessionStore::default_location();
 
     let mut terminal = ratatui::init();
@@ -791,6 +794,10 @@ fn save_server(
         None => app.forget_caps(&server.name),
     }
     app.server_form_done(entries(&list), &server.name);
+    // Premier serveur du premier lancement : l'onglet, encore sans serveur, devient le sien.
+    if app.server_name.is_empty() {
+        app.set_initial_server(&server.name);
+    }
     // L'onglet affiché est sur ce serveur et il n'est plus connecté (URL changée) : login.
     if server.name == app.server_name && !app.is_connected(&server.name) && app.login.is_none() {
         app.open_login(&server.name, &backends[&server.name].username, false);
@@ -889,8 +896,11 @@ async fn run(
         initial
     };
     let mut last_saved_tabs: Option<workspace::SavedTabs> = None;
-    if backends[&initial].provider.is_none() {
-        app.open_login(&initial, &backends[&initial].username, false);
+    match backends.get(&initial) {
+        // Premier lancement : aucun serveur configuré, le formulaire d'ajout s'impose.
+        None => app.open_first_server_form(),
+        Some(b) if b.provider.is_none() => app.open_login(&initial, &b.username, false),
+        Some(_) => {}
     }
     let mut last_refresh = Instant::now();
 
@@ -921,7 +931,7 @@ async fn run(
                 }
             } else if app.server_form.is_some() {
                 match k.code {
-                    KeyCode::Esc => app.server_form_cancel(),
+                    KeyCode::Esc => app.should_quit = app.server_form_escape(),
                     KeyCode::Enter => {
                         if let Some(draft) = app.server_form_enter()
                             && let Err(e) =
