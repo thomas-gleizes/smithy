@@ -3,6 +3,7 @@ mod browser;
 mod config;
 mod highlight;
 mod logview;
+mod markdown;
 mod pages;
 mod recent;
 mod request;
@@ -206,6 +207,11 @@ fn browser_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('g') | KeyCode::Home => app.text_top(),
             KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
             KeyCode::Char('w') => app.text_toggle_wrap(),
+            KeyCode::Char('m') => {
+                if let Some(b) = app.browser_mut() {
+                    b.toggle_rendered();
+                }
+            }
             KeyCode::Char('r') => app.refresh_current(),
             _ => {}
         },
@@ -314,7 +320,9 @@ fn run_request<P: Provider + 'static>(
                 if let Some(text) = result.as_ref().ok().and_then(|c| c.text.as_deref()) {
                     let (lines, _) = browser::file_lines(text);
                     if !lines.is_empty() {
-                        styling = Some((repo.clone(), reference.clone(), path.clone(), lines));
+                        let source = markdown::is_markdown(&path).then(|| text.to_owned());
+                        styling =
+                            Some((repo.clone(), reference.clone(), path.clone(), lines, source));
                     }
                 }
                 Msg::File {
@@ -326,17 +334,27 @@ fn run_request<P: Provider + 'static>(
             }
         };
         let _ = tx.send((server.clone(), msg));
-        if let Some((repo, reference, path, lines)) = styling {
+        if let Some((repo, reference, path, lines, markdown_source)) = styling {
             // Chargement des grammaires et analyse : hors du fil de l'interface.
             let job = tokio::task::spawn_blocking(move || {
-                let styles = highlight::highlight_file(&path, &lines)?;
-                let fingerprint = logview::fingerprint_of(&lines);
+                let styles = highlight::highlight_file(&path, &lines);
+                // Markdown : la vue mise en forme, avec ses blocs de code colorés (seules les
+                // régions nous intéressent : le texte est déjà affiché).
+                let rendered = markdown_source.map(|src| {
+                    let doc = markdown::render(&src, true);
+                    let fp = logview::fingerprint_of(doc.iter().map(|l| &l.text));
+                    (fp, doc.into_iter().map(|l| l.runs).collect::<Vec<_>>())
+                });
+                if styles.is_none() && rendered.is_none() {
+                    return None;
+                }
                 Some(Msg::FileStyles {
                     repo,
                     reference,
                     path,
-                    fingerprint,
-                    styles,
+                    fingerprint: logview::fingerprint_of(&lines),
+                    styles: styles.unwrap_or_default(),
+                    rendered,
                 })
             });
             if let Ok(Some(msg)) = job.await {

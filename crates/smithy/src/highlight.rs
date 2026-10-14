@@ -29,6 +29,7 @@ pub enum Tok {
     Heading,
     Strong,
     Emph,
+    Strike,
     Link,
     Quote,
     Code,
@@ -153,6 +154,18 @@ pub fn segments<'a>(text: &'a str, offset: usize, runs: &[Run]) -> Vec<(&'a str,
         out.push((text, None));
     }
     out
+}
+
+/// Colore un langage donné (nom de grammaire, ex. celui d'un bloc de code Markdown).
+/// `None` si on ne le connaît pas.
+pub fn highlight_as(lang: &str, lines: &[String]) -> Option<Vec<Vec<Run>>> {
+    let set = syntaxes();
+    let lang = lang.trim().to_lowercase();
+    let syntax = set
+        .find_syntax_by_token(&lang)
+        .or_else(|| set.find_syntax_by_extension(&lang))
+        .filter(|s| s.name != "Plain Text")?;
+    Some(run(syntax, lines))
 }
 
 /// Colore les lignes d'un fichier (texte **déjà nettoyé**, tel qu'il est affiché : les
@@ -319,6 +332,14 @@ mod tests {
             segments("xyz", 3, &[run(0, 5, Tok::Comment)]),
             [("xy", Some(Tok::Comment)), ("z", None)]
         );
+    }
+
+    #[test]
+    fn bloc_de_code_par_nom_de_langage() {
+        let src = lines("fn x() {}");
+        assert!(highlight_as("rust", &src).is_some());
+        assert!(highlight_as("rs", &src).is_some());
+        assert!(highlight_as("langage-inconnu", &src).is_none());
     }
 
     #[test]

@@ -33,6 +33,51 @@ pub fn ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
     out
 }
 
+/// Découpe `text` pour une largeur donnée, avec deux options pour le texte formaté (Markdown) :
+/// `words` coupe de préférence après une espace (un mot plus long que la ligne est coupé au
+/// caractère), et `hang` colonnes sont réservées au début de chaque ligne **suivante** (le
+/// retrait d'une puce de liste, la barre d'une citation). Sans option, c'est `ranges`.
+pub fn layout(text: &str, width: usize, hang: usize, words: bool) -> Vec<(usize, usize)> {
+    if !words && hang == 0 {
+        return ranges(text, width);
+    }
+    let width = width.max(1);
+    let later = width.saturating_sub(hang).max(1);
+    let mut out = Vec::new();
+    let (mut start, mut used, mut limit) = (0, 0, width);
+    // Dernière coupe possible de la ligne en cours : juste après une espace.
+    let mut soft: Option<usize> = None;
+    for (i, c) in text.char_indices() {
+        let w = c.width().unwrap_or(0);
+        if used + w > limit && i > start {
+            let cut = match soft {
+                Some(b) if words && b > start => b,
+                _ => i,
+            };
+            out.push((start, cut));
+            start = cut;
+            limit = later;
+            used = text[cut..i].chars().map(|c| c.width().unwrap_or(0)).sum();
+            soft = None;
+        }
+        used += w;
+        if c == ' ' {
+            soft = Some(i + 1);
+        }
+    }
+    out.push((start, text.len()));
+    out
+}
+
+/// Nombre de lignes d'écran de ce que ferait `layout`.
+pub fn count(text: &str, width: usize, hang: usize, words: bool) -> usize {
+    if !words && hang == 0 {
+        rows(text, width)
+    } else {
+        layout(text, width, hang, words).len()
+    }
+}
+
 /// Nombre de lignes d'écran de `text`, sans allouer.
 pub fn rows(text: &str, width: usize) -> usize {
     let width = width.max(1);
@@ -52,6 +97,64 @@ pub fn rows(text: &str, width: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coupe_apres_une_espace_et_retrait_des_lignes_suivantes() {
+        let text = "un deux trois quatre";
+        let cut = |w, h, words| {
+            layout(text, w, h, words)
+                .into_iter()
+                .map(|(a, b)| &text[a..b])
+                .collect::<Vec<_>>()
+        };
+        // Par mots : la coupe suit l'espace, qui reste en fin de ligne
+        assert_eq!(cut(9, 0, true), ["un deux ", "trois ", "quatre"]);
+        // Au caractère (sans l'option) : comme `chunks`
+        assert_eq!(cut(9, 0, false), chunks(text, 9));
+        // Retrait de 2 colonnes : les lignes suivantes sont plus étroites
+        assert_eq!(cut(10, 2, true), ["un deux ", "trois ", "quatre"]);
+        // Un mot plus long que la ligne est coupé au caractère
+        let long = "abcdefghij kl";
+        let parts: Vec<_> = layout(long, 4, 0, true)
+            .into_iter()
+            .map(|(a, b)| &long[a..b])
+            .collect();
+        assert_eq!(parts, ["abcd", "efgh", "ij ", "kl"]);
+        // Largeur nulle ou retrait plus grand que la largeur : pas de boucle infinie
+        assert!(!layout(text, 0, 5, true).is_empty());
+        assert!(!layout(text, 3, 9, true).is_empty());
+    }
+
+    #[test]
+    fn le_nombre_de_lignes_suit_toujours_le_decoupage() {
+        let samples = [
+            "",
+            "a",
+            "un deux trois quatre cinq six sept",
+            "mot-très-long-sans-espace-du-tout-vraiment",
+            "日本語 の テキスト と des accents é à ü",
+            "  espaces   multiples   ",
+            "fin avec espace ",
+        ];
+        for text in samples {
+            for width in [1, 2, 3, 5, 8, 13, 40] {
+                for hang in [0, 1, 2, 4] {
+                    for words in [false, true] {
+                        assert_eq!(
+                            count(text, width, hang, words),
+                            layout(text, width, hang, words).len(),
+                            "{text:?} w={width} h={hang} words={words}"
+                        );
+                        // Les morceaux se touchent et couvrent tout le texte
+                        let parts = layout(text, width, hang, words);
+                        assert_eq!(parts.first().map(|p| p.0), Some(0));
+                        assert_eq!(parts.last().map(|p| p.1), Some(text.len()));
+                        assert!(parts.windows(2).all(|w| w[0].1 == w[1].0));
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn coupe_a_la_largeur() {

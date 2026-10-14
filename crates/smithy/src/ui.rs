@@ -487,6 +487,7 @@ fn tok_style(tok: Tok) -> Style {
         Tok::Heading => fg(Color::Cyan).bold(),
         Tok::Strong => Style::new().bold(),
         Tok::Emph => Style::new().add_modifier(Modifier::ITALIC),
+        Tok::Strike => Style::new().add_modifier(Modifier::CROSSED_OUT),
         Tok::Link => fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
         Tok::Code => fg(Color::Green),
     }
@@ -535,16 +536,23 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
                         };
                         Line::from(Span::styled(r.text, style))
                     }
-                    LineKind::Text if r.runs.is_empty() => Line::from(r.text),
-                    LineKind::Text => Line::from(
-                        highlight::segments(r.text, r.offset, r.runs)
-                            .into_iter()
-                            .map(|(text, tok)| match tok {
-                                Some(t) => Span::styled(text, tok_style(t)),
-                                None => Span::raw(text),
-                            })
-                            .collect::<Vec<_>>(),
-                    ),
+                    LineKind::Text if r.runs.is_empty() && r.hang.is_empty() => Line::from(r.text),
+                    LineKind::Text => {
+                        let mut spans = Vec::new();
+                        // Suite d'une ligne repliée : le retrait de la puce, la barre de citation.
+                        if r.continuation && !r.hang.is_empty() {
+                            spans.push(Span::styled(r.hang, tok_style(Tok::Quote)));
+                        }
+                        spans.extend(
+                            highlight::segments(r.text, r.offset, r.runs)
+                                .into_iter()
+                                .map(|(text, tok)| match tok {
+                                    Some(t) => Span::styled(text, tok_style(t)),
+                                    None => Span::raw(text),
+                                }),
+                        );
+                        Line::from(spans)
+                    }
                 })
                 .collect()
         }
@@ -671,7 +679,30 @@ fn dir_help(width: usize) -> &'static str {
     )
 }
 
-fn file_help(width: usize) -> &'static str {
+fn file_help(width: usize, markdown: bool, rendered: bool) -> &'static str {
+    if markdown {
+        // Le rendu se replie toujours par mots : `w` n'y sert pas.
+        return pick_help(
+            width,
+            if rendered {
+                &[
+                    "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · m texte source · r actualiser · Esc/← retour",
+                    "j/k défiler · g/G · m source · Esc retour",
+                    "j/k · m · Esc",
+                    "m · Esc",
+                    "Esc",
+                ]
+            } else {
+                &[
+                    "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · w retour à la ligne · m rendu · r actualiser · Esc/← retour",
+                    "j/k défiler · g/G · w repli · m rendu · Esc retour",
+                    "j/k · w · m · Esc",
+                    "m · Esc",
+                    "Esc",
+                ]
+            },
+        );
+    }
     pick_help(
         width,
         &[
@@ -697,9 +728,16 @@ fn draw_browser(f: &mut Frame, app: &App, b: &Browser, area: Rect) {
     let width = area.width as usize;
     // Dépôt et branche sont dans le fil d'Ariane : le cadre montre le chemin.
     if let Mode::File(fv) = &b.mode {
-        let title = Line::from(format!(" /{} ", fv.path));
-        draw_text_pane(f, app, rows[0], title, &fv.text);
-        draw_footer(f, app, rows[1], file_help(width), None);
+        // Un fichier Markdown dit quelle vue il montre ; `m` bascule.
+        let mode = match (fv.rendered.is_some(), fv.is_rendered()) {
+            (true, true) => " · rendu",
+            (true, false) => " · source",
+            _ => "",
+        };
+        let title = Line::from(format!(" /{}{mode} ", fv.path));
+        draw_text_pane(f, app, rows[0], title, fv.view());
+        let help = file_help(width, fv.rendered.is_some(), fv.is_rendered());
+        draw_footer(f, app, rows[1], help, None);
         return;
     }
     draw_dir(f, app, b, rows[0], format!(" /{} ", b.path));
@@ -1367,6 +1405,8 @@ mod tests {
             text: text.into(),
             step: None,
             runs: Vec::new(),
+            hang: String::new(),
+            words: false,
         }
     }
 
@@ -2285,13 +2325,22 @@ mod tests {
     #[test]
     fn aides_de_l_explorateur_adaptees_a_la_largeur() {
         for w in [120, 80, 50, 30, 12, 5, 0] {
-            for h in [dir_help(w), file_help(w), branches_help(w)] {
+            for h in [
+                dir_help(w),
+                file_help(w, false, false),
+                file_help(w, true, true),
+                file_help(w, true, false),
+                branches_help(w),
+            ] {
                 assert!(h.chars().count() <= w.max(3), "{h:?} dépasse {w}");
                 assert!(h.contains("Esc"));
             }
         }
         assert!(dir_help(120).contains("B branche") && dir_help(120).contains("remonter"));
-        assert!(file_help(120).contains("w retour à la ligne"));
+        assert!(file_help(120, false, false).contains("w retour à la ligne"));
+        assert!(!file_help(120, true, true).contains("w retour"));
+        assert!(file_help(120, true, true).contains("m texte source"));
+        assert!(file_help(120, true, false).contains("m rendu"));
     }
 
     // --- fil d'Ariane
@@ -2646,6 +2695,8 @@ mod tests {
                 run(7, 11, Tok::Str),
                 run(13, 18, Tok::Comment),
             ],
+            hang: String::new(),
+            words: false,
         }]));
         app.viewport.set(5);
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
@@ -2662,5 +2713,31 @@ mod tests {
         assert_eq!(fg_of("W"), Some(Color::DarkGray), "commentaire");
         // Le texte sans région garde la couleur par défaut
         assert_eq!(fg_of("x"), Some(Color::Reset));
+    }
+
+    #[test]
+    fn markdown_replie_par_mots_avec_retrait_et_barre() {
+        use crate::markdown;
+        let src = "- un deux trois quatre cinq six sept huit neuf dix onze douze\n\n> citation tres longue qui doit se replier correctement sur la ligne suivante\n";
+        let lines: Vec<_> = markdown::render(src, false)
+            .into_iter()
+            .map(markdown::MdLine::into_log_line)
+            .collect();
+        let mut app = app_with_logs(LogState::Ready(lines));
+        if let Some(v) = app.logs_mut() {
+            v.wrap = true;
+        }
+        let text = render(&app, 40, 14);
+        // Aucun mot n'est coupé : chaque mot du texte reste entier à l'écran
+        for w in ["quatre", "douze", "citation", "replier", "suivante"] {
+            assert!(text.contains(w), "{w} coupé : {text}");
+        }
+        // La puce n'est que sur la première ligne ; la suite est retirée (les 2 colonnes de la
+        // puce sont des espaces) et la citation garde sa barre
+        assert_eq!(text.matches('•').count(), 1, "{text}");
+        assert!(
+            text.matches('▎').count() >= 2,
+            "la barre suit la citation : {text}"
+        );
     }
 }

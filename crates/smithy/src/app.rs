@@ -63,6 +63,8 @@ pub enum Msg {
         path: String,
         fingerprint: u64,
         styles: Vec<Vec<Run>>,
+        /// Markdown : régions de la vue mise en forme (empreinte de son texte, régions par ligne).
+        rendered: Option<(u64, Vec<Vec<Run>>)>,
     },
     /// Résultat de la sonde de joignabilité d'un serveur (version si connue, ou raison).
     Reach {
@@ -649,7 +651,7 @@ impl App {
     fn active_text_mut(&mut self) -> Option<&mut TextView> {
         match self.stack.last_mut()? {
             Page::Browser(b) => match &mut b.mode {
-                Mode::File(fv) => Some(&mut fv.text),
+                Mode::File(fv) => Some(fv.view_mut()),
                 _ => None, // la liste d'un dossier n'est pas un volet de texte
             },
             Page::Logs(v) => Some(&mut **v),
@@ -715,6 +717,13 @@ impl App {
 
     /// Retour à la ligne (touche `w`) : la même ligne de log reste en haut de l'écran.
     pub fn text_toggle_wrap(&mut self) {
+        // La vue Markdown se replie toujours par mots, et ne touche pas au réglage des logs.
+        if self
+            .browser()
+            .is_some_and(|b| matches!(&b.mode, Mode::File(fv) if fv.is_rendered()))
+        {
+            return;
+        }
         let (w, h) = self.view_size();
         if let Some(v) = self.active_text_mut() {
             v.toggle_wrap(w, h);
@@ -878,10 +887,18 @@ impl App {
                 path,
                 fingerprint,
                 styles,
+                rendered,
             } => {
                 for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Browser(b) = page {
-                        b.on_styles(&repo, &reference, &path, fingerprint, styles.clone());
+                        b.on_styles(
+                            &repo,
+                            &reference,
+                            &path,
+                            fingerprint,
+                            styles.clone(),
+                            rendered.clone(),
+                        );
                     }
                 }
             }
@@ -3707,6 +3724,7 @@ mod tests {
             path: path.into(),
             fingerprint,
             styles,
+            rendered: None,
         };
         // Un autre fichier, un autre dépôt ou un texte différent : ignoré
         a.apply(styled(fingerprint, "autre.rs", styles.clone()));
@@ -3739,5 +3757,100 @@ mod tests {
         assert!(!cut);
         assert_eq!(lines, ["a    b\u{2401}", "c"]);
         assert!(crate::browser::file_lines("").0.is_empty());
+    }
+
+    // --- Markdown
+
+    const MD: &str = "# Titre\n\n- un élément de liste assez long pour être replié sur plusieurs lignes\n\n```rust\nfn main() {}\n```\n";
+
+    fn md_view(a: &App) -> &crate::browser::FileView {
+        match &a.browser().unwrap().mode {
+            Mode::File(fv) => fv,
+            _ => panic!("pas de fichier ouvert"),
+        }
+    }
+
+    #[test]
+    fn un_fichier_markdown_s_ouvre_mis_en_forme_et_m_bascule() {
+        let mut a = explorer();
+        open_file(&mut a, "README.md", MD);
+        let fv = md_view(&a);
+        assert!(fv.is_rendered(), "rendu d'abord");
+        let LogState::Ready(rendered) = &fv.view().state else {
+            panic!("rendu pas prêt");
+        };
+        assert_eq!(rendered[0].text, "# Titre");
+        assert!(rendered[2].words && rendered[2].hang == "  ");
+        // La source reste accessible, telle quelle
+        let LogState::Ready(source) = &fv.text.state else {
+            panic!("source pas prête");
+        };
+        assert_eq!(source[0].text, "# Titre");
+        assert_eq!(source.len(), 7);
+        // m : source, puis de nouveau le rendu
+        a.browser_mut().unwrap().toggle_rendered();
+        assert!(!md_view(&a).is_rendered());
+        a.browser_mut().unwrap().toggle_rendered();
+        assert!(md_view(&a).is_rendered());
+        // Un fichier qui n'est pas du Markdown n'a pas de rendu, `m` ne fait rien
+        let mut b = explorer();
+        open_file(&mut b, "a.txt", MD);
+        assert!(!md_view(&b).is_rendered() && md_view(&b).rendered.is_none());
+        b.browser_mut().unwrap().toggle_rendered();
+        assert!(!md_view(&b).is_rendered());
+    }
+
+    #[test]
+    fn le_rendu_markdown_se_replie_toujours_et_laisse_le_reglage_des_logs() {
+        let mut a = explorer();
+        a.logs_wrap = false;
+        open_file(&mut a, "README.md", MD);
+        a.viewport.set(5);
+        a.viewport_width.set(20);
+        let before = md_view(&a).view().wrap;
+        a.text_toggle_wrap(); // sans effet sur le rendu
+        assert!(before && md_view(&a).view().wrap);
+        assert!(!a.logs_wrap, "le réglage des logs n'a pas bougé");
+        // Sur la source, `w` retrouve son rôle
+        a.browser_mut().unwrap().toggle_rendered();
+        a.text_toggle_wrap();
+        assert!(a.logs_wrap);
+    }
+
+    #[test]
+    fn coloration_des_blocs_de_code_du_rendu_markdown() {
+        let mut a = explorer();
+        open_file(&mut a, "README.md", MD);
+        let doc = crate::markdown::render(MD, true);
+        let texts: Vec<_> = doc.iter().map(|l| &l.text).collect();
+        let fp = crate::logview::fingerprint_of(texts);
+        let source = crate::browser::file_lines(MD).0;
+        let runs_per_line = |a: &App| match &md_view(a).view().state {
+            LogState::Ready(lines) => lines.iter().map(|l| l.runs.len()).collect::<Vec<_>>(),
+            _ => vec![],
+        };
+        let before = runs_per_line(&a);
+        let msg = |rendered| Msg::FileStyles {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "README.md".into(),
+            fingerprint: crate::logview::fingerprint_of(&source),
+            styles: vec![],
+            rendered,
+        };
+        // Empreinte différente : ignoré
+        a.apply(msg(Some((
+            fp ^ 1,
+            doc.iter().map(|l| l.runs.clone()).collect(),
+        ))));
+        assert_eq!(runs_per_line(&a), before);
+        // Bonne empreinte : les régions du bloc de code arrivent
+        a.apply(msg(Some((
+            fp,
+            doc.iter().map(|l| l.runs.clone()).collect(),
+        ))));
+        let after = runs_per_line(&a);
+        assert_ne!(after, before);
+        assert!(after.iter().zip(&before).any(|(a, b)| a > b));
     }
 }

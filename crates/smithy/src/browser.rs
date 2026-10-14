@@ -7,7 +7,7 @@ use std::cell::Cell;
 
 use smithy_core::{Branch, Entry, EntryKind, Error, FileContent, Repo, clean_text_line};
 
-use crate::{highlight::Run, logview::TextView, request::Request};
+use crate::{highlight::Run, logview::TextView, markdown, request::Request};
 
 /// Octets lus d'un fichier au plus : au-delà, seul le début est affiché.
 pub const FILE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -25,7 +25,43 @@ pub enum DirState {
 #[derive(Debug, Clone)]
 pub struct FileView {
     pub path: String,
+    /// Le texte du fichier tel quel (coloré par sa grammaire quand elle est connue).
     pub text: TextView,
+    /// Un fichier Markdown a aussi une vue mise en forme, affichée d'abord ; `m` passe de l'une
+    /// à l'autre. Elle se replie toujours par mots : sans cela le texte serait illisible.
+    pub rendered: Option<TextView>,
+    pub show_rendered: bool,
+}
+
+impl FileView {
+    pub fn new(path: String) -> Self {
+        Self {
+            path,
+            text: TextView::new(),
+            rendered: None,
+            show_rendered: false,
+        }
+    }
+
+    /// La vue à l'écran.
+    pub fn view(&self) -> &TextView {
+        match &self.rendered {
+            Some(r) if self.show_rendered => r,
+            _ => &self.text,
+        }
+    }
+
+    pub fn view_mut(&mut self) -> &mut TextView {
+        match &mut self.rendered {
+            Some(r) if self.show_rendered => r,
+            _ => &mut self.text,
+        }
+    }
+
+    /// Affiche-t-on la vue mise en forme ?
+    pub fn is_rendered(&self) -> bool {
+        self.show_rendered && self.rendered.is_some()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -35,7 +71,7 @@ pub enum Mode {
     Branches {
         selected: usize,
     },
-    File(FileView),
+    File(Box<FileView>),
 }
 
 /// L'écran affiché, sans les données : pratique pour choisir les touches à interpréter.
@@ -234,7 +270,34 @@ impl Browser {
             return;
         }
         match result {
-            Ok(content) => show_file(&mut fv.text, &content),
+            Ok(content) => {
+                show_file(&mut fv.text, &content);
+                // Markdown : la vue mise en forme (sans coloration des blocs de code, qui
+                // arrive à part) s'affiche tout de suite.
+                match content
+                    .text
+                    .as_deref()
+                    .filter(|_| markdown::is_markdown(path))
+                {
+                    Some(text) => {
+                        let lines = markdown::render(text, false)
+                            .into_iter()
+                            .map(markdown::MdLine::into_log_line)
+                            .collect();
+                        let view = fv.rendered.get_or_insert_with(|| {
+                            fv.show_rendered = true;
+                            let mut v = TextView::new();
+                            v.wrap = true;
+                            v
+                        });
+                        view.set_lines(lines);
+                    }
+                    None => {
+                        fv.rendered = None;
+                        fv.show_rendered = false;
+                    }
+                }
+            }
             Err(e) => fv.text.state = crate::logview::LogState::Failed(e.to_string()),
         }
     }
@@ -248,12 +311,27 @@ impl Browser {
         path: &str,
         fingerprint: u64,
         styles: Vec<Vec<Run>>,
+        rendered: Option<(u64, Vec<Vec<Run>>)>,
     ) {
         let Mode::File(fv) = &mut self.mode else {
             return;
         };
         if *repo == self.repo && reference == self.reference && path == fv.path {
             fv.text.set_styles(fingerprint, styles);
+            // Les blocs de code de la vue mise en forme : mêmes lignes, régions en plus.
+            if let (Some(view), Some((fp, runs))) = (fv.rendered.as_mut(), rendered) {
+                view.set_styles(fp, runs);
+            }
+        }
+    }
+
+    /// Touche `m` : passe de la vue mise en forme au texte source, et inversement. Sans effet
+    /// pour un fichier qui n'a pas de vue mise en forme.
+    pub fn toggle_rendered(&mut self) {
+        if let Mode::File(fv) = &mut self.mode
+            && fv.rendered.is_some()
+        {
+            fv.show_rendered = !fv.show_rendered;
         }
     }
 
@@ -290,10 +368,7 @@ impl Browser {
                         self.request_dir();
                     }
                     EntryKind::File => {
-                        self.mode = Mode::File(FileView {
-                            path: entry.path.clone(),
-                            text: TextView::new(),
-                        });
+                        self.mode = Mode::File(Box::new(FileView::new(entry.path.clone())));
                         self.request_file(entry.path);
                     }
                     EntryKind::Symlink => {
@@ -660,10 +735,7 @@ mod tests {
         );
         b.path = "src/deep".into();
         assert_eq!(b.breadcrumb(), ["Code", "feature/x", "src", "deep"]);
-        b.mode = Mode::File(FileView {
-            path: "src/deep/a.rs".into(),
-            text: TextView::new(),
-        });
+        b.mode = Mode::File(Box::new(FileView::new("src/deep/a.rs".into())));
         assert_eq!(b.breadcrumb(), ["Code", "feature/x", "src", "deep", "a.rs"]);
         b.path.clear();
         b.mode = Mode::Dir;
@@ -823,10 +895,7 @@ mod tests {
             }),
         );
         assert!(matches!(b.mode, Mode::Dir));
-        b.mode = Mode::File(FileView {
-            path: "a.txt".into(),
-            text: TextView::new(),
-        });
+        b.mode = Mode::File(Box::new(FileView::new("a.txt".into())));
         b.on_file(
             &repo(),
             "main",
@@ -855,10 +924,7 @@ mod tests {
         b.path = "src".into();
         b.on_dir(&repo(), "main", "src", Err(Error::NotFound("src".into())));
         assert!(matches!(&b.dir, DirState::Failed(m) if m.contains("src")));
-        b.mode = Mode::File(FileView {
-            path: "a.txt".into(),
-            text: TextView::new(),
-        });
+        b.mode = Mode::File(Box::new(FileView::new("a.txt".into())));
         b.on_file(
             &repo(),
             "main",
@@ -976,10 +1042,7 @@ mod tests {
                 path: "src".into()
             }]
         );
-        b.mode = Mode::File(FileView {
-            path: "src/a.rs".into(),
-            text: TextView::new(),
-        });
+        b.mode = Mode::File(Box::new(FileView::new("src/a.rs".into())));
         b.refresh();
         assert_eq!(
             b.take_requests(),

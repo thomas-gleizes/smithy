@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 syntect = { version = "5", default-features = false, features = ["parsing", "regex-fancy"] }
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
+pulldown-cmark = { version = "0.13", default-features = false }
 
 [lints]
 workspace = true

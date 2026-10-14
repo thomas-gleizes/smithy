@@ -28,6 +28,16 @@ pub struct LogLine {
     pub step: Option<usize>,
     /// Couleurs de la coloration syntaxique (octets de `text`) ; vide pour un log.
     pub runs: Vec<Run>,
+    /// Texte formaté (Markdown) : début des lignes d'écran qui suivent la première (retrait
+    /// d'une puce, barre d'une citation), et retour à la ligne par mots plutôt qu'au caractère.
+    pub hang: String,
+    pub words: bool,
+}
+
+impl LogLine {
+    fn hang_width(&self) -> usize {
+        unicode_width::UnicodeWidthStr::width(self.hang.as_str())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -46,6 +56,8 @@ pub struct Row<'a> {
     /// de **toute** la ligne : à découper avec `run_slices`.
     pub offset: usize,
     pub runs: &'a [Run],
+    /// À afficher devant le texte quand `continuation` (voir `LogLine::hang`).
+    pub hang: &'a str,
     /// Suite d'une ligne repliée (et non début d'une ligne de log).
     pub continuation: bool,
     /// Titre de la section courante (celle que `Espace` plie ou déplie).
@@ -191,6 +203,8 @@ impl TextView {
                     text,
                     step: None,
                     runs: Vec::new(),
+                    hang: String::new(),
+                    words: false,
                 })
                 .collect(),
         );
@@ -237,6 +251,8 @@ impl TextView {
                 text: "(aucune étape : le job n'a pas démarré)".to_owned(),
                 step: None,
                 runs: Vec::new(),
+                hang: String::new(),
+                words: false,
             });
         }
         for (i, step) in log.steps.iter().enumerate() {
@@ -254,12 +270,16 @@ impl TextView {
                 text: String::new(), // rempli par `refresh_headers`
                 step: Some(i),
                 runs: Vec::new(),
+                hang: String::new(),
+                words: false,
             });
             lines.extend(step.lines.iter().map(|l| LogLine {
                 kind: LineKind::Text,
                 text: l.clone(),
                 step: Some(i),
                 runs: Vec::new(),
+                hang: String::new(),
+                words: false,
             }));
         }
         self.sections = sections;
@@ -267,8 +287,7 @@ impl TextView {
         self.refresh_headers();
     }
 
-    /// Variante pour les tests : des lignes sans étape, donc jamais repliées.
-    #[cfg(test)]
+    /// Remplace le contenu par des lignes sans étape, donc jamais repliées (fichier, Markdown).
     pub fn set_lines(&mut self, lines: Vec<LogLine>) {
         self.sections.clear();
         self.state = LogState::Ready(lines);
@@ -313,7 +332,7 @@ impl TextView {
                 total += if self.hidden(l) {
                     0
                 } else if self.wrap {
-                    wrap::rows(&l.text, key)
+                    wrap::count(&l.text, key, l.hang_width(), l.words)
                 } else {
                     1
                 };
@@ -461,13 +480,15 @@ impl TextView {
                     text,
                     offset,
                     runs: &line.runs,
+                    hang: &line.hang,
                     continuation,
                     current: is_current,
                 });
                 out.len() == height
             };
             if self.wrap {
-                for (n, (start, end)) in wrap::ranges(&line.text, width).into_iter().enumerate() {
+                let parts = wrap::layout(&line.text, width, line.hang_width(), line.words);
+                for (n, (start, end)) in parts.into_iter().enumerate() {
                     if skip > 0 {
                         skip -= 1;
                         continue;
@@ -515,6 +536,8 @@ mod tests {
                     text: (*t).to_owned(),
                     step: None,
                     runs: Vec::new(),
+                    hang: String::new(),
+                    words: false,
                 })
                 .collect(),
         );
@@ -642,6 +665,8 @@ mod tests {
             text: "abcdefghijkl".into(),
             step: None,
             runs: Vec::new(),
+            hang: String::new(),
+            words: false,
         }]);
         assert_eq!(v.total_rows(6), 2, "autre contenu : recalculé");
     }

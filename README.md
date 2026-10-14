@@ -10,7 +10,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 
 - A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list and the code explorer.
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
-- Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme.
+- Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme. **Markdown files** (`.md`) open rendered: headings, emphasis, lists (nested, ordered, task lists), quotes, tables, links (the target is shown), images (alt text), rules, and code blocks coloured by their language; raw HTML is shown dimmed. Press `m` to switch to the highlighted source.
 - Sign in from the TUI (username and password, entered once and never stored).
 - A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`; each tab has its own server, which you can change from the tab (`S`) without touching the other tabs.
 - Run status translated to a common model (`Status`), whatever the forge.
@@ -138,7 +138,7 @@ In the code explorer:
 | `r`                   | Refresh                         |
 | `Esc`, `q`            | Close the file or the picker, then the explorer |
 
-A file opens in the same viewer as the logs (the text shows at once; the colours arrive a moment later, computed in the background; files over 20,000 lines or lines over 1,000 bytes stay uncoloured): `j`/`k`, `f`/`b`, `g`/`G` and `w` (wrap) work the same way. Symbolic links and submodules are listed but not opened. The explorer only needs the read-only API token (no session cookie) and works on every Forgejo version from 10 to 15 (the content API is the same).
+A Markdown file opens rendered; `m` toggles between the rendered view and the source (the rendered view always wraps at word boundaries, so `w` only applies to the source). A file opens in the same viewer as the logs (the text shows at once; the colours arrive a moment later, computed in the background; files over 20,000 lines or lines over 1,000 bytes stay uncoloured): `j`/`k`, `f`/`b`, `g`/`G` and `w` (wrap) work the same way. Symbolic links and submodules are listed but not opened. The explorer only needs the read-only API token (no session cookie) and works on every Forgejo version from 10 to 15 (the content API is the same).
 
 In the log view:
 
@@ -194,6 +194,7 @@ A new forge is a new crate implementing `Provider`.
 - [x] Job steps and logs for Forgejo
 - [x] Code explorer (branches, folders, files)
 - [x] Syntax highlighting in the explorer
+- [x] Markdown rendering in the explorer
 - [ ] File search by name in the explorer, tags and commits as references
 - [ ] Open the run URL from the TUI
 - [ ] GitHub backend (jobs and logs)
