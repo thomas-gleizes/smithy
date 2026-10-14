@@ -659,6 +659,90 @@ impl App {
         }
     }
 
+    fn active_text(&self) -> Option<&TextView> {
+        match self.stack.last()? {
+            Page::Browser(b) => match &b.mode {
+                Mode::File(fv) => Some(fv.view()),
+                _ => None,
+            },
+            Page::Logs(v) => Some(&**v),
+            _ => None,
+        }
+    }
+
+    pub fn runs_mut(&mut self) -> Option<&mut RunsView> {
+        match self.stack.last_mut() {
+            Some(Page::Runs(r)) => Some(r),
+            _ => None,
+        }
+    }
+
+    /// Une saisie de texte est-elle ouverte (filtre de l'accueil ou des runs, recherche) ? Les
+    /// touches de navigation (`t`, `x`, `S`, …) sont alors du texte.
+    pub fn is_typing(&self) -> bool {
+        self.home().is_some_and(|h| h.editing)
+            || self.runs().is_some_and(|r| r.editing)
+            || self.text_prompt_active()
+    }
+
+    // --- recherche dans un volet de texte (logs, fichier)
+
+    pub fn text_prompt_active(&self) -> bool {
+        self.active_text().is_some_and(|v| v.prompt.is_some())
+    }
+
+    pub fn text_search_begin(&mut self) {
+        if let Some(v) = self.active_text_mut() {
+            v.begin_search();
+        }
+    }
+
+    pub fn text_prompt_type(&mut self, c: char) {
+        if let Some(v) = self.active_text_mut() {
+            v.prompt_type(c);
+        }
+    }
+
+    pub fn text_prompt_backspace(&mut self) {
+        if let Some(v) = self.active_text_mut() {
+            v.prompt_backspace();
+        }
+    }
+
+    pub fn text_prompt_cancel(&mut self) {
+        if let Some(v) = self.active_text_mut() {
+            v.prompt_cancel();
+        }
+    }
+
+    pub fn text_prompt_commit(&mut self) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.active_text_mut() {
+            v.prompt_commit(w, h);
+        }
+    }
+
+    /// `n` (`1`) et `N` (`-1`).
+    pub fn text_search_step(&mut self, delta: isize) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.active_text_mut() {
+            v.step_match(delta, w, h);
+        }
+    }
+
+    /// Échap : efface la recherche si elle est active. `false` : rien à effacer, Échap fait
+    /// alors son travail habituel (revenir à la page précédente).
+    pub fn text_escape(&mut self) -> bool {
+        self.active_text_mut().is_some_and(TextView::clear_search)
+    }
+
+    // --- filtre de la liste des runs
+
+    /// Échap sur la liste des runs : retire les filtres s'il y en a. `false` sinon.
+    pub fn runs_clear_filters(&mut self) -> bool {
+        self.runs_mut().is_some_and(RunsView::clear_filters)
+    }
+
     fn view_size(&self) -> (usize, usize) {
         (self.viewport_width.get().max(1), self.viewport.get().max(1))
     }
@@ -3852,5 +3936,80 @@ mod tests {
         let after = runs_per_line(&a);
         assert_ne!(after, before);
         assert!(after.iter().zip(&before).any(|(a, b)| a > b));
+    }
+
+    // --- filtres et recherche
+
+    #[test]
+    fn saisie_en_cours_bloque_les_touches_de_navigation() {
+        let mut a = app_on_run(Status::Failure);
+        assert!(!a.is_typing());
+        a.runs_mut().unwrap().start_edit();
+        assert!(a.is_typing(), "filtre des runs");
+        a.runs_mut().unwrap().commit();
+        assert!(!a.is_typing());
+        a.open_logs();
+        a.apply(Msg::Logs {
+            repo: repo("a"),
+            pipeline_id: 7,
+            result: Ok(JobLog {
+                steps: vec![step("Tests", Status::Failure, 4)],
+                ..Default::default()
+            }),
+        });
+        a.viewport.set(5);
+        a.viewport_width.set(40);
+        a.text_search_begin();
+        assert!(a.is_typing() && a.text_prompt_active());
+        "tests".chars().for_each(|c| a.text_prompt_type(c));
+        a.text_prompt_backspace();
+        a.text_prompt_type('s');
+        a.text_prompt_commit();
+        assert!(!a.is_typing());
+        let status = a
+            .logs()
+            .unwrap()
+            .search_status()
+            .map(|(q, _, t)| (q.to_owned(), t));
+        assert_eq!(
+            status,
+            Some(("tests".to_owned(), 4)),
+            "la saisie validée a lancé la recherche"
+        );
+        // Échap efface la recherche une première fois, puis laisse faire le retour
+        assert!(a.text_escape());
+        assert!(!a.text_escape());
+        assert!(
+            a.logs().is_some(),
+            "la page n'a pas été fermée par la recherche"
+        );
+    }
+
+    #[test]
+    fn filtre_des_runs_et_ouverture_du_run_choisi() {
+        let mut a = app_on_run(Status::Failure);
+        let mut list = vec![pipe(7)];
+        list[0].status = Status::Failure;
+        let mut ok = pipe(8);
+        ok.status = Status::Success;
+        list.push(ok);
+        a.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(list),
+        });
+        a.runs_mut().unwrap().cycle_status(); // échecs
+        a.runs_mut().unwrap().cycle_status(); // succès
+        assert_eq!(a.runs().unwrap().visible().len(), 1);
+        a.open_logs();
+        assert_eq!(
+            a.logs().unwrap().pipeline.id,
+            8,
+            "ouvre le run affiché, pas le premier de la liste"
+        );
+        a.pop();
+        // Échap retire les filtres, puis ne fait plus rien de plus
+        assert!(a.runs_clear_filters());
+        assert!(!a.runs_clear_filters());
+        assert_eq!(a.runs().unwrap().visible().len(), 2);
     }
 }

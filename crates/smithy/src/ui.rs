@@ -15,6 +15,7 @@ use crate::{
     highlight::{self, Tok},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
+    textsearch::{self, Hit},
     timeago,
 };
 
@@ -467,7 +468,14 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView, area: Rect) {
         Span::styled(format!("{status} "), Style::new().fg(color)),
     ]);
     draw_text_pane(f, app, rows[0], title, view);
-    draw_footer(f, app, rows[1], logs_help(area.width as usize), None);
+    let search = search_line(view);
+    draw_footer(
+        f,
+        app,
+        rows[1],
+        logs_help(area.width as usize),
+        search.as_deref(),
+    );
 }
 
 /// Volet de texte plein cadre : sortie d'un job ou contenu d'un fichier, avec sa position et sa
@@ -491,6 +499,36 @@ fn tok_style(tok: Tok) -> Style {
         Tok::Link => fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
         Tok::Code => fg(Color::Green),
     }
+}
+
+/// Mise en évidence des occurrences d'une recherche : en vidéo inverse, et en jaune pour celle
+/// où l'on est arrivé avec `n` / `N`.
+fn hit_style(hit: Hit) -> Style {
+    match hit {
+        Hit::No => Style::new(),
+        Hit::Other => Style::new().add_modifier(Modifier::REVERSED),
+        Hit::Current => Style::new()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    }
+}
+
+/// Ligne d'état de la recherche d'un volet de texte : la saisie en cours, ou le bilan et les
+/// touches. `None` sans recherche : le pied de page affiche alors l'aide.
+fn search_line(view: &TextView) -> Option<String> {
+    if let Some(p) = &view.prompt {
+        return Some(format!("/{p}▏   Entrée valider · Échap annuler"));
+    }
+    view.search_status().map(|(q, current, total)| {
+        if total == 0 {
+            format!("/{q}   aucune occurrence · / autre recherche · Échap efface")
+        } else if current == 0 {
+            format!("/{q}   {total} occurrence(s) · n suivante · N précédente · Échap efface")
+        } else {
+            format!("/{q}   {current}/{total} · n suivante · N précédente · Échap efface")
+        }
+    })
 }
 
 fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, view: &TextView) {
@@ -536,19 +574,31 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
                         };
                         Line::from(Span::styled(r.text, style))
                     }
-                    LineKind::Text if r.runs.is_empty() && r.hang.is_empty() => Line::from(r.text),
+                    LineKind::Text
+                        if r.runs.is_empty() && r.hang.is_empty() && !view.has_search() =>
+                    {
+                        Line::from(r.text)
+                    }
                     LineKind::Text => {
                         let mut spans = Vec::new();
                         // Suite d'une ligne repliée : le retrait de la puce, la barre de citation.
                         if r.continuation && !r.hang.is_empty() {
                             spans.push(Span::styled(r.hang, tok_style(Tok::Quote)));
                         }
+                        let segments = highlight::segments(r.text, r.offset, r.runs);
+                        // Les occurrences de la recherche, de toute la ligne (une occurrence peut
+                        // être à cheval sur deux lignes d'écran), par-dessus les couleurs.
+                        let ranges = view.line_matches(r.line);
+                        let current = view
+                            .current_match()
+                            .filter(|m| m.line == r.line_no)
+                            .map(|m| (m.start, m.end));
                         spans.extend(
-                            highlight::segments(r.text, r.offset, r.runs)
+                            textsearch::overlay(segments, r.offset, &ranges, current)
                                 .into_iter()
-                                .map(|(text, tok)| match tok {
-                                    Some(t) => Span::styled(text, tok_style(t)),
-                                    None => Span::raw(text),
+                                .map(|(text, tok, hit)| {
+                                    let base = tok.map_or_else(Style::new, tok_style);
+                                    Span::styled(text, base.patch(hit_style(hit)))
                                 }),
                         );
                         Line::from(spans)
@@ -645,8 +695,9 @@ fn runs_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ naviguer · ↵/→ logs · t onglet · ←/Échap retour · r actualiser · q retour",
-            "j/k · ↵ logs · ← retour · r actualiser",
+            "j/k ↑/↓ naviguer · ↵/→ logs · / filtrer · s statut · t onglet · ←/Échap retour · r actualiser",
+            "j/k · ↵ logs · / filtrer · s statut · ← retour",
+            "j/k · ↵ · / · s · ←",
             "↵ · ← · r",
             "Échap",
         ],
@@ -657,8 +708,11 @@ fn logs_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · w retour à la ligne · r rafraîchir · Esc retour",
             "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
+            "j/k défiler · ←/→ section · Espace plier · / chercher · w retour à la ligne · Esc retour",
             "j/k défiler · ←/→ section · Espace plier · a tout · w repli · Esc retour",
+            "←/→ · Espace plier · / chercher · w repli · Esc retour",
             "←/→ · Espace plier · w repli · Esc retour",
             "←/→ · Espace · w · Esc",
             "Esc",
@@ -686,7 +740,9 @@ fn file_help(width: usize, markdown: bool, rendered: bool) -> &'static str {
             width,
             if rendered {
                 &[
+                    "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · / chercher · n/N · m texte source · r actualiser · Esc/← retour",
                     "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · m texte source · r actualiser · Esc/← retour",
+                    "j/k défiler · g/G · / chercher · m source · Esc retour",
                     "j/k défiler · g/G · m source · Esc retour",
                     "j/k · m · Esc",
                     "m · Esc",
@@ -694,7 +750,9 @@ fn file_help(width: usize, markdown: bool, rendered: bool) -> &'static str {
                 ]
             } else {
                 &[
+                    "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · / chercher · n/N · w retour à la ligne · m rendu · r actualiser · Esc/← retour",
                     "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · w retour à la ligne · m rendu · r actualiser · Esc/← retour",
+                    "j/k défiler · g/G · / chercher · w repli · m rendu · Esc retour",
                     "j/k défiler · g/G · w repli · m rendu · Esc retour",
                     "j/k · w · m · Esc",
                     "m · Esc",
@@ -706,8 +764,11 @@ fn file_help(width: usize, markdown: bool, rendered: bool) -> &'static str {
     pick_help(
         width,
         &[
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · / chercher · n/N · w retour à la ligne · r actualiser · Esc/← retour",
             "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · w retour à la ligne · r actualiser · Esc/← retour",
+            "j/k ↑/↓ défiler · g/G début/fin · / chercher · w retour à la ligne · Esc/← retour",
             "j/k défiler · g/G · w retour à la ligne · Esc retour",
+            "j/k · / · w repli · Esc retour",
             "j/k · w repli · Esc retour",
             "w · Esc",
             "Esc",
@@ -737,7 +798,8 @@ fn draw_browser(f: &mut Frame, app: &App, b: &Browser, area: Rect) {
         let title = Line::from(format!(" /{}{mode} ", fv.path));
         draw_text_pane(f, app, rows[0], title, fv.view());
         let help = file_help(width, fv.rendered.is_some(), fv.is_rendered());
-        draw_footer(f, app, rows[1], help, None);
+        let search = search_line(fv.view());
+        draw_footer(f, app, rows[1], help, search.as_deref());
         return;
     }
     draw_dir(f, app, b, rows[0], format!(" /{} ", b.path));
@@ -1127,23 +1189,37 @@ fn draw_repo(f: &mut Frame, app: &App, r: &RepoView, area: Rect) {
 
 fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
+    // Le titre rappelle les filtres actifs.
+    let mut title = String::from(" Runs");
+    if let Some(label) = r.status.label() {
+        title.push_str(&format!(" · {label}"));
+    }
+    if !r.filter.trim().is_empty() {
+        title.push_str(&format!(" · « {} »", r.filter.trim()));
+    }
+    title.push(' ');
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Runs ")
+        .title(title)
         .border_style(Style::new().fg(Color::Yellow));
     let inner = block.inner(rows[0]);
     app.viewport.set((inner.height as usize).saturating_sub(1));
-    if r.pipelines.is_empty() {
+    let visible = r.visible();
+    if visible.is_empty() {
         let (text, color) = if r.loading {
             ("chargement…", Color::Cyan)
-        } else {
+        } else if r.pipelines.is_empty() {
             ("(aucun run)", Color::DarkGray)
+        } else {
+            (
+                "(aucun run ne correspond au filtre · Échap l'efface)",
+                Color::DarkGray,
+            )
         };
         let line = Line::from(Span::styled(text, Style::new().fg(color)));
         f.render_widget(Paragraph::new(line).block(block), rows[0]);
     } else {
-        let table_rows: Vec<Row> = r
-            .pipelines
+        let table_rows: Vec<Row> = visible
             .iter()
             .map(|p| {
                 let (label, color) = status_style(p.status);
@@ -1170,9 +1246,21 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
             Row::new(["Statut", "Workflow", "Branche", "Commit", "Titre"])
                 .style(Style::new().bold()),
         )
-        .block(block.title_bottom(
-            Line::from(format!(" {}/{} ", r.selected + 1, r.pipelines.len())).right_aligned(),
-        ))
+        .block(
+            block.title_bottom(
+                Line::from(if r.filter_active() {
+                    format!(
+                        " {}/{} (sur {}) ",
+                        r.selected + 1,
+                        visible.len(),
+                        r.pipelines.len()
+                    )
+                } else {
+                    format!(" {}/{} ", r.selected + 1, visible.len())
+                })
+                .right_aligned(),
+            ),
+        )
         .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         let mut ts = TableState::default().with_offset(r.list_offset.get());
         ts.select(Some(r.selected));
@@ -1180,7 +1268,12 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
         r.list_offset.set(ts.offset());
     }
 
-    let first = if let Some(err) = app.error.as_ref().or(r.error.as_ref()) {
+    let first = if r.editing {
+        Line::from(Span::styled(
+            format!("filtrer : {}▏", r.filter),
+            Style::new().fg(Color::Yellow),
+        ))
+    } else if let Some(err) = app.error.as_ref().or(r.error.as_ref()) {
         Line::from(Span::styled(
             format!("erreur : {err}"),
             Style::new().fg(Color::Red),
@@ -1191,7 +1284,11 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
         Line::from("")
     };
     let help = Line::from(Span::styled(
-        runs_help(area.width as usize),
+        if r.editing {
+            "Entrée valider · Échap annuler · le filtre cherche dans le workflow, le job, la branche, le commit et le titre"
+        } else {
+            runs_help(area.width as usize)
+        },
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(vec![first, help]), rows[1]);
@@ -2738,6 +2835,92 @@ mod tests {
         assert!(
             text.matches('▎').count() >= 2,
             "la barre suit la citation : {text}"
+        );
+    }
+
+    #[test]
+    fn occurrences_surlignees_et_courante_en_jaune() {
+        let mut app = app_with_logs(LogState::Ready(vec![LogLine {
+            kind: LineKind::Text,
+            text: "aaa ZQX bbb ZQX".into(),
+            step: None,
+            runs: Vec::new(),
+            hang: String::new(),
+            words: false,
+        }]));
+        app.viewport.set(5);
+        app.viewport_width.set(40);
+        app.text_search_begin();
+        "ZQX".chars().for_each(|c| app.text_prompt_type(c));
+        // La saisie est affichée dans le pied de page
+        assert!(render(&app, 100, 10).contains("/ZQX▏"));
+        app.text_prompt_commit();
+        let mut term = Terminal::new(TestBackend::new(100, 10)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        // Seulement le volet de texte (les premières lignes), pas le pied de page qui répète la requête
+        let width = buf.area.width as usize;
+        let cells: Vec<_> = buf
+            .content()
+            .iter()
+            .enumerate()
+            .filter(|(i, c)| c.symbol() == "Z" && (1..4).contains(&(i / width)))
+            .map(|(_, c)| c)
+            .collect();
+        assert_eq!(cells.len(), 2, "deux occurrences à l'écran");
+        // La première est la courante (jaune), l'autre en vidéo inverse
+        assert_eq!(cells[0].bg, Color::Yellow);
+        assert!(cells[1].modifier.contains(Modifier::REVERSED) && cells[1].bg != Color::Yellow);
+        let b = buf.content().iter().find(|c| c.symbol() == "b").unwrap();
+        assert!(
+            !b.modifier.contains(Modifier::REVERSED),
+            "hors occurrence : texte normal"
+        );
+        // Bilan dans le pied de page ; n passe à la suivante
+        assert!(render(&app, 120, 10).contains("1/2"));
+        app.text_search_step(1);
+        let text = render(&app, 120, 10);
+        assert!(
+            text.contains("2/2") && text.contains("Échap efface"),
+            "{text}"
+        );
+        app.text_escape();
+        assert!(!render(&app, 120, 10).contains("2/2"));
+    }
+
+    #[test]
+    fn liste_des_runs_filtree() {
+        let mut app = app_on_runs(vec![
+            pipe(1, "ci.yml", Status::Failure),
+            pipe(2, "deploy.yml", Status::Success),
+            pipe(3, "ci.yml", Status::Success),
+        ]);
+        let r = app.runs_mut().unwrap();
+        r.start_edit();
+        "deploy".chars().for_each(|c| r.type_char(c));
+        // Saisie : le filtre est visible dans le pied de page et le titre
+        let text = render(&app, 120, 14);
+        assert!(
+            text.contains("filtrer : deploy▏") && text.contains("« deploy »"),
+            "{text}"
+        );
+        assert!(
+            text.contains("deploy.yml") && !text.contains("ci.yml"),
+            "{text}"
+        );
+        assert!(text.contains("1/1 (sur 3)"), "{text}");
+        app.runs_mut().unwrap().commit();
+        let r = app.runs_mut().unwrap();
+        r.cycle_status();
+        let text = render(&app, 120, 14);
+        assert!(text.contains("échecs"), "{text}");
+        assert!(text.contains("aucun run ne correspond"), "{text}");
+        // Les filtres retirés, tout revient
+        app.runs_clear_filters();
+        let text = render(&app, 120, 14);
+        assert!(
+            text.contains("ci.yml") && text.contains("deploy.yml") && text.contains("1/3"),
+            "{text}"
         );
     }
 }

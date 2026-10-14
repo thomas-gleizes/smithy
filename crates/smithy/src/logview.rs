@@ -11,7 +11,11 @@ use std::cell::RefCell;
 
 use smithy_core::{JobLog, Pipeline, Repo, Status};
 
-use crate::{highlight::Run, wrap};
+use crate::{
+    highlight::Run,
+    textsearch::{find_ranges, smart_case},
+    wrap,
+};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineKind {
@@ -58,6 +62,10 @@ pub struct Row<'a> {
     pub runs: &'a [Run],
     /// À afficher devant le texte quand `continuation` (voir `LogLine::hang`).
     pub hang: &'a str,
+    /// La ligne dont la ligne d'écran fait partie : son numéro et son texte entier (pour la
+    /// recherche, dont une occurrence peut être à cheval sur deux lignes d'écran).
+    pub line_no: usize,
+    pub line: &'a str,
     /// Suite d'une ligne repliée (et non début d'une ligne de log).
     pub continuation: bool,
     /// Titre de la section courante (celle que `Espace` plie ou déplie).
@@ -160,6 +168,24 @@ pub fn fingerprint_of<'a>(lines: impl IntoIterator<Item = &'a String>) -> u64 {
     h.finish()
 }
 
+/// Une occurrence de la recherche : ligne de texte et octets dans cette ligne.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Match {
+    pub line: usize,
+    pub start: usize,
+    pub end: usize,
+}
+
+/// Recherche validée : la requête, la casse retenue et toutes les occurrences.
+#[derive(Debug, Clone)]
+struct Search {
+    query: String,
+    case_sensitive: bool,
+    matches: Vec<Match>,
+    /// Occurrence atteinte avec `n` / `N` ; `None` tant qu'on n'a pas bougé.
+    current: Option<usize>,
+}
+
 /// Volet de texte : des lignes, éventuellement groupées en sections, et leur défilement.
 #[derive(Debug, Clone)]
 pub struct TextView {
@@ -171,6 +197,9 @@ pub struct TextView {
     /// Retour à la ligne actif.
     pub wrap: bool,
     sections: Vec<Section>,
+    /// Saisie de la recherche en cours (`/`), pas encore validée.
+    pub prompt: Option<String>,
+    search: Option<Search>,
     /// Section choisie avec les flèches, quand elle ne peut pas être la ligne du haut (tout tient à
     /// l'écran : on ne défile pas, mais on doit pouvoir atteindre chaque section). `None` :
     /// la section courante est celle de la ligne du haut.
@@ -186,6 +215,8 @@ impl TextView {
             notice: None,
             wrap: false,
             sections: Vec::new(),
+            prompt: None,
+            search: None,
             selected: None,
             index: RefCell::new(None),
         }
@@ -209,6 +240,175 @@ impl TextView {
                 .collect(),
         );
         *self.index.borrow_mut() = None;
+        self.refresh_search();
+    }
+
+    // --- recherche
+
+    /// `/` : ouvre la saisie, préremplie avec la dernière requête.
+    pub fn begin_search(&mut self) {
+        self.prompt = Some(
+            self.search
+                .as_ref()
+                .map_or_else(String::new, |s| s.query.clone()),
+        );
+    }
+
+    pub fn prompt_type(&mut self, c: char) {
+        if let Some(p) = self.prompt.as_mut() {
+            p.push(c);
+        }
+    }
+
+    pub fn prompt_backspace(&mut self) {
+        if let Some(p) = self.prompt.as_mut() {
+            p.pop();
+        }
+    }
+
+    pub fn prompt_cancel(&mut self) {
+        self.prompt = None;
+    }
+
+    /// Entrée : lance la recherche et va à la première occurrence à partir du haut de l'écran.
+    /// Une saisie vide efface la recherche.
+    pub fn prompt_commit(&mut self, width: usize, height: usize) {
+        let Some(query) = self.prompt.take() else {
+            return;
+        };
+        if query.is_empty() {
+            self.search = None;
+            return;
+        }
+        let case_sensitive = smart_case(&query);
+        let matches = self.collect_matches(&query, case_sensitive);
+        self.search = Some(Search {
+            query,
+            case_sensitive,
+            matches,
+            current: None,
+        });
+        self.step_match(1, width, height);
+    }
+
+    fn collect_matches(&self, query: &str, case_sensitive: bool) -> Vec<Match> {
+        self.lines()
+            .iter()
+            .enumerate()
+            // Les titres d'étape sont de l'habillage (flèche, nombre de lignes) : pas du texte.
+            .filter(|(_, l)| l.kind == LineKind::Text)
+            .flat_map(|(line, l)| {
+                find_ranges(&l.text, query, case_sensitive)
+                    .into_iter()
+                    .map(move |(start, end)| Match { line, start, end })
+            })
+            .collect()
+    }
+
+    /// Le contenu a changé (log suivi en direct, fichier rechargé) : on recompte, en gardant
+    /// l'occurrence courante si elle existe encore.
+    fn refresh_search(&mut self) {
+        let Some(s) = self.search.as_ref() else {
+            return;
+        };
+        let (query, cs) = (s.query.clone(), s.case_sensitive);
+        let previous = s.current.and_then(|i| s.matches.get(i).copied());
+        let matches = self.collect_matches(&query, cs);
+        let current = previous.and_then(|p| matches.iter().position(|m| *m == p));
+        self.search = Some(Search {
+            query,
+            case_sensitive: cs,
+            matches,
+            current,
+        });
+    }
+
+    /// `n` (`1`) et `N` (`-1`) : occurrence suivante ou précédente, en boucle. La première fois,
+    /// on part du haut de l'écran. Une occurrence dans une étape pliée la déplie.
+    pub fn step_match(&mut self, delta: isize, width: usize, height: usize) {
+        let top_line = self.line_of_row(width, self.scroll);
+        let Some(s) = self.search.as_mut() else {
+            return;
+        };
+        let n = s.matches.len();
+        if n == 0 {
+            s.current = None;
+            return;
+        }
+        let next = match s.current {
+            Some(i) => (i as isize + delta).rem_euclid(n as isize) as usize,
+            None if delta >= 0 => s
+                .matches
+                .iter()
+                .position(|m| m.line >= top_line)
+                .unwrap_or(0),
+            None => s
+                .matches
+                .iter()
+                .rposition(|m| m.line < top_line)
+                .unwrap_or(n - 1),
+        };
+        s.current = Some(next);
+        let m = s.matches[next];
+        self.reveal_match(m, width, height);
+    }
+
+    fn reveal_match(&mut self, m: Match, width: usize, height: usize) {
+        let step = self
+            .lines()
+            .get(m.line)
+            .filter(|l| self.hidden(l))
+            .and_then(|l| l.step);
+        if let Some(step) = step {
+            self.sections[step].collapsed = false;
+            self.refresh_headers();
+        }
+        // Ligne d'écran de l'occurrence : celle du morceau replié qui la contient.
+        let mut row = self.row_of_line(width, m.line);
+        if self.wrap
+            && let Some(line) = self.lines().get(m.line)
+        {
+            let parts = wrap::layout(&line.text, width, line.hang_width(), line.words);
+            row += parts.iter().rposition(|p| p.0 <= m.start).unwrap_or(0);
+        }
+        // Un peu de contexte au-dessus de l'occurrence.
+        let max = self.max_scroll(width, height);
+        self.scroll_to_row(row.saturating_sub(height / 3), max);
+    }
+
+    /// Esc : efface la recherche (et sa mise en évidence). `false` s'il n'y en avait pas.
+    pub fn clear_search(&mut self) -> bool {
+        self.prompt = None;
+        self.search.take().is_some()
+    }
+
+    pub fn has_search(&self) -> bool {
+        self.search.is_some()
+    }
+
+    /// Pour l'affichage : `(requête, rang de l'occurrence courante à partir de 1 ou 0, total)`.
+    pub fn search_status(&self) -> Option<(&str, usize, usize)> {
+        self.search.as_ref().map(|s| {
+            (
+                s.query.as_str(),
+                s.current.map_or(0, |i| i + 1),
+                s.matches.len(),
+            )
+        })
+    }
+
+    /// Occurrences de la recherche dans le texte d'une ligne (pour la surbrillance).
+    pub fn line_matches(&self, text: &str) -> Vec<(usize, usize)> {
+        self.search
+            .as_ref()
+            .map_or_else(Vec::new, |s| find_ranges(text, &s.query, s.case_sensitive))
+    }
+
+    /// L'occurrence courante, à mettre en avant.
+    pub fn current_match(&self) -> Option<Match> {
+        self.search
+            .as_ref()
+            .and_then(|s| s.current.and_then(|i| s.matches.get(i).copied()))
     }
 
     /// Empreinte du texte affiché : une coloration calculée pour un autre texte (fichier rechargé
@@ -285,6 +485,7 @@ impl TextView {
         self.sections = sections;
         self.state = LogState::Ready(lines);
         self.refresh_headers();
+        self.refresh_search();
     }
 
     /// Remplace le contenu par des lignes sans étape, donc jamais repliées (fichier, Markdown).
@@ -292,6 +493,7 @@ impl TextView {
         self.sections.clear();
         self.state = LogState::Ready(lines);
         *self.index.borrow_mut() = None;
+        self.refresh_search();
     }
 
     /// Réécrit les titres (flèche, nombre de lignes cachées) et invalide l'index d'écran.
@@ -472,7 +674,12 @@ impl TextView {
         let mut skip = self.scroll.saturating_sub(first_row);
         let current = self.current_step(width);
         let mut out = Vec::with_capacity(height);
-        for line in lines.iter().skip(first_line).filter(|l| !self.hidden(l)) {
+        for (line_no, line) in lines
+            .iter()
+            .enumerate()
+            .skip(first_line)
+            .filter(|(_, l)| !self.hidden(l))
+        {
             let is_current = matches!(line.kind, LineKind::Step(_)) && line.step == current;
             let mut push = |text: &'a str, offset: usize, continuation| {
                 out.push(Row {
@@ -481,6 +688,8 @@ impl TextView {
                     offset,
                     runs: &line.runs,
                     hang: &line.hang,
+                    line_no,
+                    line: &line.text,
                     continuation,
                     current: is_current,
                 });
@@ -1069,5 +1278,173 @@ mod tests {
             "la dernière ligne d'écran est atteinte : {:?}",
             win.last()
         );
+    }
+
+    // --- recherche
+
+    fn search(v: &mut LogView, query: &str, w: usize, h: usize) {
+        v.begin_search();
+        v.prompt = Some(String::new());
+        query.chars().for_each(|c| v.prompt_type(c));
+        v.prompt_commit(w, h);
+    }
+
+    fn ranks(v: &LogView) -> (usize, usize) {
+        v.search_status().map_or((9, 9), |(_, c, t)| (c, t))
+    }
+
+    #[test]
+    fn la_recherche_compte_et_atteint_chaque_occurrence_en_boucle() {
+        let lines: Vec<String> = (0..30)
+            .map(|i| {
+                if i % 10 == 3 {
+                    format!("erreur {i}")
+                } else {
+                    format!("ligne {i}")
+                }
+            })
+            .collect();
+        let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+        let mut v = view(&refs);
+        search(&mut v, "erreur", 40, 5);
+        assert_eq!(ranks(&v), (1, 3), "première occurrence atteinte");
+        assert_eq!(v.current_match().map(|m| m.line), Some(3));
+        v.step_match(1, 40, 5);
+        assert_eq!(v.current_match().map(|m| m.line), Some(13));
+        assert_eq!(v.scroll, 13 - 5 / 3, "un peu de contexte au-dessus");
+        v.step_match(1, 40, 5);
+        v.step_match(1, 40, 5);
+        assert_eq!(ranks(&v), (1, 3), "retour à la première en boucle");
+        v.step_match(-1, 40, 5);
+        assert_eq!(
+            ranks(&v),
+            (3, 3),
+            "précédente depuis la première : la dernière"
+        );
+        // Le défilement ne dépasse jamais le bas
+        assert!(v.scroll <= v.max_scroll(40, 5));
+    }
+
+    #[test]
+    fn premiere_occurrence_a_partir_du_haut_de_l_ecran() {
+        let mut v = view(&["foo", "bar", "foo", "bar", "foo"]);
+        v.scroll = 3;
+        search(&mut v, "foo", 40, 2);
+        assert_eq!(
+            v.current_match().map(|m| m.line),
+            Some(4),
+            "après le haut de l'écran"
+        );
+        // Précédente (N) depuis un nouvel état : avant le haut de l'écran
+        v.clear_search();
+        v.scroll = 3;
+        search(&mut v, "foo", 40, 2);
+        v.clear_search();
+        v.begin_search();
+        "foo".chars().for_each(|c| v.prompt_type(c));
+        v.prompt_commit(40, 2);
+        assert!(v.has_search());
+    }
+
+    #[test]
+    fn casse_intelligente_et_requetes_sans_resultat() {
+        let mut v = view(&["Erreur", "erreur", "ERREUR"]);
+        search(&mut v, "erreur", 40, 5);
+        assert_eq!(ranks(&v).1, 3);
+        search(&mut v, "Erreur", 40, 5);
+        assert_eq!(ranks(&v).1, 1, "une majuscule : la casse compte");
+        search(&mut v, "absent", 40, 5);
+        assert_eq!(v.search_status(), Some(("absent", 0, 0)));
+        v.step_match(1, 40, 5); // sans effet, sans plantage
+        assert_eq!(v.current_match(), None);
+        // Saisie vide : efface la recherche
+        v.begin_search();
+        assert_eq!(v.prompt.as_deref(), Some("absent"), "préremplie");
+        (0..6).for_each(|_| v.prompt_backspace());
+        v.prompt_commit(40, 5);
+        assert!(!v.has_search());
+    }
+
+    #[test]
+    fn esc_efface_la_recherche_puis_ne_fait_plus_rien() {
+        let mut v = view(&["abc"]);
+        assert!(!v.clear_search());
+        search(&mut v, "b", 40, 5);
+        assert!(v.clear_search());
+        assert!(!v.has_search() && v.current_match().is_none());
+        // Annuler la saisie ne change pas une recherche existante
+        search(&mut v, "a", 40, 5);
+        v.begin_search();
+        v.prompt_type('x');
+        v.prompt_cancel();
+        assert_eq!(v.search_status().map(|s| s.0), Some("a"));
+    }
+
+    #[test]
+    fn une_occurrence_dans_une_etape_pliee_la_deplie() {
+        let mut v = sectioned(&[
+            ("Set up job", Status::Success, 5),
+            ("Tests", Status::Failure, 3),
+        ]);
+        // « Set up job 4 » est dans l'étape réussie, repliée
+        assert!(v.window(W, 20).iter().all(|r| r.text != "Set up job 4"));
+        search(&mut v, "job 4", W, 20);
+        assert_eq!(ranks(&v), (1, 1));
+        assert!(
+            v.window(W, 20).iter().any(|r| r.text == "Set up job 4"),
+            "l'étape s'est dépliée pour montrer l'occurrence"
+        );
+        // Les titres d'étape ne sont pas du texte : « lignes » n'y est pas cherché
+        search(&mut v, "▾", W, 20);
+        assert_eq!(ranks(&v).1, 0);
+        search(&mut v, "lignes)", W, 20);
+        assert_eq!(
+            ranks(&v).1,
+            0,
+            "le titre replié « (5 lignes) » est de l'habillage"
+        );
+    }
+
+    #[test]
+    fn occurrence_a_cheval_sur_deux_lignes_d_ecran_et_defilement_vers_la_bonne() {
+        // Une ligne de 40 caractères repliée à 10 colonnes : l'occurrence est sur la 4e ligne d'écran
+        let line = format!("{}CIBLE{}", "x".repeat(32), "y".repeat(3));
+        let mut v = view(&["avant", &line, "après"]);
+        v.wrap = true;
+        let (w, h) = (10, 3);
+        search(&mut v, "CIBLE", w, h);
+        let m = v.current_match().unwrap();
+        assert_eq!((m.line, m.start, m.end), (1, 32, 37));
+        // Les lignes d'écran 1+3 = 4 (la ligne 1 débute à la ligne d'écran 1) ; contexte : h/3 = 1
+        assert_eq!(v.scroll, v.row_of_line(w, 1) + 3 - 1);
+        // La fenêtre montre bien un morceau de la ligne qui contient le début de l'occurrence
+        let win = v.window(w, h);
+        assert!(
+            win.iter()
+                .any(|r| r.line_no == 1 && r.offset <= 32 && 32 < r.offset + r.text.len())
+        );
+        // Le Row porte la ligne entière pour que l'affichage retrouve l'occurrence
+        assert!(win.iter().all(|r| r.line == v.lines()[r.line_no].text));
+    }
+
+    #[test]
+    fn la_recherche_survit_au_rafraichissement_et_au_flux_en_direct() {
+        let mut v = sectioned(&[("Tests", Status::Running, 3)]);
+        search(&mut v, "tests 2", W, 20);
+        assert_eq!(ranks(&v), (1, 1));
+        // Le log grandit : nouvelles occurrences, l'occurrence courante est gardée
+        v.set_log(&joblog(&[("Tests", Status::Running, 8)]));
+        assert_eq!(ranks(&v).1, 1);
+        assert_eq!(v.current_match().map(|m| m.line), Some(2));
+        v.set_log(&joblog(&[
+            ("Tests", Status::Running, 8),
+            ("Tests", Status::Failure, 2),
+        ]));
+        assert_eq!(ranks(&v).1, 2, "les nouvelles lignes sont comptées");
+        // Texte remplacé (fichier rechargé) : recompté
+        let mut f = view(&["un deux", "deux"]);
+        search(&mut f, "deux", W, 5);
+        f.set_plain(vec!["rien".into()]);
+        assert_eq!(f.search_status(), Some(("deux", 0, 0)));
     }
 }

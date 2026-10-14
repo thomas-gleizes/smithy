@@ -9,7 +9,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 ## Features
 
 - A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list and the code explorer.
-- Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
+- Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step. Filter the list of runs (`/` for text, `s` for status) and search inside logs, files and rendered Markdown (`/`, then `n` / `N`).
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme. **Markdown files** (`.md`) open rendered: headings, emphasis, lists (nested, ordered, task lists), quotes, tables, links (the target is shown), images (alt text), rules, and code blocks coloured by their language; raw HTML is shown dimmed. Press `m` to switch to the highlighted source.
 - Sign in from the TUI (username and password, entered once and never stored).
 - A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`; each tab has its own server, which you can change from the tab (`S`) without touching the other tabs.
@@ -125,6 +125,16 @@ On the home page:
 
 On a repository page and on the list of runs: `j`/`k` move, `Enter` or `→` opens (CI or Code; a run's logs), `←`, `Esc`, `q` or `Backspace` go back, `PgDn`/`PgUp`, `g`/`G` as above.
 
+On the list of runs, two filters combine:
+
+| Key                   | Action                          |
+|-----------------------|---------------------------------|
+| `/`                   | Filter by text, live as you type (`Enter` keeps it, `Esc` abandons it). Every word must match, ignoring case, in the workflow, job, branch, commit, title, run number or status (`failure`, `success`, …): `main ci` or `#42` |
+| `s`                   | Cycle the status filter: all, failures, successes, running |
+| `Esc`                 | Remove the filters first; a second `Esc` goes back |
+
+The title shows the active filters and the counter reads `2/3 (sur 12)`. Opening a run opens the one on screen. The filters stay when you come back from a run's logs.
+
 In the code explorer:
 
 | Key                   | Action                          |
@@ -150,6 +160,9 @@ In the log view:
 | `Space`               | Fold / unfold the selected step |
 | `a`                   | Unfold all steps (or fold all if all are open) |
 | `g` / `Home`, `G` / `End` | Top / bottom                |
+| `/`                   | Search the text (`Enter` validates, `Esc` cancels); the occurrences are highlighted and the first one at or after the top of the screen is selected. Lower-case queries ignore the case, a capital letter makes it exact |
+| `n` / `N`             | Next / previous occurrence (wraps around). An occurrence inside a folded step unfolds it |
+| `Esc`                 | Clear the search first; a second `Esc` goes back |
 | `w`                   | Toggle line wrapping (kept for the session) |
 | `r`                   | Refresh                         |
 | `Esc`, `q`, `Backspace` | Back to the runs              |
@@ -190,7 +203,8 @@ A new forge is a new crate implementing `Provider`.
 - [x] Add, edit and delete servers from the app
 - [x] Restore the open tabs at startup (one instance owns them, `--fresh` to skip)
 - [ ] Pull requests, notifications and runners
-- [ ] Filters and search (status, branch, workflow, repository)
+- [x] Filters on the runs list (text, status) and search in logs, files and rendered Markdown
+- [ ] Filter by name in the code explorer's folders and in the logs' steps
 - [x] Job steps and logs for Forgejo
 - [x] Code explorer (branches, folders, files)
 - [x] Syntax highlighting in the explorer

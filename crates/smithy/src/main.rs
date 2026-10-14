@@ -8,6 +8,7 @@ mod pages;
 mod recent;
 mod request;
 mod session;
+mod textsearch;
 mod timeago;
 mod ui;
 mod workspace;
@@ -90,8 +91,8 @@ fn build_provider(
 
 /// Touches des onglets, valables sur toutes les pages. Renvoie `true` si la touche est prise.
 fn tab_key(app: &mut App, code: KeyCode) -> bool {
-    // En pleine saisie du filtre, `t`, `x` et les autres sont du texte.
-    if app.home().is_some_and(|h| h.editing) {
+    // En pleine saisie (filtre, recherche), `t`, `x` et les autres sont du texte.
+    if app.is_typing() {
         return false;
     }
     match code {
@@ -170,6 +171,48 @@ fn home_key(app: &mut App, code: KeyCode) {
     }
 }
 
+/// Saisie de la recherche dans un volet de texte : presque tout est du texte.
+fn text_prompt_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Enter => app.text_prompt_commit(),
+        KeyCode::Esc => app.text_prompt_cancel(),
+        KeyCode::Backspace => app.text_prompt_backspace(),
+        KeyCode::Char(c) => app.text_prompt_type(c),
+        _ => {}
+    }
+}
+
+/// Touches de la liste des runs : le filtre (`/` texte, `s` statut), puis la liste.
+fn runs_key(app: &mut App, code: KeyCode) {
+    if app.runs().is_some_and(|r| r.editing) {
+        if let Some(r) = app.runs_mut() {
+            match code {
+                KeyCode::Enter => r.commit(),
+                KeyCode::Esc => r.cancel_edit(),
+                KeyCode::Backspace => r.backspace(),
+                KeyCode::Char(c) => r.type_char(c),
+                _ => {}
+            }
+        }
+        return;
+    }
+    match code {
+        KeyCode::Char('/') => {
+            if let Some(r) = app.runs_mut() {
+                r.start_edit();
+            }
+        }
+        KeyCode::Char('s') => {
+            if let Some(r) = app.runs_mut() {
+                r.cycle_status();
+            }
+        }
+        // Échap retire d'abord les filtres, puis il fait son travail habituel (retour).
+        KeyCode::Esc if app.runs_clear_filters() => {}
+        _ => list_key(app, code, App::open_logs),
+    }
+}
+
 /// Touches de la page d'un dépôt et de la liste de ses runs.
 fn list_key(app: &mut App, code: KeyCode, enter: fn(&mut App)) {
     match code {
@@ -195,11 +238,16 @@ fn browser_key(app: &mut App, code: KeyCode) {
     };
     match screen {
         Screen::File => match code {
+            // Échap efface d'abord une recherche active.
+            KeyCode::Esc if app.text_escape() => {}
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
                 if let Some(b) = app.browser_mut() {
                     b.up();
                 }
             }
+            KeyCode::Char('/') => app.text_search_begin(),
+            KeyCode::Char('n') => app.text_search_step(1),
+            KeyCode::Char('N') => app.text_search_step(-1),
             KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
             KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
             KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
@@ -717,19 +765,29 @@ async fn run(
                 }
             } else if app.tab_picker.is_some() {
                 tab_picker_key(&mut app, k.code);
-            } else if k.code == KeyCode::Char('S') && !app.home().is_some_and(|h| h.editing) {
+            } else if k.code == KeyCode::Char('S') && !app.is_typing() {
                 app.open_server_picker();
             } else if tab_key(&mut app, k.code) {
                 // pris par les onglets
+            } else if app.text_prompt_active() {
+                text_prompt_key(&mut app, k.code);
             } else if app.home().is_some() {
                 home_key(&mut app, k.code);
             } else if app.repo_page().is_some() {
                 list_key(&mut app, k.code, App::repo_enter);
             } else if app.runs().is_some() {
-                list_key(&mut app, k.code, App::open_logs);
+                runs_key(&mut app, k.code);
             } else if app.logs().is_some() {
                 match k.code {
-                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => app.close_logs(),
+                    KeyCode::Esc => {
+                        if !app.text_escape() {
+                            app.close_logs();
+                        }
+                    }
+                    KeyCode::Char('q') | KeyCode::Backspace => app.close_logs(),
+                    KeyCode::Char('/') => app.text_search_begin(),
+                    KeyCode::Char('n') => app.text_search_step(1),
+                    KeyCode::Char('N') => app.text_search_step(-1),
                     KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
                     KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
                     KeyCode::Char(' ') => app.text_toggle_section(),

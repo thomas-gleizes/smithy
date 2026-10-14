@@ -4,7 +4,7 @@
 
 use std::cell::Cell;
 
-use smithy_core::{Error, Pipeline, Repo, RepoInfo, RepoSource};
+use smithy_core::{Error, Pipeline, Repo, RepoInfo, RepoSource, Status};
 
 use crate::{recent::RecentEntry, request::Request};
 
@@ -392,11 +392,70 @@ impl RepoView {
 // ---------------------------------------------------------------------------------------------
 // Runs de la CI
 
+/// Filtre par statut de la liste des runs (touche `s`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StatusFilter {
+    #[default]
+    All,
+    Failed,
+    Passed,
+    Running,
+}
+
+impl StatusFilter {
+    pub fn next(self) -> Self {
+        match self {
+            Self::All => Self::Failed,
+            Self::Failed => Self::Passed,
+            Self::Passed => Self::Running,
+            Self::Running => Self::All,
+        }
+    }
+
+    pub fn label(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::Failed => Some("échecs"),
+            Self::Passed => Some("succès"),
+            Self::Running => Some("en cours"),
+        }
+    }
+
+    fn accepts(self, status: Status) -> bool {
+        match self {
+            Self::All => true,
+            Self::Failed => status == Status::Failure,
+            Self::Passed => status == Status::Success,
+            Self::Running => matches!(status, Status::Running | Status::Pending),
+        }
+    }
+}
+
+/// Un run correspond-il à tous les mots du filtre ? (sans tenir compte de la casse, dans le
+/// workflow, le job, la branche, le commit, le titre, le numéro et le statut)
+fn matches_words(p: &Pipeline, words: &[String]) -> bool {
+    if words.is_empty() {
+        return true;
+    }
+    let hay = format!(
+        "{} {} {} {} {} #{} {:?}",
+        p.workflow, p.job, p.branch, p.commit, p.title, p.number, p.status
+    )
+    .to_lowercase();
+    words.iter().all(|w| hay.contains(w.as_str()))
+}
+
 #[derive(Debug, Clone)]
 pub struct RunsView {
     pub repo: Repo,
     pub pipelines: Vec<Pipeline>,
+    /// Indice dans la liste **affichée** (`visible`), filtre appliqué.
     pub selected: usize,
+    /// Filtre texte (`/`) et filtre de statut (`s`) ; ils se cumulent.
+    pub filter: String,
+    pub status: StatusFilter,
+    /// Saisie du filtre en cours.
+    pub editing: bool,
     /// Premier chargement en cours (la liste est vide en attendant).
     pub loading: bool,
     pub error: Option<String>,
@@ -409,19 +468,86 @@ impl RunsView {
             repo,
             pipelines: Vec::new(),
             selected: 0,
+            filter: String::new(),
+            status: StatusFilter::All,
+            editing: false,
             loading: true,
             error: None,
             list_offset: Cell::new(0),
         }
     }
 
+    /// Les runs affichés : ceux qui passent les deux filtres, dans l'ordre reçu.
+    pub fn visible(&self) -> Vec<&Pipeline> {
+        let words: Vec<String> = self
+            .filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.pipelines
+            .iter()
+            .filter(|p| self.status.accepts(p.status) && matches_words(p, &words))
+            .collect()
+    }
+
+    pub fn filter_active(&self) -> bool {
+        !self.filter.trim().is_empty() || self.status != StatusFilter::All
+    }
+
     pub fn selected_pipeline(&self) -> Option<&Pipeline> {
-        self.pipelines.get(self.selected)
+        self.visible().get(self.selected).copied()
     }
 
     pub fn move_selection(&mut self, delta: isize) {
-        let max = self.pipelines.len().saturating_sub(1);
+        let max = self.visible().len().saturating_sub(1);
         self.selected = self.selected.min(max).saturating_add_signed(delta).min(max);
+    }
+
+    // --- filtre
+
+    pub fn start_edit(&mut self) {
+        self.editing = true;
+    }
+
+    pub fn type_char(&mut self, c: char) {
+        if self.editing {
+            self.filter.push(c);
+            self.selected = 0;
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        if self.editing {
+            self.filter.pop();
+            self.selected = 0;
+        }
+    }
+
+    /// Entrée : le filtre reste appliqué, la saisie se ferme.
+    pub fn commit(&mut self) {
+        self.editing = false;
+    }
+
+    /// Échap pendant la saisie : le texte tapé est abandonné.
+    pub fn cancel_edit(&mut self) {
+        self.editing = false;
+        self.filter.clear();
+        self.selected = 0;
+    }
+
+    /// Touche `s` : statut suivant (tous, échecs, succès, en cours).
+    pub fn cycle_status(&mut self) {
+        self.status = self.status.next();
+        self.selected = 0;
+    }
+
+    /// Échap hors saisie : retire les filtres. `false` s'il n'y en avait pas.
+    pub fn clear_filters(&mut self) -> bool {
+        let active = self.filter_active();
+        self.filter.clear();
+        self.status = StatusFilter::All;
+        self.selected = 0;
+        active
     }
 
     /// Une liste arrive. La sélection suit le même run même si de nouveaux arrivent en tête.
@@ -435,9 +561,10 @@ impl RunsView {
                 let keep = self.selected_pipeline().map(|p| p.id);
                 self.pipelines = list;
                 self.error = None;
+                let visible = self.visible();
                 self.selected = keep
-                    .and_then(|id| self.pipelines.iter().position(|p| p.id == id))
-                    .unwrap_or_else(|| self.selected.min(self.pipelines.len().saturating_sub(1)));
+                    .and_then(|id| visible.iter().position(|p| p.id == id))
+                    .unwrap_or_else(|| self.selected.min(visible.len().saturating_sub(1)));
             }
             Err(e) => self.error = Some(e),
         }
@@ -764,5 +891,142 @@ mod tests {
         assert_eq!((r.error.as_deref(), r.pipelines.len()), (Some("coupé"), 1));
         r.apply_pipelines(&repo("a"), Ok(vec![pipe(9)]));
         assert_eq!(r.error, None);
+    }
+
+    // --- filtre des runs
+
+    fn run(id: u64, workflow: &str, branch: &str, title: &str, status: Status) -> Pipeline {
+        Pipeline {
+            id,
+            number: id,
+            job: format!("job{id}"),
+            workflow: workflow.into(),
+            title: title.into(),
+            branch: branch.into(),
+            commit: format!("abcdef{id}0123"),
+            status,
+            url: None,
+        }
+    }
+
+    fn runs_view() -> RunsView {
+        let mut v = RunsView::new(Repo {
+            owner: "o".into(),
+            name: "r".into(),
+        });
+        v.apply_pipelines(
+            &v.repo.clone(),
+            Ok(vec![
+                run(5, "ci.yml", "main", "fix: build cassé", Status::Failure),
+                run(4, "ci.yml", "feature/x", "feat: x", Status::Success),
+                run(3, "deploy.yml", "main", "chore: release", Status::Success),
+                run(2, "ci.yml", "main", "docs", Status::Running),
+                run(1, "lint.yml", "dev", "style", Status::Failure),
+            ]),
+        );
+        v
+    }
+
+    fn ids(v: &RunsView) -> Vec<u64> {
+        v.visible().iter().map(|p| p.id).collect()
+    }
+
+    #[test]
+    fn filtre_texte_cumulatif_sans_casse() {
+        let mut v = runs_view();
+        assert_eq!(ids(&v), [5, 4, 3, 2, 1]);
+        v.start_edit();
+        "MAIN".chars().for_each(|c| v.type_char(c));
+        assert_eq!(ids(&v), [5, 3, 2], "branche, sans tenir compte de la casse");
+        " ci".chars().for_each(|c| v.type_char(c));
+        assert_eq!(ids(&v), [5, 2], "tous les mots doivent correspondre");
+        v.commit();
+        assert!(
+            !v.editing && v.filter_active(),
+            "le filtre reste après Entrée"
+        );
+        // Titre, commit, numéro, statut
+        for (q, expect) in [
+            ("release", vec![3]),
+            ("abcdef40", vec![4]),
+            ("#1", vec![1]),
+            ("failure", vec![5, 1]),
+            ("job2", vec![2]),
+        ] {
+            v.clear_filters();
+            v.start_edit();
+            q.chars().for_each(|c| v.type_char(c));
+            v.commit();
+            assert_eq!(ids(&v), expect, "{q}");
+        }
+    }
+
+    #[test]
+    fn filtre_de_statut_et_cumul_avec_le_texte() {
+        let mut v = runs_view();
+        v.cycle_status();
+        assert_eq!(v.status.label(), Some("échecs"));
+        assert_eq!(ids(&v), [5, 1]);
+        v.cycle_status();
+        assert_eq!(ids(&v), [4, 3], "succès");
+        v.cycle_status();
+        assert_eq!(ids(&v), [2], "en cours");
+        v.cycle_status();
+        assert_eq!(v.status.label(), None);
+        assert_eq!(ids(&v).len(), 5);
+        // Cumul : échecs sur main
+        v.cycle_status();
+        v.start_edit();
+        "main".chars().for_each(|c| v.type_char(c));
+        v.commit();
+        assert_eq!(ids(&v), [5]);
+    }
+
+    #[test]
+    fn echap_annule_la_saisie_puis_retire_les_filtres() {
+        let mut v = runs_view();
+        v.start_edit();
+        "zzz".chars().for_each(|c| v.type_char(c));
+        assert!(ids(&v).is_empty());
+        v.cancel_edit();
+        assert_eq!(
+            (v.filter.as_str(), v.editing, ids(&v).len()),
+            ("", false, 5)
+        );
+        assert!(!v.clear_filters(), "rien à retirer");
+        v.cycle_status();
+        assert!(v.clear_filters(), "le statut compte comme un filtre");
+        assert_eq!(v.status, StatusFilter::All);
+        // Hors saisie, les caractères sont ignorés
+        v.type_char('x');
+        assert!(v.filter.is_empty());
+    }
+
+    #[test]
+    fn la_selection_suit_la_liste_affichee_et_le_meme_run() {
+        let mut v = runs_view();
+        v.start_edit();
+        "ci".chars().for_each(|c| v.type_char(c));
+        v.commit();
+        assert_eq!(ids(&v), [5, 4, 2]);
+        v.move_selection(1);
+        assert_eq!(v.selected_pipeline().map(|p| p.id), Some(4));
+        v.move_selection(10);
+        assert_eq!(
+            v.selected_pipeline().map(|p| p.id),
+            Some(2),
+            "borné à la liste affichée"
+        );
+        // Un nouveau run arrive en tête : la sélection suit le run 4... ici le 2
+        let mut list = v.pipelines.clone();
+        list.insert(0, run(6, "ci.yml", "main", "nouveau", Status::Pending));
+        v.apply_pipelines(&v.repo.clone(), Ok(list));
+        assert_eq!(v.selected_pipeline().map(|p| p.id), Some(2));
+        assert_eq!(ids(&v), [6, 5, 4, 2]);
+        // Le run sélectionné sort du filtre : la sélection reste dans les bornes
+        let mut list = v.pipelines.clone();
+        list.retain(|p| p.id != 2);
+        v.apply_pipelines(&v.repo.clone(), Ok(list));
+        assert!(v.selected < ids(&v).len());
     }
 }
