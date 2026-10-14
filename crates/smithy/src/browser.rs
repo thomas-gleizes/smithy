@@ -7,7 +7,7 @@ use std::cell::Cell;
 
 use smithy_core::{Branch, Entry, EntryKind, Error, FileContent, Repo, clean_text_line};
 
-use crate::{logview::TextView, request::Request};
+use crate::{highlight::Run, logview::TextView, request::Request};
 
 /// Octets lus d'un fichier au plus : au-delà, seul le début est affiché.
 pub const FILE_LIMIT_BYTES: usize = 1024 * 1024;
@@ -239,6 +239,24 @@ impl Browser {
         }
     }
 
+    /// La coloration d'un fichier arrive, calculée à part : elle ne s'applique que si c'est
+    /// encore le même fichier, avec le même texte.
+    pub fn on_styles(
+        &mut self,
+        repo: &Repo,
+        reference: &str,
+        path: &str,
+        fingerprint: u64,
+        styles: Vec<Vec<Run>>,
+    ) {
+        let Mode::File(fv) = &mut self.mode else {
+            return;
+        };
+        if *repo == self.repo && reference == self.reference && path == fv.path {
+            fv.text.set_styles(fingerprint, styles);
+        }
+    }
+
     // --- actions de l'utilisateur
 
     /// Entrée / flèche droite : ouvre le dossier ou le fichier sélectionné, ou choisit la
@@ -398,6 +416,19 @@ impl Browser {
 }
 
 /// Remplit le volet de texte avec le contenu d'un fichier, et dit ce qui a été coupé.
+/// Les lignes **affichées** d'un texte (nettoyées, bornées) et si on en a coupé. C'est ce texte
+/// que la coloration analyse : ses décalages d'octets doivent viser ce qui est à l'écran.
+pub fn file_lines(text: &str) -> (Vec<String>, bool) {
+    let mut lines: Vec<&str> = text.split('\n').collect();
+    // Un fichier qui finit par un saut de ligne ne compte pas de ligne vide en plus.
+    if lines.last() == Some(&"") {
+        lines.pop();
+    }
+    let cut = lines.len() > FILE_LIMIT_LINES;
+    lines.truncate(FILE_LIMIT_LINES);
+    (lines.iter().map(|l| clean_text_line(l)).collect(), cut)
+}
+
 fn show_file(view: &mut TextView, content: &FileContent) {
     let Some(text) = &content.text else {
         view.set_plain(vec![format!(
@@ -407,17 +438,11 @@ fn show_file(view: &mut TextView, content: &FileContent) {
         view.notice = None;
         return;
     };
-    let mut lines: Vec<&str> = text.split('\n').collect();
-    // Un fichier qui finit par un saut de ligne ne compte pas de ligne vide en plus.
-    if lines.last() == Some(&"") {
-        lines.pop();
-    }
-    let cut_lines = lines.len() > FILE_LIMIT_LINES;
-    lines.truncate(FILE_LIMIT_LINES);
-    let shown: Vec<String> = if lines.is_empty() {
+    let (lines, cut_lines) = file_lines(text);
+    let shown = if lines.is_empty() {
         vec!["(fichier vide)".to_owned()]
     } else {
-        lines.iter().map(|l| clean_text_line(l)).collect()
+        lines
     };
     view.set_plain(shown);
     view.notice = match (content.truncated, cut_lines) {

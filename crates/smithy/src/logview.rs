@@ -11,7 +11,7 @@ use std::cell::RefCell;
 
 use smithy_core::{JobLog, Pipeline, Repo, Status};
 
-use crate::wrap;
+use crate::{highlight::Run, wrap};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LineKind {
@@ -26,6 +26,8 @@ pub struct LogLine {
     pub text: String,
     /// Étape à laquelle la ligne appartient (son titre compris), si elle en a une.
     pub step: Option<usize>,
+    /// Couleurs de la coloration syntaxique (octets de `text`) ; vide pour un log.
+    pub runs: Vec<Run>,
 }
 
 #[derive(Debug, Clone)]
@@ -40,6 +42,10 @@ pub enum LogState {
 pub struct Row<'a> {
     pub kind: LineKind,
     pub text: &'a str,
+    /// Octet de `text` dans sa ligne (non nul sur la suite d'une ligne repliée) et les couleurs
+    /// de **toute** la ligne : à découper avec `run_slices`.
+    pub offset: usize,
+    pub runs: &'a [Run],
     /// Suite d'une ligne repliée (et non début d'une ligne de log).
     pub continuation: bool,
     /// Titre de la section courante (celle que `Espace` plie ou déplie).
@@ -132,6 +138,16 @@ struct RowIndex {
     starts: Vec<usize>,
 }
 
+/// Empreinte d'un texte ligne à ligne (voir `TextView::fingerprint`).
+pub fn fingerprint_of<'a>(lines: impl IntoIterator<Item = &'a String>) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::hash::DefaultHasher::new();
+    for l in lines {
+        l.hash(&mut h);
+    }
+    h.finish()
+}
+
 /// Volet de texte : des lignes, éventuellement groupées en sections, et leur défilement.
 #[derive(Debug, Clone)]
 pub struct TextView {
@@ -174,10 +190,38 @@ impl TextView {
                     kind: LineKind::Text,
                     text,
                     step: None,
+                    runs: Vec::new(),
                 })
                 .collect(),
         );
         *self.index.borrow_mut() = None;
+    }
+
+    /// Empreinte du texte affiché : une coloration calculée pour un autre texte (fichier rechargé
+    /// entre-temps) ne doit pas être appliquée.
+    pub fn fingerprint(&self) -> u64 {
+        match &self.state {
+            LogState::Ready(lines) => fingerprint_of(lines.iter().map(|l| &l.text)),
+            _ => fingerprint_of(std::iter::empty::<&String>()),
+        }
+    }
+
+    /// Applique la coloration (une liste de régions par ligne). Refusée si le nombre de lignes
+    /// ne correspond pas ou si le texte n'est plus celui pour lequel elle a été calculée.
+    pub fn set_styles(&mut self, fingerprint: u64, styles: Vec<Vec<Run>>) -> bool {
+        if self.fingerprint() != fingerprint {
+            return false;
+        }
+        let LogState::Ready(lines) = &mut self.state else {
+            return false;
+        };
+        if lines.len() != styles.len() {
+            return false;
+        }
+        for (line, runs) in lines.iter_mut().zip(styles) {
+            line.runs = runs;
+        }
+        true
     }
 
     /// Remplace le contenu. L'état plié/déplié des étapes déjà vues est conservé ; une étape
@@ -192,6 +236,7 @@ impl TextView {
                 kind: LineKind::Text,
                 text: "(aucune étape : le job n'a pas démarré)".to_owned(),
                 step: None,
+                runs: Vec::new(),
             });
         }
         for (i, step) in log.steps.iter().enumerate() {
@@ -208,11 +253,13 @@ impl TextView {
                 kind: LineKind::Step(step.status),
                 text: String::new(), // rempli par `refresh_headers`
                 step: Some(i),
+                runs: Vec::new(),
             });
             lines.extend(step.lines.iter().map(|l| LogLine {
                 kind: LineKind::Text,
                 text: l.clone(),
                 step: Some(i),
+                runs: Vec::new(),
             }));
         }
         self.sections = sections;
@@ -396,7 +443,7 @@ impl TextView {
     }
 
     /// Les lignes d'écran visibles : de `scroll` sur `height` lignes.
-    pub fn window(&self, width: usize, height: usize) -> Vec<Row<'_>> {
+    pub fn window<'a>(&'a self, width: usize, height: usize) -> Vec<Row<'a>> {
         if height == 0 {
             return Vec::new();
         }
@@ -408,26 +455,28 @@ impl TextView {
         let mut out = Vec::with_capacity(height);
         for line in lines.iter().skip(first_line).filter(|l| !self.hidden(l)) {
             let is_current = matches!(line.kind, LineKind::Step(_)) && line.step == current;
-            let mut push = |text, continuation| {
+            let mut push = |text: &'a str, offset: usize, continuation| {
                 out.push(Row {
                     kind: line.kind,
                     text,
+                    offset,
+                    runs: &line.runs,
                     continuation,
                     current: is_current,
                 });
                 out.len() == height
             };
             if self.wrap {
-                for (n, chunk) in wrap::chunks(&line.text, width).into_iter().enumerate() {
+                for (n, (start, end)) in wrap::ranges(&line.text, width).into_iter().enumerate() {
                     if skip > 0 {
                         skip -= 1;
                         continue;
                     }
-                    if push(chunk, n > 0) {
+                    if push(&line.text[start..end], start, n > 0) {
                         return out;
                     }
                 }
-            } else if push(&line.text, false) {
+            } else if push(&line.text, 0, false) {
                 return out;
             }
         }
@@ -465,6 +514,7 @@ mod tests {
                     kind: LineKind::Text,
                     text: (*t).to_owned(),
                     step: None,
+                    runs: Vec::new(),
                 })
                 .collect(),
         );
@@ -591,6 +641,7 @@ mod tests {
             kind: LineKind::Text,
             text: "abcdefghijkl".into(),
             step: None,
+            runs: Vec::new(),
         }]);
         assert_eq!(v.total_rows(6), 2, "autre contenu : recalculé");
     }

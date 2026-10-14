@@ -6,20 +6,30 @@ use unicode_width::UnicodeWidthChar;
 /// Découpe `text` en morceaux d'au plus `width` colonnes (un caractère large de 2 colonnes
 /// compte pour 2). Toujours au moins un morceau, même pour une ligne vide ; une largeur
 /// trop étroite pour un caractère le laisse seul sur sa ligne plutôt que de boucler.
+#[cfg(test)]
 pub fn chunks(text: &str, width: usize) -> Vec<&str> {
+    ranges(text, width)
+        .into_iter()
+        .map(|(a, b)| &text[a..b])
+        .collect()
+}
+
+/// Comme `chunks`, mais en positions d'octets `(début, fin)` : la coloration en a besoin pour
+/// savoir quelle part de la ligne chaque morceau montre.
+pub fn ranges(text: &str, width: usize) -> Vec<(usize, usize)> {
     let width = width.max(1);
     let mut out = Vec::new();
     let (mut start, mut used) = (0, 0);
     for (i, c) in text.char_indices() {
         let w = c.width().unwrap_or(0);
         if used + w > width && i > start {
-            out.push(&text[start..i]);
+            out.push((start, i));
             start = i;
             used = 0;
         }
         used += w;
     }
-    out.push(&text[start..]);
+    out.push((start, text.len()));
     out
 }
 

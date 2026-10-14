@@ -12,6 +12,7 @@ use smithy_core::{EntryKind, RepoInfo, Status};
 use crate::{
     app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
+    highlight::{self, Tok},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
     timeago,
@@ -471,6 +472,26 @@ fn draw_logs(f: &mut Frame, app: &App, view: &LogView, area: Rect) {
 
 /// Volet de texte plein cadre : sortie d'un job ou contenu d'un fichier, avec sa position et sa
 /// réserve éventuelle dans la bordure du bas.
+/// Les couleurs des jetons : les 16 couleurs ANSI, donc celles du terminal de l'utilisateur
+/// (aucun thème RGB imposé).
+fn tok_style(tok: Tok) -> Style {
+    let fg = |c| Style::new().fg(c);
+    match tok {
+        Tok::Comment | Tok::Quote => fg(Color::DarkGray),
+        Tok::Str => fg(Color::Green),
+        Tok::Number | Tok::Constant | Tok::Attr => fg(Color::Yellow),
+        Tok::Keyword => fg(Color::Magenta),
+        Tok::Type => fg(Color::Cyan),
+        Tok::Function => fg(Color::LightBlue),
+        Tok::Tag => fg(Color::Red),
+        Tok::Heading => fg(Color::Cyan).bold(),
+        Tok::Strong => Style::new().bold(),
+        Tok::Emph => Style::new().add_modifier(Modifier::ITALIC),
+        Tok::Link => fg(Color::Blue).add_modifier(Modifier::UNDERLINED),
+        Tok::Code => fg(Color::Green),
+    }
+}
+
 fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, view: &TextView) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -514,7 +535,16 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
                         };
                         Line::from(Span::styled(r.text, style))
                     }
-                    LineKind::Text => Line::from(r.text),
+                    LineKind::Text if r.runs.is_empty() => Line::from(r.text),
+                    LineKind::Text => Line::from(
+                        highlight::segments(r.text, r.offset, r.runs)
+                            .into_iter()
+                            .map(|(text, tok)| match tok {
+                                Some(t) => Span::styled(text, tok_style(t)),
+                                None => Span::raw(text),
+                            })
+                            .collect::<Vec<_>>(),
+                    ),
                 })
                 .collect()
         }
@@ -1336,6 +1366,7 @@ mod tests {
             kind,
             text: text.into(),
             step: None,
+            runs: Vec::new(),
         }
     }
 
@@ -2600,5 +2631,36 @@ mod tests {
         app.server_picker_move(-1);
         app.server_delete_ask();
         assert!(render(&app, 110, 20).contains("utilisé par un onglet"));
+    }
+
+    #[test]
+    fn les_jetons_sont_peints_aux_couleurs_ansi() {
+        use crate::highlight::{Run, Tok};
+        let run = |start, end, tok| Run { start, end, tok };
+        let app = app_with_logs(LogState::Ready(vec![LogLine {
+            kind: LineKind::Text,
+            text: "QQ x = \"ZZ\"; // WW".into(),
+            step: None,
+            runs: vec![
+                run(0, 2, Tok::Keyword),
+                run(7, 11, Tok::Str),
+                run(13, 18, Tok::Comment),
+            ],
+        }]));
+        app.viewport.set(5);
+        let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let fg_of = |sym: &str| {
+            buf.content()
+                .iter()
+                .find(|c| c.symbol() == sym)
+                .map(|c| c.fg)
+        };
+        assert_eq!(fg_of("Q"), Some(Color::Magenta), "mot-clé");
+        assert_eq!(fg_of("Z"), Some(Color::Green), "chaîne");
+        assert_eq!(fg_of("W"), Some(Color::DarkGray), "commentaire");
+        // Le texte sans région garde la couleur par défaut
+        assert_eq!(fg_of("x"), Some(Color::Reset));
     }
 }

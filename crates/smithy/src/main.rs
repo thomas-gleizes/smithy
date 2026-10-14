@@ -1,6 +1,7 @@
 mod app;
 mod browser;
 mod config;
+mod highlight;
 mod logview;
 mod pages;
 mod recent;
@@ -262,6 +263,7 @@ fn run_request<P: Provider + 'static>(
 ) {
     let (p, tx) = (p.clone(), tx.clone());
     tokio::spawn(async move {
+        let mut styling = None;
         let msg = match req {
             Request::Repos(source) => {
                 let result = p.list_repos(&source).await;
@@ -308,6 +310,13 @@ fn run_request<P: Provider + 'static>(
                 let result = p
                     .read_file(&repo, &reference, &path, FILE_LIMIT_BYTES)
                     .await;
+                // Le texte s'affiche tout de suite ; la coloration suit, calculée à part.
+                if let Some(text) = result.as_ref().ok().and_then(|c| c.text.as_deref()) {
+                    let (lines, _) = browser::file_lines(text);
+                    if !lines.is_empty() {
+                        styling = Some((repo.clone(), reference.clone(), path.clone(), lines));
+                    }
+                }
                 Msg::File {
                     repo,
                     reference,
@@ -316,7 +325,24 @@ fn run_request<P: Provider + 'static>(
                 }
             }
         };
-        let _ = tx.send((server, msg));
+        let _ = tx.send((server.clone(), msg));
+        if let Some((repo, reference, path, lines)) = styling {
+            // Chargement des grammaires et analyse : hors du fil de l'interface.
+            let job = tokio::task::spawn_blocking(move || {
+                let styles = highlight::highlight_file(&path, &lines)?;
+                let fingerprint = logview::fingerprint_of(&lines);
+                Some(Msg::FileStyles {
+                    repo,
+                    reference,
+                    path,
+                    fingerprint,
+                    styles,
+                })
+            });
+            if let Ok(Some(msg)) = job.await {
+                let _ = tx.send((server, msg));
+            }
+        }
     });
 }
 

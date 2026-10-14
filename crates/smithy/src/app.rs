@@ -8,6 +8,7 @@ use smithy_core::{
 
 use crate::{
     browser::{Browser, Mode},
+    highlight::Run,
     logview::{LogState, LogView, Start, TextView},
     pages::{HomeRow, HomeView, RepoView, RunsView},
     recent::{self, RecentEntry},
@@ -54,6 +55,14 @@ pub enum Msg {
         repo: Repo,
         pipeline_id: u64,
         result: Result<JobLog, Error>,
+    },
+    /// La coloration syntaxique d'un fichier, calculée à part une fois le texte affiché.
+    FileStyles {
+        repo: Repo,
+        reference: String,
+        path: String,
+        fingerprint: u64,
+        styles: Vec<Vec<Run>>,
     },
     /// Résultat de la sonde de joignabilité d'un serveur (version si connue, ou raison).
     Reach {
@@ -860,6 +869,19 @@ impl App {
                 for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Browser(b) = page {
                         b.on_file(&repo, &reference, &path, result.clone());
+                    }
+                }
+            }
+            Msg::FileStyles {
+                repo,
+                reference,
+                path,
+                fingerprint,
+                styles,
+            } => {
+                for page in self.stacks_of(server).into_iter().flatten() {
+                    if let Page::Browser(b) = page {
+                        b.on_styles(&repo, &reference, &path, fingerprint, styles.clone());
                     }
                 }
             }
@@ -3629,5 +3651,93 @@ mod tests {
         assert!(ok);
         assert!(matches!(a.stack[0], Page::Home(_)));
         assert!(a.snapshot().tabs[0].pages.len() >= 2);
+    }
+
+    // --- coloration syntaxique
+
+    fn open_file(a: &mut App, path: &str, text: &str) {
+        feed(a);
+        {
+            let b = a.browser_mut().unwrap();
+            b.move_selection(1); // « a.txt » (dossiers d'abord)
+            b.enter();
+        }
+        // Le fichier ouvert porte le nom demandé
+        if let Mode::File(fv) = &mut a.browser_mut().unwrap().mode {
+            fv.path = path.to_owned();
+        }
+        a.apply(Msg::File {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: path.into(),
+            result: Ok(FileContent {
+                size: text.len() as u64,
+                text: Some(text.into()),
+                truncated: false,
+            }),
+        });
+    }
+
+    fn file_runs(a: &App) -> Vec<usize> {
+        let Mode::File(fv) = &a.browser().unwrap().mode else {
+            panic!("pas de fichier ouvert");
+        };
+        let crate::logview::LogState::Ready(lines) = &fv.text.state else {
+            panic!("fichier pas prêt");
+        };
+        lines.iter().map(|l| l.runs.len()).collect()
+    }
+
+    #[test]
+    fn la_coloration_arrive_apres_le_texte_et_seulement_pour_le_meme_texte() {
+        let mut a = explorer();
+        open_file(&mut a, "a.txt", "let a = 1;\nlet b = 2;\n");
+        assert_eq!(file_runs(&a), [0, 0], "d'abord le texte, sans couleur");
+        let lines = crate::browser::file_lines("let a = 1;\nlet b = 2;\n").0;
+        let fingerprint = crate::logview::fingerprint_of(&lines);
+        let run = |s, e| Run {
+            start: s,
+            end: e,
+            tok: crate::highlight::Tok::Keyword,
+        };
+        let styles = vec![vec![run(0, 3)], vec![run(0, 3)]];
+        let styled = |fingerprint, path: &str, styles| Msg::FileStyles {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: path.into(),
+            fingerprint,
+            styles,
+        };
+        // Un autre fichier, un autre dépôt ou un texte différent : ignoré
+        a.apply(styled(fingerprint, "autre.rs", styles.clone()));
+        a.apply(styled(fingerprint ^ 1, "a.txt", styles.clone()));
+        assert_eq!(file_runs(&a), [0, 0]);
+        // Un nombre de lignes différent : ignoré
+        a.apply(styled(fingerprint, "a.txt", vec![vec![run(0, 3)]]));
+        assert_eq!(file_runs(&a), [0, 0]);
+        // Le bon : appliqué
+        a.apply(styled(fingerprint, "a.txt", styles));
+        assert_eq!(file_runs(&a), [1, 1]);
+        // Le fichier est rechargé avec un autre texte : l'ancienne coloration est partie
+        a.apply(Msg::File {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "a.txt".into(),
+            result: Ok(FileContent {
+                size: 5,
+                text: Some("autre\nchose\n".into()),
+                truncated: false,
+            }),
+        });
+        assert_eq!(file_runs(&a), [0, 0]);
+    }
+
+    #[test]
+    fn lignes_du_fichier_affichees_et_analysees_sont_les_memes() {
+        // Tabulation et contrôle : le texte analysé est celui qui est à l'écran
+        let (lines, cut) = crate::browser::file_lines("a\tb\x01\nc\r\n");
+        assert!(!cut);
+        assert_eq!(lines, ["a    b\u{2401}", "c"]);
+        assert!(crate::browser::file_lines("").0.is_empty());
     }
 }
