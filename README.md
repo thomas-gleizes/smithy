@@ -46,17 +46,25 @@ An unverified version is never silently trusted: the log view shows a ⚠ notice
 
 ## Install
 
-### Pre-built Linux binary
+### Pre-built binary
 
-Tagged releases (`vX.Y.Z`) carry a **static Linux x86_64 binary** (built against musl, so it runs on any distribution without installing anything). Download `smithy-<version>-x86_64-unknown-linux-musl.tar.gz` from the [Releases](https://github.com/thomas-gleizes/smithy/releases) page, check it against the `.sha256` file next to it, and unpack it:
+Every release carries ready-to-run binaries for **Linux** (x86_64 and arm64, static: built against musl, so they run on any distribution without installing anything) and **macOS** (Apple Silicon and Intel). One-line install of the latest release (checks the archive against `checksums.txt`, installs to `/usr/local/bin`, or to `$SMITHY_INSTALL_DIR`):
 
 ```sh
-sha256sum -c smithy-*.tar.gz.sha256
-tar xzf smithy-*.tar.gz
-./smithy-*/smithy --version
+curl -fsSL https://raw.githubusercontent.com/thomas-gleizes/smithy/main/scripts/install.sh | bash
 ```
 
-Any commit can also be built from the *Release* workflow (Actions tab → *Release* → *Run workflow*): the archive is kept as an artifact of the run.
+Or by hand: download `smithy_<os>_<arch>.tar.gz` (`os` = `linux` or `darwin`, `arch` = `amd64` or `arm64`) from the [Releases](https://github.com/thomas-gleizes/smithy/releases) page, check it against `checksums.txt`, and put `smithy` on your `PATH`. The latest one always has the same URL:
+
+```sh
+curl -fLO https://github.com/thomas-gleizes/smithy/releases/latest/download/smithy_linux_amd64.tar.gz
+curl -fLO https://github.com/thomas-gleizes/smithy/releases/latest/download/checksums.txt
+sha256sum --ignore-missing -c checksums.txt
+tar xzf smithy_linux_amd64.tar.gz smithy
+./smithy --version
+```
+
+Releases are published automatically: when CI passes on `main`, the next version is computed from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/): `feat` → minor, `fix`/`perf`/`refactor` → patch, `!` or `BREAKING CHANGE` → major; `docs`/`chore`/`ci`/`test` alone → no release), tagged and published. Pushing a `vX.Y.Z` tag by hand publishes that version. Any commit can also be built without publishing from the *Release* workflow (Actions tab → *Release* → *Run workflow*): the archives are kept as artifacts of the run.
 
 ### From source
 
