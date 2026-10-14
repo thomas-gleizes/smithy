@@ -280,7 +280,21 @@ fn browser_key(app: &mut App, code: KeyCode) {
                 _ => {}
             }
         }
+        Screen::Dir if app.browser().is_some_and(|b| b.editing) => {
+            // Saisie du filtre par nom : presque tout est du texte.
+            if let Some(b) = app.browser_mut() {
+                match code {
+                    KeyCode::Enter => b.filter_commit(),
+                    KeyCode::Esc => b.filter_cancel(),
+                    KeyCode::Backspace => b.filter_backspace(),
+                    KeyCode::Char(c) => b.filter_type(c),
+                    _ => {}
+                }
+            }
+        }
         Screen::Dir => match code {
+            // Échap retire d'abord le filtre, puis il ferme l'explorateur.
+            KeyCode::Esc if app.browser_mut().is_some_and(Browser::clear_filter) => {}
             KeyCode::Esc | KeyCode::Char('q') => {
                 if app.browser_mut().is_some_and(Browser::back) {
                     app.close_browser();
@@ -299,6 +313,7 @@ fn browser_key(app: &mut App, code: KeyCode) {
                     KeyCode::End | KeyCode::Char('G') => b.select_last(),
                     KeyCode::Enter | KeyCode::Right => b.enter(),
                     KeyCode::Left | KeyCode::Backspace => b.up(),
+                    KeyCode::Char('/') => b.start_filter(),
                     KeyCode::Char('B') => b.open_branches(),
                     KeyCode::Char('r') => b.refresh(),
                     _ => {}

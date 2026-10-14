@@ -144,9 +144,11 @@ In the code explorer:
 | `←` / `Backspace`     | Go up one folder (or close the file) |
 | `PgDn` / `f`, `PgUp` / `b` | Page down / up             |
 | `g` / `Home`, `G` / `End` | First / last entry          |
+| `/`                   | Filter the folder's entries by name, live as you type (every word must match, ignoring case). `Enter` keeps the filter, `Esc` abandons the typing and brings back the previous filter |
 | `B`                   | Choose a branch (the default one comes first) |
 | `r`                   | Refresh                         |
-| `Esc`, `q`            | Close the file or the picker, then the explorer |
+| `Esc`                 | Remove the filter first, then close the explorer (`q` closes it right away) |
+| `q`                   | Close the file or the picker, then the explorer |
 
 A Markdown file opens rendered; `m` toggles between the rendered view and the source (the rendered view always wraps at word boundaries, so `w` only applies to the source). A file opens in the same viewer as the logs (the text shows at once; the colours arrive a moment later, computed in the background; files over 20,000 lines or lines over 1,000 bytes stay uncoloured): `j`/`k`, `f`/`b`, `g`/`G` and `w` (wrap) work the same way. Symbolic links and submodules are listed but not opened. The explorer only needs the read-only API token (no session cookie) and works on every Forgejo version from 10 to 15 (the content API is the same).
 
@@ -204,7 +206,8 @@ A new forge is a new crate implementing `Provider`.
 - [x] Restore the open tabs at startup (one instance owns them, `--fresh` to skip)
 - [ ] Pull requests, notifications and runners
 - [x] Filters on the runs list (text, status) and search in logs, files and rendered Markdown
-- [ ] Filter by name in the code explorer's folders and in the logs' steps
+- [x] Filter by name in the code explorer's folders
+- [ ] Filter the steps of a job's logs by name
 - [x] Job steps and logs for Forgejo
 - [x] Code explorer (branches, folders, files)
 - [x] Syntax highlighting in the explorer

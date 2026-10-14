@@ -93,8 +93,14 @@ pub struct Browser {
     /// Dossier courant, sans `/` initial ni final ; vide à la racine.
     pub path: String,
     pub dir: DirState,
-    /// Indice de l'entrée sélectionnée dans le dossier trié.
+    /// Indice de l'entrée sélectionnée dans la liste **affichée** (`visible`) du dossier trié.
     pub selected: usize,
+    /// Filtre par nom du dossier courant (`/`), et saisie en cours. Propre à chaque dossier :
+    /// changer de dossier ou de branche le retire.
+    pub filter: String,
+    pub editing: bool,
+    /// Le filtre validé avant la saisie en cours : `Échap` le retrouve.
+    filter_before: String,
     pub mode: Mode,
     /// Dépôt sans aucune branche.
     pub empty_repo: bool,
@@ -122,6 +128,9 @@ impl Browser {
             path: String::new(),
             dir: DirState::Loading,
             selected: 0,
+            filter: String::new(),
+            editing: false,
+            filter_before: String::new(),
             mode: Mode::Dir,
             empty_repo: false,
             info: None,
@@ -196,6 +205,75 @@ impl Browser {
         }
     }
 
+    /// Les entrées affichées : celles dont le nom contient tous les mots du filtre (sans tenir
+    /// compte de la casse). Sans filtre, tout le dossier.
+    pub fn visible(&self) -> Vec<&Entry> {
+        let words: Vec<String> = self
+            .filter
+            .split_whitespace()
+            .map(str::to_lowercase)
+            .collect();
+        self.entries()
+            .iter()
+            .filter(|e| {
+                let name = e.name.to_lowercase();
+                words.iter().all(|w| name.contains(w.as_str()))
+            })
+            .collect()
+    }
+
+    pub fn filter_active(&self) -> bool {
+        !self.filter.trim().is_empty()
+    }
+
+    // --- filtre par nom
+
+    pub fn start_filter(&mut self) {
+        if matches!(self.mode, Mode::Dir) && matches!(self.dir, DirState::Ready(_)) {
+            self.editing = true;
+            self.filter_before = self.filter.clone();
+        }
+    }
+
+    pub fn filter_type(&mut self, c: char) {
+        if self.editing {
+            self.filter.push(c);
+            self.selected = 0;
+            self.list_offset.set(0);
+        }
+    }
+
+    pub fn filter_backspace(&mut self) {
+        if self.editing {
+            self.filter.pop();
+            self.selected = 0;
+            self.list_offset.set(0);
+        }
+    }
+
+    /// Entrée : le filtre reste appliqué, la saisie se ferme.
+    pub fn filter_commit(&mut self) {
+        self.editing = false;
+    }
+
+    /// Échap pendant la saisie : le texte tapé est abandonné, le filtre d'avant revient.
+    pub fn filter_cancel(&mut self) {
+        self.editing = false;
+        self.filter = std::mem::take(&mut self.filter_before);
+        self.selected = 0;
+        self.list_offset.set(0);
+    }
+
+    /// Retire le filtre ; `false` s'il n'y en avait pas.
+    pub fn clear_filter(&mut self) -> bool {
+        let had = !self.filter.is_empty();
+        self.filter.clear();
+        self.editing = false;
+        self.selected = 0;
+        self.list_offset.set(0);
+        had
+    }
+
     // --- réponses du backend
 
     pub fn on_branches(&mut self, repo: &Repo, result: Result<Vec<Branch>, Error>) {
@@ -238,16 +316,15 @@ impl Browser {
             Ok(mut entries) => {
                 // Dossiers d'abord, puis ordre alphabétique sans tenir compte de la casse.
                 entries.sort_by_cached_key(|e| (e.kind != EntryKind::Dir, e.name.to_lowercase()));
-                self.selected = self
-                    .reselect
-                    .take()
-                    .and_then(|name| entries.iter().position(|e| e.name == name))
-                    .unwrap_or(0);
                 // Le décalage mémorisé appartient à l'ancien dossier : le garder laisserait le
                 // début d'un dossier court caché au-dessus de la sélection (ratatui ne fait que
                 // descendre jusqu'à la sélection, il ne remonte pas pour remplir l'écran).
                 self.list_offset.set(0);
                 self.dir = DirState::Ready(entries);
+                let reselect = self.reselect.take();
+                self.selected = reselect
+                    .and_then(|name| self.visible().iter().position(|e| e.name == name))
+                    .unwrap_or(0);
             }
             Err(e) => {
                 self.reselect = None;
@@ -353,11 +430,12 @@ impl Browser {
                 self.reference = name;
                 self.path.clear();
                 self.selected = 0;
+                self.clear_filter();
                 self.mode = Mode::Dir;
                 self.request_dir();
             }
             Mode::Dir => {
-                let Some(entry) = self.entries().get(self.selected).cloned() else {
+                let Some(entry) = self.visible().get(self.selected).map(|e| (*e).clone()) else {
                     return;
                 };
                 self.info = None;
@@ -365,6 +443,7 @@ impl Browser {
                     EntryKind::Dir => {
                         self.path = entry.path;
                         self.selected = 0;
+                        self.clear_filter();
                         self.request_dir();
                     }
                     EntryKind::File => {
@@ -407,6 +486,7 @@ impl Browser {
                 self.reselect = Some(name);
                 self.path = parent;
                 self.info = None;
+                self.clear_filter();
                 self.request_dir();
             }
         }
@@ -466,7 +546,7 @@ impl Browser {
     fn len(&self) -> usize {
         match &self.mode {
             Mode::Branches { .. } => self.branches.as_ref().map_or(0, Vec::len),
-            _ => self.entries().len(),
+            _ => self.visible().len(),
         }
     }
 
@@ -1081,5 +1161,185 @@ mod tests {
         original.on_branches(&repo(), Ok(vec![branch("main", true)]));
         assert_eq!(original.reference, "main");
         assert_eq!(copy.reference, "");
+    }
+
+    // --- filtre par nom
+
+    fn type_filter(b: &mut Browser, text: &str) {
+        b.start_filter();
+        text.chars().for_each(|c| b.filter_type(c));
+    }
+
+    fn shown(b: &Browser) -> Vec<String> {
+        b.visible().iter().map(|e| e.name.clone()).collect()
+    }
+
+    #[test]
+    fn filtre_par_nom_en_direct_sans_casse_et_mots_cumules() {
+        let mut b = browsing();
+        assert_eq!(
+            shown(&b),
+            ["alpha", "src", "lien", "README.md", "sub", "Zebra.txt"]
+        );
+        type_filter(&mut b, "A");
+        assert_eq!(
+            shown(&b),
+            ["alpha", "README.md", "Zebra.txt"],
+            "sans tenir compte de la casse"
+        );
+        b.filter_type(' ');
+        b.filter_type('t');
+        assert_eq!(shown(&b), ["Zebra.txt"], "tous les mots : « a » et « t »");
+        b.filter_backspace();
+        b.filter_backspace();
+        assert_eq!(b.filter, "A");
+        b.filter_commit();
+        assert!(!b.editing && b.filter_active(), "Entrée garde le filtre");
+        // Hors saisie, les caractères sont ignorés
+        b.filter_type('z');
+        assert_eq!(b.filter, "A");
+    }
+
+    #[test]
+    fn la_selection_et_l_ouverture_suivent_la_liste_affichee() {
+        let mut b = browsing();
+        type_filter(&mut b, "zebra");
+        b.filter_commit();
+        assert_eq!(b.selected, 0);
+        b.enter();
+        assert!(
+            matches!(&b.mode, Mode::File(fv) if fv.path == "Zebra.txt"),
+            "ouvre l'entrée affichée, pas la première du dossier"
+        );
+        assert_eq!(
+            b.take_requests(),
+            [Request::File {
+                repo: repo(),
+                reference: "main".into(),
+                path: "Zebra.txt".into()
+            }]
+        );
+        // Déplacements bornés à la liste affichée
+        let mut b = browsing();
+        type_filter(&mut b, "a");
+        b.filter_commit();
+        b.move_selection(10);
+        assert_eq!(b.selected, 2);
+        b.select_first();
+        assert_eq!(b.selected, 0);
+        b.select_last();
+        assert_eq!(b.selected, 2);
+    }
+
+    #[test]
+    fn echap_annule_la_saisie_puis_retire_le_filtre() {
+        let mut b = browsing();
+        type_filter(&mut b, "zzz");
+        assert!(shown(&b).is_empty());
+        b.filter_cancel();
+        assert!(!b.editing && b.filter.is_empty() && b.visible().len() == 6);
+        assert!(!b.clear_filter(), "rien à retirer");
+        type_filter(&mut b, "src");
+        b.filter_commit();
+        assert!(b.clear_filter());
+        assert_eq!(b.visible().len(), 6);
+    }
+
+    #[test]
+    fn le_filtre_est_propre_a_chaque_dossier_et_a_chaque_branche() {
+        let mut b = browsing();
+        type_filter(&mut b, "src");
+        b.filter_commit();
+        b.enter(); // dans src/
+        assert!(b.filter.is_empty() && b.path == "src");
+        b.take_requests();
+        b.on_dir(
+            &repo(),
+            "main",
+            "src",
+            Ok(vec![entry("a.rs", "src/a.rs", EntryKind::File, 1)]),
+        );
+        type_filter(&mut b, "a.rs");
+        b.filter_commit();
+        b.up();
+        assert!(b.filter.is_empty(), "remonter retire le filtre");
+        b.take_requests();
+        b.on_dir(
+            &repo(),
+            "main",
+            "",
+            Ok(vec![
+                entry("alpha", "alpha", EntryKind::Dir, 0),
+                entry("src", "src", EntryKind::Dir, 0),
+            ]),
+        );
+        assert_eq!(
+            b.entries()[b.selected].name,
+            "src",
+            "retombe sur le dossier quitté"
+        );
+        // Une autre branche repart sans filtre
+        type_filter(&mut b, "alp");
+        b.filter_commit();
+        b.open_branches();
+        if let Mode::Branches { selected } = &mut b.mode {
+            *selected = 1;
+        }
+        b.enter();
+        assert!(b.filter.is_empty() && b.reference == "feature/x");
+    }
+
+    #[test]
+    fn filtre_seulement_sur_un_dossier_charge() {
+        let mut b = Browser::open(repo());
+        b.start_filter();
+        assert!(!b.editing, "dossier pas encore chargé");
+        let mut b = browsing();
+        b.open_branches();
+        b.start_filter();
+        assert!(!b.editing, "pas dans le sélecteur de branche");
+        let mut b = browsing();
+        b.mode = Mode::File(Box::new(FileView::new("a.txt".into())));
+        b.start_filter();
+        assert!(!b.editing, "pas dans un fichier");
+    }
+
+    #[test]
+    fn rechargement_garde_le_filtre_et_une_selection_valide() {
+        let mut b = browsing();
+        type_filter(&mut b, "a");
+        b.filter_commit();
+        b.move_selection(2);
+        b.refresh();
+        b.take_requests();
+        b.on_dir(
+            &repo(),
+            "main",
+            "",
+            Ok(vec![
+                entry("alpha", "alpha", EntryKind::Dir, 0),
+                entry("x", "x", EntryKind::File, 1),
+            ]),
+        );
+        assert_eq!(b.filter, "a");
+        assert_eq!(shown(&b), ["alpha"]);
+        assert!(b.selected < b.visible().len().max(1));
+    }
+
+    #[test]
+    fn echap_pendant_une_nouvelle_saisie_retrouve_le_filtre_valide() {
+        let mut b = browsing();
+        type_filter(&mut b, "a");
+        b.filter_commit();
+        b.start_filter();
+        "lp".chars().for_each(|c| b.filter_type(c));
+        assert_eq!(b.filter, "alp");
+        assert_eq!(shown(&b), ["alpha"]);
+        b.filter_cancel();
+        assert_eq!(b.filter, "a", "le filtre validé est revenu");
+        assert_eq!(shown(&b).len(), 3);
+        // Un second Échap (hors saisie) le retire
+        assert!(b.clear_filter());
+        assert!(b.filter.is_empty());
     }
 }

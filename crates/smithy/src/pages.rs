@@ -456,6 +456,8 @@ pub struct RunsView {
     pub status: StatusFilter,
     /// Saisie du filtre en cours.
     pub editing: bool,
+    /// Le filtre validé avant la saisie en cours : `Échap` le retrouve.
+    filter_before: String,
     /// Premier chargement en cours (la liste est vide en attendant).
     pub loading: bool,
     pub error: Option<String>,
@@ -471,6 +473,7 @@ impl RunsView {
             filter: String::new(),
             status: StatusFilter::All,
             editing: false,
+            filter_before: String::new(),
             loading: true,
             error: None,
             list_offset: Cell::new(0),
@@ -507,6 +510,7 @@ impl RunsView {
 
     pub fn start_edit(&mut self) {
         self.editing = true;
+        self.filter_before = self.filter.clone();
     }
 
     pub fn type_char(&mut self, c: char) {
@@ -528,10 +532,10 @@ impl RunsView {
         self.editing = false;
     }
 
-    /// Échap pendant la saisie : le texte tapé est abandonné.
+    /// Échap pendant la saisie : le texte tapé est abandonné, le filtre d'avant revient.
     pub fn cancel_edit(&mut self) {
         self.editing = false;
-        self.filter.clear();
+        self.filter = std::mem::take(&mut self.filter_before);
         self.selected = 0;
     }
 
@@ -1028,5 +1032,19 @@ mod tests {
         list.retain(|p| p.id != 2);
         v.apply_pipelines(&v.repo.clone(), Ok(list));
         assert!(v.selected < ids(&v).len());
+    }
+
+    #[test]
+    fn echap_pendant_une_nouvelle_saisie_retrouve_le_filtre_des_runs() {
+        let mut v = runs_view();
+        v.start_edit();
+        "ci".chars().for_each(|c| v.type_char(c));
+        v.commit();
+        v.start_edit();
+        "x".chars().for_each(|c| v.type_char(c));
+        assert_eq!(v.filter, "cix");
+        v.cancel_edit();
+        assert_eq!(v.filter, "ci");
+        assert_eq!(ids(&v), [5, 4, 2]);
     }
 }

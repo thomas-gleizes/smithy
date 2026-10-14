@@ -724,9 +724,9 @@ fn dir_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ naviguer · →/↵ ouvrir · ←/⌫ remonter · B branche · t onglet · r actualiser · Esc retour",
-            "j/k · →/↵ ouvrir · ← remonter · B branche · Esc retour",
-            "→ ouvrir · ← haut · B branche · Esc",
+            "j/k ↑/↓ naviguer · →/↵ ouvrir · ←/⌫ remonter · / filtrer · B branche · t onglet · r actualiser · Esc retour",
+            "j/k · →/↵ ouvrir · ← remonter · / filtrer · B branche · Esc retour",
+            "→ ouvrir · ← haut · / filtrer · B branche · Esc",
             "→ · ← · B · Esc",
             "Esc",
         ],
@@ -802,13 +802,27 @@ fn draw_browser(f: &mut Frame, app: &App, b: &Browser, area: Rect) {
         draw_footer(f, app, rows[1], help, search.as_deref());
         return;
     }
-    draw_dir(f, app, b, rows[0], format!(" /{} ", b.path));
+    let filter = if b.filter_active() {
+        format!(" · « {} »", b.filter.trim())
+    } else {
+        String::new()
+    };
+    draw_dir(f, app, b, rows[0], format!(" /{}{filter} ", b.path));
     let help = if matches!(b.mode, Mode::Branches { .. }) {
         branches_help(width)
     } else {
         dir_help(width)
     };
-    draw_footer(f, app, rows[1], help, b.info.as_deref());
+    let prompt = b
+        .editing
+        .then(|| format!("filtrer : {}▏   Entrée valider · Échap annuler", b.filter));
+    draw_footer(
+        f,
+        app,
+        rows[1],
+        help,
+        prompt.as_deref().or(b.info.as_deref()),
+    );
     if let Mode::Branches { selected } = b.mode {
         draw_branch_picker(f, b, selected);
     }
@@ -836,8 +850,16 @@ fn draw_dir(f: &mut Frame, app: &App, b: &Browser, area: Rect, title: String) {
             },
             Color::DarkGray,
         ),
+        DirState::Ready(_) if b.visible().is_empty() => draw_message(
+            f,
+            area,
+            block,
+            "(aucune entrée ne correspond au filtre · Échap l'efface)".to_owned(),
+            Color::DarkGray,
+        ),
         DirState::Ready(entries) => {
-            let table_rows: Vec<Row> = entries
+            let visible = b.visible();
+            let table_rows: Vec<Row> = visible
                 .iter()
                 .map(|e| {
                     let (label, style) = match e.kind {
@@ -868,9 +890,21 @@ fn draw_dir(f: &mut Frame, app: &App, b: &Browser, area: Rect, title: String) {
                 .collect();
             let table = Table::new(table_rows, [Constraint::Min(10), Constraint::Length(10)])
                 .header(Row::new(["Nom", "Taille"]).style(Style::new().bold()))
-                .block(block.title_bottom(
-                    Line::from(format!(" {}/{} ", b.selected + 1, entries.len())).right_aligned(),
-                ))
+                .block(
+                    block.title_bottom(
+                        Line::from(if b.filter_active() {
+                            format!(
+                                " {}/{} (sur {}) ",
+                                b.selected + 1,
+                                visible.len(),
+                                entries.len()
+                            )
+                        } else {
+                            format!(" {}/{} ", b.selected + 1, visible.len())
+                        })
+                        .right_aligned(),
+                    ),
+                )
                 .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
             // Le décalage est mémorisé d'une image à l'autre : sinon la sélection resterait
             // collée au bas de l'écran à chaque déplacement vers le haut.
@@ -2922,5 +2956,68 @@ mod tests {
             text.contains("ci.yml") && text.contains("deploy.yml") && text.contains("1/3"),
             "{text}"
         );
+    }
+
+    #[test]
+    fn dossier_filtre_a_l_ecran() {
+        let mut app = App::new();
+        app.set_caps("", true, true);
+        let repo = Repo {
+            owner: "o".into(),
+            name: "r".into(),
+        };
+        let mut b = Browser::open(repo.clone());
+        b.on_branches(
+            &repo,
+            Ok(vec![smithy_core::Branch {
+                name: "main".into(),
+                default: true,
+            }]),
+        );
+        let e = |n: &str, k| smithy_core::Entry {
+            name: n.into(),
+            path: n.into(),
+            kind: k,
+            size: 5,
+        };
+        b.on_dir(
+            &repo,
+            "main",
+            "",
+            Ok(vec![
+                e("alpha", EntryKind::Dir),
+                e("notes.md", EntryKind::File),
+                e("main.rs", EntryKind::File),
+            ]),
+        );
+        app.stack.push(crate::app::Page::Browser(b));
+        {
+            let b = app.browser_mut().unwrap();
+            b.start_filter();
+            "RS".chars().for_each(|c| b.filter_type(c));
+        }
+        let text = render(&app, 110, 12);
+        assert!(text.contains("filtrer : RS▏"), "{text}");
+        assert!(
+            text.contains("« RS »") && text.contains("1/1 (sur 3)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("main.rs") && !text.contains("notes.md"),
+            "{text}"
+        );
+        assert!(app.is_typing());
+        app.browser_mut().unwrap().filter_commit();
+        assert!(!app.is_typing());
+        assert!(render(&app, 110, 12).contains("« RS »"));
+        // Aucune entrée ne correspond
+        let b = app.browser_mut().unwrap();
+        b.start_filter();
+        "zzz".chars().for_each(|c| b.filter_type(c));
+        b.filter_commit();
+        assert!(render(&app, 110, 12).contains("aucune entrée ne correspond"));
+        app.browser_mut().unwrap().clear_filter();
+        let text = render(&app, 110, 12);
+        assert!(text.contains("notes.md") && text.contains("1/3"), "{text}");
     }
 }

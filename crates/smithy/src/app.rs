@@ -682,6 +682,7 @@ impl App {
     pub fn is_typing(&self) -> bool {
         self.home().is_some_and(|h| h.editing)
             || self.runs().is_some_and(|r| r.editing)
+            || self.browser().is_some_and(|b| b.editing)
             || self.text_prompt_active()
     }
 
