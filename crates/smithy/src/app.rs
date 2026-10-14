@@ -54,8 +54,11 @@ pub enum Msg {
         pipeline_id: u64,
         result: Result<JobLog, Error>,
     },
-    /// Résultat du login : la session à conserver, ou le message d'erreur.
-    LoggedIn(Result<Session, String>),
+    /// Résultat du login sur ce serveur : la session à conserver, ou le message d'erreur.
+    LoggedIn {
+        server: String,
+        result: Result<Session, String>,
+    },
 }
 
 /// Nombre maximal d'onglets : chacun garde ses pages (un log peut compter 50 000 lignes).
@@ -72,6 +75,7 @@ pub enum TabMarker {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TabTitle {
+    pub server: String,
     pub text: String,
     pub marker: Option<TabMarker>,
     pub active: bool,
@@ -104,9 +108,22 @@ pub enum LoginField {
     Password,
 }
 
+/// Un serveur configuré, pour la liste des serveurs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerEntry {
+    pub name: String,
+    pub url: String,
+}
+
 /// Formulaire de connexion. Le mot de passe n'y reste que le temps de la saisie.
 #[derive(Debug)]
 pub struct LoginForm {
+    /// Serveur auquel on se connecte, et son libellé pour le titre.
+    pub server: String,
+    pub label: String,
+    /// La connexion sert à changer d'onglet de serveur : une fois faite, l'onglet bascule ;
+    /// annulée, il reste comme il était.
+    pub switch_to: bool,
     pub username: String,
     pub password: String,
     pub field: LoginField,
@@ -120,8 +137,13 @@ pub struct App {
     pub should_quit: bool,
     /// Formulaire affiché par-dessus l'interface tant que l'utilisateur n'est pas connecté.
     pub login: Option<LoginForm>,
-    /// Nom et URL du serveur, pour le titre du formulaire.
-    pub server_label: String,
+    /// Les serveurs configurés, pour la liste (`S`) et les libellés de connexion.
+    pub servers: Vec<ServerEntry>,
+    /// Liste des serveurs ouverte par-dessus l'interface (indice de la ligne choisie).
+    pub server_picker: Option<usize>,
+    /// Ce que sait faire chaque serveur **connecté** : `(logs, explorateur)`. Absent = pas de
+    /// fournisseur (il faut se connecter avant de pouvoir y aller).
+    caps: std::collections::HashMap<String, (bool, bool)>,
     /// Pages empilées de l'onglet affiché, comme dans un navigateur : `Échap` dépile et retrouve
     /// la page d'avant telle qu'on l'a laissée. Jamais vide : le fond est toujours l'accueil.
     pub stack: Vec<Page>,
@@ -131,11 +153,14 @@ pub struct App {
     active: usize,
     /// Liste des onglets ouverte par-dessus l'interface (indice de la ligne choisie).
     pub tab_picker: Option<usize>,
-    /// Nom du serveur, pour le fil d'Ariane et l'historique.
+    /// Serveur de l'onglet **affiché** (comme `stack`, c'est celui de l'onglet courant) : fil
+    /// d'Ariane, historique, étiquette des requêtes. Chaque onglet a le sien, voir `tab_servers`.
     pub server_name: String,
-    /// Le backend sait-il fournir des logs ? (`Capabilities::logs`)
+    /// Le serveur de chaque onglet ; l'entrée de l'onglet affiché est mise à jour quand on le quitte.
+    tab_servers: Vec<String>,
+    /// Le serveur de l'onglet affiché sait-il fournir des logs ? (`Capabilities::logs`)
     pub logs_supported: bool,
-    /// Le backend sait-il parcourir le code ? (`Capabilities::browse`)
+    /// … et parcourir le code ? (`Capabilities::browse`)
     pub browse_supported: bool,
     /// Dernier choix de retour à la ligne, appliqué aux volets de texte suivants (le temps de la session).
     pub logs_wrap: bool,
@@ -147,23 +172,31 @@ pub struct App {
     pub recents_dirty: bool,
     /// Requêtes que la boucle principale doit lancer. Gardées tant qu'aucun fournisseur n'est
     /// prêt (connexion à faire) : elles partent dès que la connexion aboutit.
-    pending: Vec<Request>,
+    /// Chaque requête est étiquetée du serveur de l'onglet qui la demande.
+    pending: Vec<(String, Request)>,
 }
 
 impl App {
     pub fn new() -> Self {
         let mut home = HomeView::new();
-        let pending = home.request_current().into_iter().collect();
+        let pending = home
+            .request_current()
+            .into_iter()
+            .map(|r| (String::new(), r))
+            .collect();
         Self {
             error: None,
             should_quit: false,
             login: None,
-            server_label: String::new(),
+            servers: Vec::new(),
+            server_picker: None,
+            caps: std::collections::HashMap::new(),
             stack: vec![Page::Home(home)],
             tabs: vec![Vec::new()],
             active: 0,
             tab_picker: None,
             server_name: String::new(),
+            tab_servers: vec![String::new()],
             logs_supported: false,
             browse_supported: false,
             logs_wrap: false,
@@ -276,29 +309,69 @@ impl App {
 
     /// Les requêtes à lancer : celles de l'application, puis celles de chaque explorateur ouvert
     /// (dans n'importe quel onglet).
+    #[cfg(test)]
     pub fn take_requests(&mut self) -> Vec<Request> {
+        self.take_tagged_requests()
+            .into_iter()
+            .map(|(_, r)| r)
+            .collect()
+    }
+
+    /// Comme `take_requests`, chaque requête portant le serveur de l'onglet qui la demande :
+    /// c'est à ce fournisseur qu'il faut l'envoyer, et sa réponse y revient (`apply_for`).
+    pub fn take_tagged_requests(&mut self) -> Vec<(String, Request)> {
         let mut out = std::mem::take(&mut self.pending);
-        for stack in self.stacks_mut() {
+        let active = self.active;
+        let shown = (active, &mut self.stack);
+        let others = self
+            .tabs
+            .iter_mut()
+            .enumerate()
+            .filter(|(i, _)| *i != active);
+        for (i, stack) in std::iter::once(shown).chain(others) {
+            let server = if i == active {
+                &self.server_name
+            } else {
+                &self.tab_servers[i]
+            };
             for page in stack {
                 if let Page::Browser(b) = page {
-                    out.extend(b.take_requests());
+                    out.extend(b.take_requests().into_iter().map(|r| (server.clone(), r)));
                 }
             }
         }
         out
     }
 
-    /// Les piles de tous les onglets (l'affichée d'abord), pour diffuser une réponse réseau :
-    /// chaque page écarte ce qui ne la concerne pas.
-    fn stacks_mut(&mut self) -> impl Iterator<Item = &mut Vec<Page>> {
+    /// Remet en file des requêtes que `main` n'a pas pu envoyer (serveur pas encore connecté).
+    pub fn requeue(&mut self, requests: Vec<(String, Request)>) {
+        self.pending.extend(requests);
+    }
+
+    fn queue(&mut self, req: Request) {
+        self.pending.push((self.server_name.clone(), req));
+    }
+
+    fn queue_all(&mut self, reqs: impl IntoIterator<Item = Request>) {
+        for r in reqs {
+            self.queue(r);
+        }
+    }
+
+    /// Les piles des seuls onglets qui sont sur ce serveur : deux serveurs peuvent avoir un
+    /// dépôt du même nom, une réponse de l'un ne doit pas atteindre les onglets de l'autre.
+    fn stacks_of(&mut self, server: &str) -> Vec<&mut Vec<Page>> {
         let active = self.active;
-        std::iter::once(&mut self.stack).chain(
-            self.tabs
-                .iter_mut()
-                .enumerate()
-                .filter(move |(i, _)| *i != active)
-                .map(|(_, s)| s),
-        )
+        let mut out = Vec::new();
+        if self.server_name == server {
+            out.push(&mut self.stack);
+        }
+        for (i, stack) in self.tabs.iter_mut().enumerate() {
+            if i != active && self.tab_servers[i] == server {
+                out.push(stack);
+            }
+        }
+        out
     }
 
     // --- accueil
@@ -331,14 +404,14 @@ impl App {
     /// Flèche droite / gauche : section suivante ou précédente de l'accueil.
     pub fn home_switch(&mut self, delta: isize) {
         if let Some(r) = self.home_mut().and_then(|h| h.switch(delta)) {
-            self.pending.push(r);
+            self.queue(r);
         }
     }
 
     /// Entrée dans la saisie de l'accueil : « Explorer » lance sa recherche.
     pub fn home_commit(&mut self) {
         if let Some(r) = self.home_mut().and_then(HomeView::commit) {
-            self.pending.push(r);
+            self.queue(r);
         }
     }
 
@@ -355,8 +428,8 @@ impl App {
             None => RepoView::placeholder(row.repo.clone()),
         };
         self.record_recent(&row.repo);
-        self.pending.push(Request::RepoInfo(row.repo.clone()));
-        self.pending.push(Request::Pipelines(row.repo));
+        self.queue(Request::RepoInfo(row.repo.clone()));
+        self.queue(Request::Pipelines(row.repo));
         self.stack.push(Page::Repo(view));
     }
 
@@ -380,7 +453,7 @@ impl App {
         let Some(r) = self.repo_page() else { return };
         let (repo, item) = (r.info.repo.clone(), r.selected);
         if item == 0 {
-            self.pending.push(Request::Pipelines(repo.clone()));
+            self.queue(Request::Pipelines(repo.clone()));
             self.stack.push(Page::Runs(RunsView::new(repo)));
         } else if self.browse_supported {
             self.stack.push(Page::Browser(Browser::open(repo)));
@@ -405,7 +478,7 @@ impl App {
         let mut view = LogView::new(repo.clone(), pipeline.clone());
         view.wrap = self.logs_wrap;
         self.stack.push(Page::Logs(view));
-        self.pending.push(Request::Logs { repo, pipeline });
+        self.queue(Request::Logs { repo, pipeline });
     }
 
     /// Redemande les logs affichés. Le contenu déjà là reste visible pendant ce temps ;
@@ -419,7 +492,7 @@ impl App {
             repo: v.repo.clone(),
             pipeline: v.pipeline.clone(),
         };
-        self.pending.push(req);
+        self.queue(req);
     }
 
     /// Le job affiché tourne encore : ses logs sont à rafraîchir périodiquement. Son statut
@@ -435,12 +508,12 @@ impl App {
         match self.stack.last() {
             Some(Page::Runs(r)) => {
                 let repo = r.repo.clone();
-                self.pending.push(Request::Pipelines(repo));
+                self.queue(Request::Pipelines(repo));
             }
             Some(Page::Logs(v)) => {
                 // La liste des runs, plus bas, dit si le job a fini.
                 let repo = v.repo.clone();
-                self.pending.push(Request::Pipelines(repo));
+                self.queue(Request::Pipelines(repo));
                 if self.logs_are_live() {
                     self.refetch_logs();
                 }
@@ -453,11 +526,15 @@ impl App {
                 continue;
             }
             if let Some(Page::Logs(v)) = stack.last() {
-                background.push(Request::Pipelines(v.repo.clone()));
-                background.push(Request::Logs {
-                    repo: v.repo.clone(),
-                    pipeline: v.pipeline.clone(),
-                });
+                let server = self.tab_servers[i].clone();
+                background.push((server.clone(), Request::Pipelines(v.repo.clone())));
+                background.push((
+                    server,
+                    Request::Logs {
+                        repo: v.repo.clone(),
+                        pipeline: v.pipeline.clone(),
+                    },
+                ));
             }
         }
         self.pending.extend(background);
@@ -478,7 +555,7 @@ impl App {
             Some(Page::Logs(_)) => self.refetch_logs(),
             None => {}
         }
-        self.pending.extend(requests);
+        self.queue_all(requests);
     }
 
     pub fn close_browser(&mut self) {
@@ -571,8 +648,16 @@ impl App {
     }
 
     /// Ouvre le formulaire ; si l'identifiant est connu, le curseur démarre sur le mot de passe.
-    pub fn open_login(&mut self, username: &str) {
+    pub fn open_login(&mut self, server: &str, username: &str, switch_to: bool) {
+        let label = self
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .map_or_else(|| server.to_owned(), |s| format!("{} ({})", s.name, s.url));
         self.login = Some(LoginForm {
+            server: server.to_owned(),
+            label,
+            switch_to,
             username: username.to_owned(),
             password: String::new(),
             field: if username.is_empty() {
@@ -632,24 +717,32 @@ impl App {
     /// Intègre une réponse du réseau. Elle est diffusée à tous les onglets : les pages
     /// concernées (même dépôt, même chemin, même job) la prennent, les autres l'écartent, ce qui
     /// règle aussi les réponses périmées (page dépilée, recherche abandonnée, autre dépôt).
+    #[cfg(test)]
     pub fn apply(&mut self, msg: Msg) {
+        let server = self.server_name.clone();
+        self.apply_for(&server, msg);
+    }
+
+    /// Intègre la réponse d'un serveur : seuls les onglets de **ce** serveur la reçoivent
+    /// (une réponse tardive, après un changement de serveur de l'onglet, est donc ignorée).
+    pub fn apply_for(&mut self, server: &str, msg: Msg) {
         match msg {
             Msg::Repos { source, result } => {
-                for stack in self.stacks_mut() {
+                for stack in self.stacks_of(server) {
                     if let Some(Page::Home(h)) = stack.first_mut() {
                         h.apply(&source, result.clone());
                     }
                 }
             }
             Msg::RepoInfo { repo, result } => {
-                for page in self.stacks_mut().flatten() {
+                for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Repo(r) = page {
                         r.apply_info(&repo, result.clone());
                     }
                 }
             }
             Msg::Pipelines { repo, result } => {
-                for page in self.stacks_mut().flatten() {
+                for page in self.stacks_of(server).into_iter().flatten() {
                     match page {
                         Page::Repo(r) => r.apply_pipelines(&repo, &result),
                         Page::Runs(r) => r.apply_pipelines(&repo, result.clone()),
@@ -658,7 +751,7 @@ impl App {
                 }
             }
             Msg::Branches { repo, result } => {
-                for page in self.stacks_mut().flatten() {
+                for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Browser(b) = page {
                         b.on_branches(&repo, result.clone());
                     }
@@ -670,7 +763,7 @@ impl App {
                 path,
                 result,
             } => {
-                for page in self.stacks_mut().flatten() {
+                for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Browser(b) = page {
                         b.on_dir(&repo, &reference, &path, result.clone());
                     }
@@ -682,7 +775,7 @@ impl App {
                 path,
                 result,
             } => {
-                for page in self.stacks_mut().flatten() {
+                for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Browser(b) = page {
                         b.on_file(&repo, &reference, &path, result.clone());
                     }
@@ -695,7 +788,7 @@ impl App {
             } => {
                 let size = self.view_size();
                 let mut banner = None;
-                for stack in self.stacks_mut() {
+                for stack in self.stacks_of(server) {
                     if let Some(e) = apply_logs(stack, &repo, pipeline_id, &result, size) {
                         banner = Some(e);
                     }
@@ -704,15 +797,24 @@ impl App {
                     self.error = banner;
                 }
             }
-            Msg::LoggedIn(Ok(_)) => {
-                self.login = None;
-                self.error = None;
-            }
-            Msg::LoggedIn(Err(e)) => {
-                if let Some(f) = self.login.as_mut() {
-                    f.busy = false;
-                    f.field = LoginField::Password;
-                    f.error = Some(e);
+            Msg::LoggedIn { server, result } => {
+                let mine = self.login.as_ref().is_some_and(|f| f.server == server);
+                match result {
+                    Ok(_) if mine => {
+                        let switch = self.login.take().is_some_and(|f| f.switch_to);
+                        self.error = None;
+                        if switch {
+                            self.switch_server(&server);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        if let Some(f) = self.login.as_mut().filter(|_| mine) {
+                            f.busy = false;
+                            f.field = LoginField::Password;
+                            f.error = Some(e);
+                        }
+                    }
                 }
             }
         }
@@ -740,6 +842,11 @@ impl App {
             .map(|i| {
                 let stack = self.stack_of(i);
                 TabTitle {
+                    server: if i == self.active {
+                        self.server_name.clone()
+                    } else {
+                        self.tab_servers[i].clone()
+                    },
                     text: stack.last().map_or_else(String::new, page_title),
                     marker: marker_of(stack),
                     active: i == self.active,
@@ -755,8 +862,22 @@ impl App {
         }
         let leaving = std::mem::take(&mut self.stack);
         self.tabs[self.active] = leaving;
+        self.tab_servers[self.active] = self.server_name.clone();
         self.stack = std::mem::take(&mut self.tabs[i]);
         self.active = i;
+        self.sync_server();
+    }
+
+    /// Le serveur de l'onglet affiché devient « le serveur courant » : nom et capacités.
+    fn sync_server(&mut self) {
+        self.server_name = self.tab_servers[self.active].clone();
+        let (logs, browse) = self
+            .caps
+            .get(&self.server_name)
+            .copied()
+            .unwrap_or_default();
+        self.logs_supported = logs;
+        self.browse_supported = browse;
     }
 
     /// `Tab` (`1`) et `Maj+Tab` (`-1`) : onglet suivant ou précédent, en boucle.
@@ -779,6 +900,7 @@ impl App {
         let copy: Vec<Page> = self.stack.iter().map(Page::fork).collect();
         let at = self.active + 1;
         self.tabs.insert(at, copy);
+        self.tab_servers.insert(at, self.server_name.clone());
         self.go_tab(at);
         match self.stack.last() {
             Some(Page::Home(_)) => self.home_enter(),
@@ -804,7 +926,7 @@ impl App {
         }
         if self.tabs.len() == 1 {
             let mut home = HomeView::new();
-            self.pending.extend(home.request_current());
+            self.queue_all(home.request_current());
             self.stack = vec![Page::Home(home)];
             return;
         }
@@ -814,9 +936,99 @@ impl App {
             self.go_tab(next);
         }
         self.tabs.remove(i);
+        self.tab_servers.remove(i);
         if i < self.active {
             self.active -= 1;
         }
+    }
+
+    // --- serveurs
+
+    /// Déclare les serveurs configurés (nom, URL), pour la liste et les libellés de connexion.
+    pub fn set_servers(&mut self, servers: Vec<ServerEntry>) {
+        self.servers = servers;
+    }
+
+    /// Un fournisseur est prêt pour ce serveur : ce qu'il sait faire. Le serveur est alors
+    /// « connecté » (on peut y basculer sans login).
+    pub fn set_caps(&mut self, server: &str, logs: bool, browse: bool) {
+        self.caps.insert(server.to_owned(), (logs, browse));
+        self.sync_server();
+    }
+
+    pub fn is_connected(&self, server: &str) -> bool {
+        self.caps.contains_key(server)
+    }
+
+    /// Plusieurs serveurs configurés : les titres d'onglets disent de quel serveur ils sont.
+    pub fn multi_server(&self) -> bool {
+        self.servers.len() > 1
+    }
+
+    /// Change le serveur de l'onglet affiché : il garde son rang, sa pile repart sur l'accueil
+    /// du nouveau serveur. Les autres onglets ne bougent pas, et une réponse tardive de l'ancien
+    /// serveur sera ignorée (`apply_for`).
+    pub fn switch_server(&mut self, server: &str) {
+        if server == self.server_name {
+            return;
+        }
+        self.server_name = server.to_owned();
+        self.tab_servers[self.active] = server.to_owned();
+        self.sync_server();
+        let mut home = HomeView::new();
+        self.queue_all(home.request_current());
+        self.stack = vec![Page::Home(home)];
+        self.error = None;
+    }
+
+    /// Serveur du premier onglet au démarrage : l'accueil déjà demandé lui revient.
+    pub fn set_initial_server(&mut self, server: &str) {
+        self.server_name = server.to_owned();
+        self.tab_servers[self.active] = server.to_owned();
+        for (tag, _) in self.pending.iter_mut().filter(|(t, _)| t.is_empty()) {
+            *tag = server.to_owned();
+        }
+        self.sync_server();
+    }
+
+    pub fn open_server_picker(&mut self) {
+        if self.servers.len() > 1 {
+            let at = self.servers.iter().position(|s| s.name == self.server_name);
+            self.server_picker = Some(at.unwrap_or(0));
+        }
+    }
+
+    pub fn server_picker_move(&mut self, delta: isize) {
+        if let Some(sel) = self.server_picker.as_mut() {
+            let max = self.servers.len().saturating_sub(1);
+            *sel = sel.saturating_add_signed(delta).min(max);
+        }
+    }
+
+    /// Entrée dans la liste : bascule tout de suite si le serveur est connecté ; sinon renvoie
+    /// son nom pour que `main` retrouve un identifiant et ouvre le login (la bascule se fera
+    /// une fois connecté).
+    pub fn server_picker_choose(&mut self) -> Option<String> {
+        let name = self.servers.get(self.server_picker.take()?)?.name.clone();
+        if name == self.server_name {
+            return None;
+        }
+        if self.is_connected(&name) {
+            self.switch_server(&name);
+            None
+        } else {
+            Some(name)
+        }
+    }
+
+    /// Échap dans le formulaire. Renvoie `true` s'il faut quitter : seulement quand il s'agit
+    /// de la connexion de démarrage (le serveur de l'onglet n'est pas connecté, rien à voir
+    /// sans elle). Une bascule annulée ou un renouvellement de session se contentent de fermer.
+    pub fn login_escape(&mut self) -> bool {
+        let Some(form) = self.login.take() else {
+            return false;
+        };
+        !form.switch_to && !self.is_connected(&form.server)
     }
 
     // --- liste des onglets (touche `T`)
@@ -1052,8 +1264,7 @@ mod tests {
     /// App au repos : le démarrage a déjà demandé « mes dépôts », la file est vidée.
     fn fresh() -> App {
         let mut a = App::new();
-        a.logs_supported = true;
-        a.browse_supported = true;
+        a.set_caps("", true, true);
         a.take_requests();
         a
     }
@@ -1169,7 +1380,7 @@ mod tests {
         );
 
         let mut b = app_on_run(Status::Success);
-        b.logs_supported = false;
+        b.set_caps("", false, b.browse_supported);
         b.open_logs();
         assert!(b.logs().is_none() && b.error.is_some());
         assert!(b.take_requests().is_empty());
@@ -1362,7 +1573,7 @@ mod tests {
     #[test]
     fn formulaire_saisie_et_envoi() {
         let mut a = App::new();
-        a.open_login("");
+        a.open_login("", "", false);
         typed(&mut a, "thomas");
         assert!(a.login_enter().is_none()); // passe au mot de passe
         assert_eq!(a.login.as_ref().unwrap().field, LoginField::Password);
@@ -1385,14 +1596,14 @@ mod tests {
     #[test]
     fn identifiant_connu_demarre_sur_le_mot_de_passe() {
         let mut a = App::new();
-        a.open_login("thomas");
+        a.open_login("", "thomas", false);
         assert_eq!(a.login.as_ref().unwrap().field, LoginField::Password);
     }
 
     #[test]
     fn champs_vides_refuses() {
         let mut a = App::new();
-        a.open_login("thomas");
+        a.open_login("", "thomas", false);
         assert!(a.login_enter().is_none());
         let f = a.login.as_ref().unwrap();
         assert!(!f.busy && f.error.is_some());
@@ -1401,12 +1612,13 @@ mod tests {
     #[test]
     fn echec_de_login_rouvre_la_saisie() {
         let mut a = App::new();
-        a.open_login("thomas");
+        a.open_login("", "thomas", false);
         typed(&mut a, "mauvais");
         a.login_enter().unwrap();
-        a.apply(Msg::LoggedIn(Err(
-            "identifiant ou mot de passe incorrect".into()
-        )));
+        a.apply(Msg::LoggedIn {
+            server: String::new(),
+            result: Err("identifiant ou mot de passe incorrect".into()),
+        });
         let f = a.login.as_ref().unwrap();
         assert!(!f.busy);
         assert_eq!(f.field, LoginField::Password);
@@ -1416,14 +1628,17 @@ mod tests {
     #[test]
     fn succes_de_login_ferme_le_formulaire() {
         let mut a = App::new();
-        a.open_login("thomas");
+        a.open_login("", "thomas", false);
         let session = Session {
             url: "http://a".into(),
             username: "thomas".into(),
             token: Some("t".into()),
             cookies: Default::default(),
         };
-        a.apply(Msg::LoggedIn(Ok(session)));
+        a.apply(Msg::LoggedIn {
+            server: String::new(),
+            result: Ok(session),
+        });
         assert!(a.login.is_none());
     }
 
@@ -1669,7 +1884,7 @@ mod tests {
     #[test]
     fn explorateur_refuse_si_le_backend_ne_sait_pas() {
         let mut a = app_on_repo();
-        a.browse_supported = false;
+        a.set_caps("", a.logs_supported, false);
         a.list_move(1);
         a.repo_enter();
         assert!(a.browser().is_none() && a.repo_page().is_some());
@@ -1958,6 +2173,7 @@ mod tests {
         assert_eq!(
             a.tab_titles(),
             [TabTitle {
+                server: String::new(),
                 text: "Accueil".into(),
                 marker: None,
                 active: true
@@ -2329,5 +2545,301 @@ mod tests {
         b.repo_enter();
         b.pop();
         assert!(b.take_requests().is_empty());
+    }
+
+    // --- un serveur par onglet
+
+    fn entry(n: &str) -> ServerEntry {
+        ServerEntry {
+            name: n.into(),
+            url: format!("http://{n}"),
+        }
+    }
+
+    /// Deux onglets sur le serveur `A` (liste des runs de `o/a`, run 7), deux serveurs connus et
+    /// connectés ; l'onglet 2 est affiché.
+    fn two_tabs_on_a() -> App {
+        let mut a = app_on_run(Status::Running);
+        a.set_initial_server("A");
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_caps("A", true, true);
+        a.set_caps("B", true, false);
+        a.open_in_new_tab();
+        a.take_requests();
+        a
+    }
+
+    fn run_count(a: &App) -> usize {
+        a.runs().map_or(0, |r| r.pipelines.len())
+    }
+
+    #[test]
+    fn changer_de_serveur_ne_touche_pas_les_autres_onglets() {
+        let mut a = two_tabs_on_a();
+        assert_eq!(a.tab_count(), 2);
+        a.switch_server("B");
+        assert_eq!(a.server_name, "B");
+        assert!(a.home().is_some() && a.stack.len() == 1, "accueil neuf");
+        assert!((a.logs_supported, a.browse_supported) == (true, false));
+        // Le rang est conservé, l'autre onglet est intact et reste sur A
+        assert_eq!(active_index(&a), 1);
+        a.switch_tab(-1);
+        assert_eq!(a.server_name, "A");
+        assert_eq!(run_count(&a), 1);
+        assert!(a.browse_supported);
+        assert_eq!(
+            a.tab_titles()
+                .iter()
+                .map(|t| t.server.as_str())
+                .collect::<Vec<_>>(),
+            ["A", "B"]
+        );
+    }
+
+    #[test]
+    fn la_demande_d_accueil_du_nouveau_serveur_est_etiquetee() {
+        let mut a = two_tabs_on_a();
+        a.switch_server("B");
+        let reqs = a.take_tagged_requests();
+        assert!(!reqs.is_empty());
+        assert!(reqs.iter().all(|(s, _)| s == "B"), "{reqs:?}");
+    }
+
+    #[test]
+    fn une_reponse_n_atteint_que_les_onglets_de_son_serveur() {
+        // Les deux serveurs ont un dépôt `o/a` : sans étiquette, les runs de l'un iraient chez l'autre.
+        let mut a = two_tabs_on_a();
+        a.switch_tab(-1); // onglet 1 sur A
+        a.open_in_new_tab(); // onglet 2 = copie, sur A
+        a.take_requests();
+        a.switch_server("B");
+        a.switch_tab(-1); // retour sur l'onglet 1 (A)
+        assert_eq!(a.tab_count(), 3);
+        let two = |n: u64| Ok(vec![pipe(7), pipe(n)]);
+        a.apply_for(
+            "B",
+            Msg::Pipelines {
+                repo: repo("a"),
+                result: two(8),
+            },
+        );
+        assert_eq!(run_count(&a), 1, "la réponse de B ne touche pas A");
+        a.apply_for(
+            "A",
+            Msg::Pipelines {
+                repo: repo("a"),
+                result: two(9),
+            },
+        );
+        assert_eq!(run_count(&a), 2);
+        // L'onglet 2 est passé sur B : rien reçu. L'onglet 3 (copie, resté sur A, ouvert sur
+        // les logs) l'a reçue aussi.
+        a.switch_tab(1);
+        assert_eq!((a.server_name.as_str(), run_count(&a)), ("B", 0));
+        a.switch_tab(1);
+        assert_eq!(a.server_name, "A");
+        a.pop();
+        assert_eq!(run_count(&a), 2);
+    }
+
+    #[test]
+    fn reponse_tardive_apres_changement_de_serveur_ignoree() {
+        let mut a = two_tabs_on_a();
+        // L'onglet 2 demande les runs de A, puis passe sur B avant la réponse
+        a.switch_server("B");
+        a.apply_for(
+            "A",
+            Msg::Repos {
+                source: RepoSource::Mine,
+                result: Ok(vec![info("zzz")]),
+            },
+        );
+        assert!(
+            a.home_rows().iter().all(|r| r.repo.name != "zzz"),
+            "les dépôts de A n'apparaissent pas dans l'accueil de B"
+        );
+    }
+
+    #[test]
+    fn les_requetes_d_arriere_plan_portent_le_serveur_de_leur_onglet() {
+        let mut a = two_tabs_on_a();
+        a.open_logs(); // onglet 2 (A) suit un job en cours
+        a.take_requests();
+        a.switch_server("B"); // l'onglet 2 passe sur B (accueil)
+        a.take_requests();
+        a.switch_tab(-1); // onglet 1 (A) affiché, en logs ? non : liste des runs
+        a.open_logs();
+        a.take_requests();
+        a.switch_tab(1);
+        a.tick();
+        let reqs = a.take_tagged_requests();
+        assert!(
+            reqs.iter()
+                .filter(|(_, r)| matches!(r, Request::Logs { .. }))
+                .all(|(s, _)| s == "A"),
+            "{reqs:?}"
+        );
+        assert!(
+            reqs.iter()
+                .any(|(s, r)| s == "A" && matches!(r, Request::Logs { .. }))
+        );
+    }
+
+    #[test]
+    fn les_requetes_d_un_explorateur_inactif_portent_son_serveur() {
+        let mut a = app_on_repo();
+        a.set_initial_server("A");
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_caps("A", true, true);
+        a.set_caps("B", true, true);
+        a.list_move(1);
+        a.repo_enter(); // CI
+        a.pop();
+        // Code : ouvre l'explorateur dans l'onglet 1, puis onglet 2 sur B
+        a.list_move(1);
+        a.repo_enter();
+        assert!(a.browser().is_some());
+        a.open_in_new_tab();
+        a.switch_server("B");
+        a.switch_tab(-1);
+        let reqs = a.take_tagged_requests();
+        assert!(
+            reqs.iter()
+                .filter(|(_, r)| matches!(r, Request::Branches(_)))
+                .all(|(s, _)| s == "A"),
+            "{reqs:?}"
+        );
+    }
+
+    #[test]
+    fn requeue_remet_en_file() {
+        let mut a = fresh();
+        a.switch_server("B");
+        let reqs = a.take_tagged_requests();
+        assert!(!reqs.is_empty());
+        a.requeue(reqs.clone());
+        assert_eq!(a.take_tagged_requests(), reqs);
+    }
+
+    #[test]
+    fn capacites_par_serveur() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_caps("A", true, true);
+        a.set_caps("B", false, true);
+        a.switch_server("A");
+        assert!(a.logs_supported);
+        a.switch_server("B");
+        assert!(!a.logs_supported && a.browse_supported);
+        a.close_tab(); // le dernier onglet : reste sur B
+        assert!(!a.logs_supported);
+        assert!(a.is_connected("A") && !a.is_connected("C"));
+    }
+
+    #[test]
+    fn nouvel_onglet_herite_du_serveur_et_la_fermeture_reste_coherente() {
+        let mut a = two_tabs_on_a();
+        a.switch_server("B"); // onglet 2 sur B
+        a.open_in_new_tab(); // onglet 3 : copie, sur B
+        assert_eq!(a.server_name, "B");
+        a.switch_tab(-2); // onglet 1 (A)
+        assert_eq!(a.server_name, "A");
+        a.close_tab(); // ferme l'onglet 1 : on retombe sur un onglet de B
+        assert_eq!(a.server_name, "B");
+        assert_eq!(a.tab_count(), 2);
+        assert!(a.tab_titles().iter().all(|t| t.server == "B"),);
+    }
+
+    #[test]
+    fn selecteur_de_serveur() {
+        let mut a = fresh();
+        a.open_server_picker();
+        assert_eq!(a.server_picker, None, "un seul serveur : rien à choisir");
+        a.set_servers(vec![entry("A"), entry("B"), entry("C")]);
+        a.set_initial_server("A");
+        a.set_caps("A", true, true);
+        a.set_caps("B", true, true);
+        a.open_server_picker();
+        assert_eq!(a.server_picker, Some(0), "commence sur le serveur courant");
+        a.server_picker_move(1);
+        // B est connecté : bascule directe
+        assert_eq!(a.server_picker_choose(), None);
+        assert_eq!((a.server_name.as_str(), a.server_picker), ("B", None));
+        // C ne l'est pas : le choix est renvoyé pour ouvrir le login, rien ne change encore
+        a.open_server_picker();
+        a.server_picker_move(1);
+        assert_eq!(a.server_picker_choose().as_deref(), Some("C"));
+        assert_eq!(a.server_name, "B");
+        // le serveur déjà affiché : rien
+        a.open_server_picker();
+        assert_eq!(a.server_picker_choose(), None);
+    }
+
+    #[test]
+    fn la_connexion_d_une_bascule_ne_change_l_onglet_qu_une_fois_reussie() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        a.set_caps("A", true, true);
+        a.open_login("B", "thomas", true);
+        assert_eq!(a.login.as_ref().unwrap().label, "B (http://B)");
+        // Un échec ne bascule pas
+        a.login_enter();
+        a.apply_for(
+            "B",
+            Msg::LoggedIn {
+                server: "B".into(),
+                result: Err("non".into()),
+            },
+        );
+        assert_eq!(a.server_name, "A");
+        assert!(a.login.is_some());
+        // Succès d'un autre serveur : ignoré
+        let session = Session {
+            url: "http://B".into(),
+            username: "thomas".into(),
+            token: None,
+            cookies: Default::default(),
+        };
+        a.apply_for(
+            "C",
+            Msg::LoggedIn {
+                server: "C".into(),
+                result: Ok(session.clone()),
+            },
+        );
+        assert!(a.login.is_some() && a.server_name == "A");
+        // Succès : main annonce les capacités, puis l'onglet bascule
+        a.set_caps("B", true, true);
+        a.apply_for(
+            "B",
+            Msg::LoggedIn {
+                server: "B".into(),
+                result: Ok(session),
+            },
+        );
+        assert!(a.login.is_none());
+        assert_eq!(a.server_name, "B");
+    }
+
+    #[test]
+    fn echap_dans_le_login() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        // Connexion de démarrage (A pas connecté) : quitte
+        a.caps.clear();
+        a.open_login("A", "", false);
+        assert!(a.login_escape());
+        assert!(a.login.is_none());
+        // Bascule annulée : ferme, l'onglet reste comme il était
+        a.open_login("B", "", true);
+        assert!(!a.login_escape());
+        assert_eq!(a.server_name, "A");
+        // Renouvellement de session d'un serveur connecté : ferme
+        a.set_caps("A", true, true);
+        a.open_login("A", "t", false);
+        assert!(!a.login_escape());
+        assert!(!a.login_escape(), "sans formulaire : rien");
     }
 }

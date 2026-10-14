@@ -58,8 +58,12 @@ pub fn draw(f: &mut Frame, app: &App) {
     if let Some(selected) = app.tab_picker {
         draw_tab_picker(f, app, selected);
     }
+    if let Some(selected) = app.server_picker {
+        draw_server_picker(f, app, selected);
+    }
     if let Some(form) = &app.login {
-        draw_login(f, form, &app.server_label);
+        let quits = !form.switch_to && !app.is_connected(&form.server);
+        draw_login(f, form, quits);
     }
 }
 
@@ -165,8 +169,20 @@ fn fit_tabs(titles: &[TabTitle], width: usize) -> TabBar {
     }
 }
 
+/// Les titres d'onglets, préfixés du serveur quand il y en a plusieurs : sans cela deux onglets
+/// « secret · CI » de deux serveurs se ressembleraient.
+fn display_titles(app: &App) -> Vec<TabTitle> {
+    let mut titles = app.tab_titles();
+    if app.multi_server() {
+        for t in &mut titles {
+            t.text = format!("{} · {}", t.server, t.text);
+        }
+    }
+    titles
+}
+
 fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
-    let bar = fit_tabs(&app.tab_titles(), area.width as usize);
+    let bar = fit_tabs(&display_titles(app), area.width as usize);
     let dim = Style::new().fg(Color::DarkGray);
     let mut spans: Vec<Span> = Vec::new();
     if bar.more_left {
@@ -199,8 +215,44 @@ fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
+    let items: Vec<ListItem> = app
+        .servers
+        .iter()
+        .map(|s| {
+            let here = s.name == app.server_name;
+            let state = if app.is_connected(&s.name) {
+                Span::styled("connecté", Style::new().fg(Color::Green))
+            } else {
+                Span::styled("à connecter", Style::new().fg(Color::DarkGray))
+            };
+            ListItem::new(Line::from(vec![
+                Span::raw(if here { "● " } else { "  " }),
+                Span::raw(format!("{} ", s.name)),
+                Span::styled(format!("({}) ", s.url), Style::new().fg(Color::DarkGray)),
+                state,
+            ]))
+        })
+        .collect();
+    let height = (items.len() as u16).clamp(1, 12) + 2;
+    let area = centered(f.area(), 70, height);
+    f.render_widget(Clear, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Serveurs (cet onglet) ")
+                .title_bottom(Line::from(" ↵ choisir · Échap ").right_aligned())
+                .border_style(Style::new().fg(Color::Yellow)),
+        )
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut ls = ListState::default();
+    ls.select(Some(selected));
+    f.render_stateful_widget(list, area, &mut ls);
+}
+
 fn draw_tab_picker(f: &mut Frame, app: &App, selected: usize) {
-    let titles = app.tab_titles();
+    let titles = display_titles(app);
     let items: Vec<ListItem> = titles
         .iter()
         .enumerate()
@@ -990,7 +1042,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
-fn draw_login(f: &mut Frame, form: &LoginForm, server: &str) {
+fn draw_login(f: &mut Frame, form: &LoginForm, quits: bool) {
     let area = centered(f.area(), 64, 9);
     f.render_widget(Clear, area);
 
@@ -1028,13 +1080,17 @@ fn draw_login(f: &mut Frame, form: &LoginForm, server: &str) {
     });
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Entrée valider · Tab changer de champ · Esc quitter",
+        if quits {
+            "Entrée valider · Tab changer de champ · Esc quitter"
+        } else {
+            "Entrée valider · Tab changer de champ · Esc annuler"
+        },
         Style::new().fg(Color::DarkGray),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(format!(" Connexion · {server} "))
+        .title(format!(" Connexion · {} ", form.label))
         .border_style(Style::new().fg(Color::Yellow));
     f.render_widget(Paragraph::new(lines).block(block), area);
 }
@@ -1068,8 +1124,7 @@ mod tests {
     /// App sur la page des runs de `smithy/demo` : accueil → dépôt → CI, comme à l'usage.
     fn app_on_runs(pipelines: Vec<Pipeline>) -> App {
         let mut app = App::new();
-        app.logs_supported = true;
-        app.browse_supported = true;
+        app.set_caps("", true, true);
         app.take_requests();
         let repo = Repo {
             owner: "smithy".into(),
@@ -1298,7 +1353,7 @@ mod tests {
 
     fn explorer_app() -> App {
         let mut app = App::new();
-        app.browse_supported = true;
+        app.set_caps("", app.logs_supported, true);
         app.take_requests();
         app.apply(Msg::Repos {
             source: RepoSource::Mine,
@@ -1841,6 +1896,7 @@ mod tests {
 
     fn tt(text: &str, marker: Option<TabMarker>, active: bool) -> TabTitle {
         TabTitle {
+            server: String::new(),
             text: text.into(),
             marker,
             active,
@@ -2276,7 +2332,7 @@ mod tests {
     #[test]
     fn formulaire_par_dessus_les_logs() {
         let mut app = app_with_logs(LogState::Failed("session expirée".into()));
-        app.open_login("thomas");
+        app.open_login("", "thomas", false);
         let text = render(&app, 100, 20);
         assert!(text.contains("Connexion") && text.contains("CI"));
     }
@@ -2284,8 +2340,11 @@ mod tests {
     #[test]
     fn formulaire_de_connexion_masque_le_mot_de_passe() {
         let mut app = App::new();
-        app.server_label = "maison (http://forge)".into();
-        app.open_login("thomas");
+        app.set_servers(vec![crate::app::ServerEntry {
+            name: "maison".into(),
+            url: "http://forge".into(),
+        }]);
+        app.open_login("maison", "thomas", false);
         "hunter2".chars().for_each(|c| app.login_type(c));
         let text = render(&app, 100, 20);
         assert!(text.contains("Connexion · maison"));
@@ -2300,7 +2359,7 @@ mod tests {
     #[test]
     fn formulaire_sur_tres_petit_terminal() {
         let mut app = App::new();
-        app.open_login("");
+        app.open_login("", "", false);
         render(&app, 10, 3);
     }
 
@@ -2308,5 +2367,66 @@ mod tests {
     fn rendu_sur_petit_terminal_et_etat_vide() {
         let mut term = Terminal::new(TestBackend::new(20, 4)).unwrap();
         term.draw(|f| draw(f, &App::new())).unwrap();
+    }
+
+    fn two_servers() -> App {
+        let mut app = App::new();
+        app.set_servers(
+            ["A", "B"]
+                .map(|n| crate::app::ServerEntry {
+                    name: n.into(),
+                    url: format!("http://{n}.example"),
+                })
+                .to_vec(),
+        );
+        app.set_initial_server("A");
+        app.set_caps("A", true, true);
+        app
+    }
+
+    #[test]
+    fn titres_d_onglets_prefixes_du_serveur_seulement_avec_plusieurs_serveurs() {
+        let mut app = two_servers();
+        app.open_in_new_tab();
+        app.switch_server("B");
+        let text = render(&app, 100, 10);
+        assert!(
+            text.contains("A · Accueil") && text.contains("B · Accueil"),
+            "{text}"
+        );
+        // Un seul serveur configuré : titres inchangés
+        let mut solo = App::new();
+        solo.open_in_new_tab();
+        let text = render(&solo, 100, 10);
+        assert!(
+            text.contains("Accueil") && !text.contains(" · Accueil"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn liste_des_serveurs() {
+        let mut app = two_servers();
+        app.open_server_picker();
+        let text = render(&app, 100, 14);
+        assert!(text.contains("Serveurs"), "{text}");
+        assert!(text.contains("● A") && text.contains("connecté"), "{text}");
+        assert!(
+            text.contains("B (http://B.example)") && text.contains("à connecter"),
+            "{text}"
+        );
+        assert!(text.contains("↵ choisir"));
+    }
+
+    #[test]
+    fn le_formulaire_dit_quitter_ou_annuler() {
+        let mut app = two_servers();
+        app.open_login("B", "", true);
+        let text = render(&app, 100, 20);
+        assert!(text.contains("Connexion · B (http://B.example)"), "{text}");
+        assert!(text.contains("Esc annuler") && !text.contains("Esc quitter"));
+        // Connexion de démarrage d'un serveur pas encore connecté : Échap quitte
+        app.open_login("B", "", false);
+        assert!(render(&app, 100, 20).contains("Esc quitter"));
     }
 }

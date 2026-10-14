@@ -11,7 +11,7 @@ mod ui;
 mod wrap;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -36,13 +36,13 @@ const TICK: Duration = Duration::from_millis(100);
 #[tokio::main]
 async fn main() -> Result<()> {
     let cfg = config::load()?;
-    let server = cfg
-        .server(std::env::var("SMITHY_SERVER").ok().as_deref())?
-        .clone();
+    let wanted = std::env::var("SMITHY_SERVER").ok();
+    // Vérifie le nom demandé (erreur claire) avant d'ouvrir le terminal.
+    cfg.server(wanted.as_deref())?;
     let store = SessionStore::default_location();
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, server, store).await;
+    let result = run(&mut terminal, cfg.servers.clone(), wanted, store).await;
     ratatui::restore();
     result
 }
@@ -227,7 +227,12 @@ fn browser_key(app: &mut App, code: KeyCode) {
 }
 
 /// Lance une requête de l'application ; la réponse revient par le canal sous forme de `Msg`.
-fn run_request<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>, req: Request) {
+fn run_request<P: Provider + 'static>(
+    p: &Arc<P>,
+    tx: &UnboundedSender<(String, Msg)>,
+    server: String,
+    req: Request,
+) {
     let (p, tx) = (p.clone(), tx.clone());
     tokio::spawn(async move {
         let msg = match req {
@@ -284,7 +289,7 @@ fn run_request<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>, req
                 }
             }
         };
-        let _ = tx.send(msg);
+        let _ = tx.send((server, msg));
     });
 }
 
@@ -293,7 +298,7 @@ fn run_request<P: Provider + 'static>(p: &Arc<P>, tx: &UnboundedSender<Msg>, req
 /// cookie : sinon chaque expiration de session laisserait un token de plus sur le compte.
 fn spawn_login(
     server: &Server,
-    tx: &UnboundedSender<Msg>,
+    tx: &UnboundedSender<(String, Msg)>,
     username: String,
     password: String,
     known_token: Option<String>,
@@ -318,40 +323,108 @@ fn spawn_login(
             cookies: l.cookies,
         })
         .map_err(|e| e.to_string());
-        let _ = tx.send(Msg::LoggedIn(result));
+        let name = server.name.clone();
+        let _ = tx.send((
+            name.clone(),
+            Msg::LoggedIn {
+                server: name,
+                result,
+            },
+        ));
     });
+}
+
+/// Ce que `main` sait d'un serveur : son fournisseur s'il est connecté, et de quoi se
+/// reconnecter sans créer de token de plus.
+struct Backend {
+    server: Server,
+    provider: Option<Arc<Forgejo>>,
+    username: String,
+    saved_token: Option<String>,
+}
+
+impl Backend {
+    /// Le token de la config prime ; sinon celui créé lors d'un login précédent. Les cookies,
+    /// eux, viennent toujours de la session sauvegardée.
+    fn load(server: Server, store: Option<&SessionStore>) -> Self {
+        let saved = store.and_then(|s| s.load(&server.name, &server.url).ok().flatten());
+        let username = saved.as_ref().map_or(String::new(), |s| s.username.clone());
+        let saved_token = saved.as_ref().and_then(|s| s.token.clone());
+        let token = server.token.clone().or_else(|| saved_token.clone());
+        let cookies = saved.map(|s| s.cookies).unwrap_or_default();
+        let provider = token.map(|t| build_provider(&server, t, cookies));
+        Self {
+            server,
+            provider,
+            username,
+            saved_token,
+        }
+    }
+
+    /// Un token de la config suffit aussi : pas besoin d'en créer.
+    fn known_token(&self) -> Option<String> {
+        self.server
+            .token
+            .clone()
+            .or_else(|| self.saved_token.clone())
+    }
+}
+
+fn announce(app: &mut App, b: &Backend) {
+    if let Some(p) = &b.provider {
+        app.set_caps(
+            &b.server.name,
+            p.capabilities().logs,
+            p.capabilities().browse,
+        );
+    }
 }
 
 async fn run(
     terminal: &mut DefaultTerminal,
-    server: Server,
+    servers: Vec<Server>,
+    wanted: Option<String>,
     store: Option<SessionStore>,
 ) -> Result<()> {
     let recent_store = RecentStore::default_location();
-    let (tx, mut rx) = mpsc::unbounded_channel();
+    let (tx, mut rx) = mpsc::unbounded_channel::<(String, Msg)>();
     let mut app = App::new();
-    app.server_name = server.name.clone();
-    app.server_label = format!("{} ({})", server.name, server.url);
+    app.set_servers(
+        servers
+            .iter()
+            .map(|s| app::ServerEntry {
+                name: s.name.clone(),
+                url: s.url.clone(),
+            })
+            .collect(),
+    );
     if let Some(r) = &recent_store {
         app.recents = r.load();
     }
 
-    // Le token de la config prime ; sinon celui créé lors d'un login précédent.
-    // Les cookies, eux, viennent toujours de la session sauvegardée.
-    let saved = store
-        .as_ref()
-        .and_then(|s| s.load(&server.name, &server.url).ok().flatten());
-    let mut username = saved.as_ref().map_or(String::new(), |s| s.username.clone());
-    let mut saved_token = saved.as_ref().and_then(|s| s.token.clone());
-    let token = server.token.clone().or_else(|| saved_token.clone());
-    let cookies = saved.map(|s| s.cookies).unwrap_or_default();
-    let mut provider = token.map(|t| build_provider(&server, t, cookies));
-    match &provider {
-        Some(p) => {
-            app.logs_supported = p.capabilities().logs;
-            app.browse_supported = p.capabilities().browse;
-        }
-        None => app.open_login(&username),
+    // Tous les serveurs qui ont déjà des identifiants sont prêts dès le départ.
+    let mut backends: HashMap<String, Backend> = servers
+        .into_iter()
+        .map(|s| (s.name.clone(), Backend::load(s, store.as_ref())))
+        .collect();
+    let order: Vec<String> = app.servers.iter().map(|s| s.name.clone()).collect();
+    for name in &order {
+        announce(&mut app, &backends[name]);
+    }
+    // Serveur demandé, sinon le premier qui a des identifiants (sinon le premier, avec login).
+    let initial = wanted
+        .filter(|w| backends.contains_key(w))
+        .or_else(|| {
+            order
+                .iter()
+                .find(|n| backends[*n].provider.is_some())
+                .cloned()
+        })
+        .or_else(|| order.first().cloned())
+        .unwrap_or_default();
+    app.set_initial_server(&initial);
+    if backends[&initial].provider.is_none() {
+        app.open_login(&initial, &backends[&initial].username, false);
     }
     let mut last_refresh = Instant::now();
 
@@ -364,16 +437,13 @@ async fn run(
                     let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
                     if ctrl && k.code == KeyCode::Char('c') {
                         app.should_quit = true;
-                    } else if app.login.is_some() {
+                    } else if let Some(form) = app.login.as_ref().map(|f| f.server.clone()) {
                         match k.code {
-                            KeyCode::Esc if provider.is_none() => app.should_quit = true,
-                            KeyCode::Esc => app.login = None,
+                            KeyCode::Esc => app.should_quit = app.login_escape(),
                             KeyCode::Enter => {
                                 if let Some((user, pass)) = app.login_enter() {
-                                    // Un token de la config suffit aussi : pas besoin d'en créer.
-                                    let known =
-                                        server.token.clone().or_else(|| saved_token.clone());
-                                    spawn_login(&server, &tx, user, pass, known);
+                                    let b = &backends[&form];
+                                    spawn_login(&b.server, &tx, user, pass, b.known_token());
                                 }
                             }
                             KeyCode::Tab | KeyCode::Up | KeyCode::Down => app.login_toggle_field(),
@@ -381,8 +451,28 @@ async fn run(
                             KeyCode::Char(c) if !ctrl => app.login_type(c),
                             _ => {}
                         }
+                    } else if app.server_picker.is_some() {
+                        match k.code {
+                            KeyCode::Esc | KeyCode::Char('q' | 'S') => app.server_picker = None,
+                            KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                                app.server_picker_move(1)
+                            }
+                            KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                                app.server_picker_move(-1)
+                            }
+                            KeyCode::Enter => {
+                                // Pas encore connecté : le login d'abord, la bascule ensuite.
+                                if let Some(name) = app.server_picker_choose() {
+                                    app.open_login(&name, &backends[&name].username, true);
+                                }
+                            }
+                            _ => {}
+                        }
                     } else if app.tab_picker.is_some() {
                         tab_picker_key(&mut app, k.code);
+                    } else if k.code == KeyCode::Char('S') && !app.home().is_some_and(|h| h.editing)
+                    {
+                        app.open_server_picker();
                     } else if tab_key(&mut app, k.code) {
                         // pris par les onglets
                     } else if app.home().is_some() {
@@ -417,32 +507,44 @@ async fn run(
             }
         }
 
-        while let Ok(msg) = rx.try_recv() {
+        while let Ok((origin, msg)) = rx.try_recv() {
             let mut save_error = None;
             match &msg {
-                Msg::LoggedIn(Ok(session)) => {
-                    username.clone_from(&session.username);
-                    saved_token.clone_from(&session.token);
-                    // Le token de la config prime ; les cookies viennent de ce login.
-                    if let Some(token) = server.token.clone().or_else(|| session.token.clone()) {
-                        let p = build_provider(&server, token, session.cookies.clone());
-                        app.logs_supported = p.capabilities().logs;
-                        app.browse_supported = p.capabilities().browse;
-                        provider = Some(p);
-                        // Des logs étaient demandés quand la session a expiré : on les relance.
-                        app.refetch_logs();
-                    }
-                    if let Some(Err(e)) = store.as_ref().map(|s| s.save(&server.name, session)) {
-                        save_error = Some(format!("session non sauvegardée : {e}"));
+                Msg::LoggedIn {
+                    server: name,
+                    result: Ok(session),
+                } => {
+                    if let Some(b) = backends.get_mut(name) {
+                        b.username.clone_from(&session.username);
+                        b.saved_token.clone_from(&session.token);
+                        // Le token de la config prime ; les cookies viennent de ce login.
+                        if let Some(token) = b.known_token() {
+                            b.provider =
+                                Some(build_provider(&b.server, token, session.cookies.clone()));
+                            announce(&mut app, b);
+                        }
+                        if let Some(Err(e)) = store.as_ref().map(|s| s.save(name, session)) {
+                            save_error = Some(format!("session non sauvegardée : {e}"));
+                        }
                     }
                 }
+                // Une session expirée ne fait surgir le login que pour le serveur de l'onglet
+                // affiché : un onglet en arrière-plan attendra qu'on y revienne.
                 Msg::Logs {
                     result: Err(Error::SessionExpired),
                     ..
-                } if app.login.is_none() => app.open_login(&username),
+                } if app.login.is_none() && origin == app.server_name => {
+                    let username = backends.get(&origin).map_or("", |b| b.username.as_str());
+                    app.open_login(&origin, username, false);
+                }
                 _ => {}
             }
-            app.apply(msg);
+            let logged_in = matches!(&msg, Msg::LoggedIn { result: Ok(_), .. });
+            app.apply_for(&origin, msg);
+            if logged_in {
+                // Des logs étaient demandés quand la session a expiré : on les relance.
+                app.refetch_logs();
+            }
             // Après `apply`, qui efface le bandeau d'erreur.
             if save_error.is_some() {
                 app.error = save_error;
@@ -453,11 +555,16 @@ async fn run(
             app.tick();
             last_refresh = Instant::now();
         }
-        if let Some(p) = &provider {
-            for req in app.take_requests() {
-                run_request(p, &tx, req);
+        // Chaque requête part vers le fournisseur de son serveur ; sans fournisseur (pas encore
+        // connecté), elle attend dans la file.
+        let mut waiting = Vec::new();
+        for (name, req) in app.take_tagged_requests() {
+            match backends.get(&name).and_then(|b| b.provider.as_ref()) {
+                Some(p) => run_request(p, &tx, name, req),
+                None => waiting.push((name, req)),
             }
         }
+        app.requeue(waiting);
         if app.recents_dirty {
             app.recents_dirty = false;
             if let Some(Err(e)) = recent_store.as_ref().map(|r| r.save(&app.recents)) {

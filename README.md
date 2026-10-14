@@ -12,7 +12,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible.
 - Sign in from the TUI (username and password, entered once and never stored).
-- A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`.
+- A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`; each tab has its own server, which you can change from the tab (`S`) without touching the other tabs.
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
 - Backends are pluggable through the `Provider` trait; the UI adapts to what a backend supports (`Capabilities`).
@@ -70,7 +70,7 @@ name = "work"
 url = "https://git.work.example"
 ```
 
-The first server is used by default; pick another one with `SMITHY_SERVER=work`. The former single-server format (`url` and `token` at the top level) is still read, as a server named `default`.
+All the servers are available at once: smithy starts on `SMITHY_SERVER` if set, otherwise on the first server that already has credentials (a `token` or a saved login), otherwise on the first one. Each tab belongs to one server; press `S` to change the server of the current tab (see below). The former single-server format (`url` and `token` at the top level) is still read, as a server named `default`.
 
 Environment variables override the first server (or define one if the file has none):
 
@@ -102,7 +102,9 @@ Tabs, on every page (except while typing a filter):
 | `T`                   | List the tabs (`j`/`k`, `Enter` to go, `x` to close, `Esc`) |
 | `x`                   | Close the current tab (the last one becomes a fresh home page) |
 
-Tabs are independent: each keeps its own page stack, selection and scroll position. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
+| `S`                   | Change the **server of the current tab** (list of the configured servers; `Enter` to choose) |
+
+Tabs are independent: each keeps its own page stack, selection, scroll position **and server**. `S` lists the configured servers (● marks the current one, *connecté* those already signed in). Choosing one keeps the tab at the same rank but restarts it on that server's home page; the other tabs are left alone, even if they were showing the same repository name on another server. A server you are not signed in to opens its login form first (`Esc` cancels and leaves the tab as it was). With several servers configured, tab titles are prefixed by their server (`work · repo · CI`). A running job keeps being followed in a background tab on its own server. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
 
 On the home page:
 
@@ -179,7 +181,7 @@ A new forge is a new crate implementing `Provider`.
 - [x] Home page (my repositories, watched, starred, explore, recent) and a repository page
 - [ ] Organisations on the home page (needs an extra `read:organization` token scope)
 - [x] Independent tabs, each with its own page stack
-- [ ] One server per tab (several servers at once)
+- [x] One server per tab (several servers at once, switched from the tab with `S`)
 - [ ] Restore the open tabs at startup
 - [ ] Pull requests, notifications and runners
 - [ ] Filters and search (status, branch, workflow, repository)
@@ -189,7 +191,7 @@ A new forge is a new crate implementing `Provider`.
 - [ ] File search by name in the explorer, tags and commits as references
 - [ ] Open the run URL from the TUI
 - [ ] GitHub backend (jobs and logs)
-- [x] Multiple instances in the config file (selection from the TUI still to come)
+- [x] Multiple instances in the config file (selected per tab from the TUI)
 - [ ] GitLab, Bitbucket, Azure DevOps backends
 
 ## License
