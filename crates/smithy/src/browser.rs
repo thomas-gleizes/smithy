@@ -95,6 +95,18 @@ impl Browser {
         }
     }
 
+    /// Rouvre l'explorateur dans un dossier connu (restauration d'un onglet) : la branche est
+    /// déjà choisie, on demande le dossier et, pour le sélecteur, la liste des branches.
+    pub fn restore(repo: Repo, reference: String, path: String) -> Self {
+        let mut b = Self::open(repo);
+        if !reference.is_empty() {
+            b.reference = reference;
+            b.path = path;
+            b.request_dir();
+        }
+        b
+    }
+
     /// Fil d'Ariane de la page : « Code », branche, puis les dossiers (ou le fichier). Le dépôt
     /// n'y est pas : la page du dépôt, plus bas dans la pile, le donne déjà.
     pub fn breadcrumb(&self) -> Vec<String> {

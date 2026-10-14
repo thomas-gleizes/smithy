@@ -28,6 +28,24 @@ pub fn push(entries: &mut Vec<RecentEntry>, entry: RecentEntry) {
     entries.truncate(MAX_RECENT);
 }
 
+/// Réunit l'historique du disque et celui de cette instance : deux instances en parallèle ne
+/// s'effacent pas mutuellement. Pour un même dépôt on garde la date la plus récente.
+pub fn merge(disk: Vec<RecentEntry>, mine: &[RecentEntry]) -> Vec<RecentEntry> {
+    let mut all: Vec<RecentEntry> = mine.to_vec();
+    for d in disk {
+        match all
+            .iter_mut()
+            .find(|e| e.server == d.server && e.owner == d.owner && e.name == d.name)
+        {
+            Some(e) => e.opened = e.opened.max(d.opened),
+            None => all.push(d),
+        }
+    }
+    all.sort_by_key(|e| std::cmp::Reverse(e.opened));
+    all.truncate(MAX_RECENT);
+    all
+}
+
 pub struct RecentStore {
     path: PathBuf,
 }
@@ -50,6 +68,13 @@ impl RecentStore {
             .ok()
             .and_then(|s| serde_json::from_str(&s).ok())
             .unwrap_or_default()
+    }
+
+    /// Sauvegarde en fusionnant avec ce que le disque contient maintenant, et renvoie le résultat.
+    pub fn save_merged(&self, mine: &[RecentEntry]) -> Result<Vec<RecentEntry>> {
+        let merged = merge(self.load(), mine);
+        self.save(&merged)?;
+        Ok(merged)
     }
 
     pub fn save(&self, entries: &[RecentEntry]) -> Result<()> {
@@ -75,6 +100,19 @@ mod tests {
             name: name.into(),
             opened,
         }
+    }
+
+    #[test]
+    fn fusion_de_deux_instances() {
+        let disk = vec![entry("s", "a", 50), entry("s", "autre", 40)];
+        let mine = vec![entry("s", "b", 60), entry("s", "a", 30)];
+        let m = merge(disk, &mine);
+        let names: Vec<_> = m.iter().map(|e| (e.name.as_str(), e.opened)).collect();
+        // « a » garde sa date la plus récente, l'ordre est du plus récent au plus ancien
+        assert_eq!(names, [("b", 60), ("a", 50), ("autre", 40)]);
+        // Borne respectée
+        let many: Vec<_> = (0..40).map(|i| entry("s", &format!("r{i}"), i)).collect();
+        assert_eq!(merge(many, &[]).len(), MAX_RECENT);
     }
 
     struct Tmp(PathBuf);

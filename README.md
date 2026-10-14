@@ -46,7 +46,7 @@ An unverified version is never silently trusted: the log view shows a ⚠ notice
 
 ## Install
 
-Requires Rust 1.85+.
+Requires Rust 1.89+.
 
 ```sh
 git clone git@github.com:thomas-gleizes/smithy.git
@@ -105,7 +105,11 @@ Tabs, on every page (except while typing a filter):
 
 Tabs are independent: each keeps its own page stack, selection, scroll position **and server**. `S` lists the configured servers (● marks the current one). Each line shows two independent states: the **network** (*joignable*, or *injoignable* with the reason, e.g. a VPN that is down) and the **session** (*session ouverte* or *pas de session*). Reachability is probed (`/api/v1/version`, no authentication) when the list opens and again every 5 seconds while it stays open, so you see a server is unreachable before choosing it. Choosing one keeps the tab at the same rank but restarts it on that server's home page; the other tabs are left alone, even if they were showing the same repository name on another server. A server you are not signed in to opens its login form first (`Esc` cancels and leaves the tab as it was).
 
-**Managing servers from the app**: in the `S` list, `a` adds a server (name, URL, optional token), `e` edits the selected one (URL and token; the name is fixed, and an empty token keeps the current one), `d` deletes it after a `y` confirmation. Changes are written to `config.toml` (rewritten in the `[[server]]` format, comments are not kept, mode `0600`); deleting also removes the saved login of that server. A server used by a tab, or the last one, cannot be deleted. Servers that only come from `SMITHY_URL` are written without their token. The list also opens with a single server, so a second one can be added right away. With several servers configured, tab titles are prefixed by their server (`work · repo · CI`). A running job keeps being followed in a background tab on its own server. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
+**Managing servers from the app**: in the `S` list, `a` adds a server (name, URL, optional token), `e` edits the selected one (URL and token; the name is fixed, and an empty token keeps the current one), `d` deletes it after a `y` confirmation. Changes are written to `config.toml` (rewritten in the `[[server]]` format, comments are not kept, mode `0600`); deleting also removes the saved login of that server. A server used by a tab, or the last one, cannot be deleted. Servers that only come from `SMITHY_URL` are written without their token. The list also opens with a single server, so a second one can be added right away. With several servers configured, tab titles are prefixed by their server (`work · repo · CI`). A running job keeps being followed in a background tab on its own server. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs.
+
+**Tabs are restored when smithy restarts**: each tab comes back on its server, with its page stack (home section, repository page, runs list, code folder and branch). The data is reloaded, not saved. A job's logs are not restored: that tab returns to its runs list. Tabs whose server no longer exists are dropped. Start with `smithy --fresh` to skip the restoration.
+
+Only **one running instance** manages the saved tabs (a file lock, released by the system even after a crash). A second instance started in parallel opens one empty tab, says so in the top line (*onglets non sauvegardés : autre instance*) and saves nothing, so it never duplicates or overwrites the first one's tabs. The *Recent* history is merged on save, so parallel instances do not erase each other's entries.
 
 On the home page:
 
@@ -184,7 +188,7 @@ A new forge is a new crate implementing `Provider`.
 - [x] Independent tabs, each with its own page stack
 - [x] One server per tab (several servers at once, switched from the tab with `S`)
 - [x] Add, edit and delete servers from the app
-- [ ] Restore the open tabs at startup
+- [x] Restore the open tabs at startup (one instance owns them, `--fresh` to skip)
 - [ ] Pull requests, notifications and runners
 - [ ] Filters and search (status, branch, workflow, repository)
 - [x] Job steps and logs for Forgejo

@@ -442,7 +442,19 @@ fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
         };
         spans.push(Span::styled(p, style));
     }
+    let used: usize = spans.iter().map(|s| text_width(&s.content)).sum();
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+    // Une autre instance gère les onglets : on le dit à droite s'il reste de la place.
+    if app.shared_instance {
+        let note = " onglets non sauvegardés : autre instance ";
+        if used + text_width(note) < area.width as usize {
+            f.render_widget(
+                Paragraph::new(Span::styled(note, Style::new().fg(Color::Yellow)))
+                    .alignment(ratatui::layout::Alignment::Right),
+                area,
+            );
+        }
+    }
 }
 
 fn draw_logs(f: &mut Frame, app: &App, view: &LogView, area: Rect) {

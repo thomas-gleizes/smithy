@@ -8,6 +8,7 @@ mod request;
 mod session;
 mod timeago;
 mod ui;
+mod workspace;
 mod wrap;
 
 use std::{
@@ -39,12 +40,38 @@ async fn main() -> Result<()> {
     let wanted = std::env::var("SMITHY_SERVER").ok();
     // Vérifie le nom demandé (erreur claire) avant d'ouvrir le terminal.
     cfg.server(wanted.as_deref())?;
+    let fresh = parse_args()?;
     let store = SessionStore::default_location();
 
     let mut terminal = ratatui::init();
-    let result = run(&mut terminal, cfg.servers.clone(), wanted, store).await;
+    let result = run(&mut terminal, cfg.servers.clone(), wanted, store, fresh).await;
     ratatui::restore();
     result
+}
+
+const USAGE: &str = "smithy : consulter la CI et le code de vos forges git dans le terminal
+
+Usage : smithy [--fresh]
+
+  --fresh   ne rouvre pas les onglets de la dernière session (démarre sur l'accueil)
+  --help    affiche ce message
+
+Configuration : voir le README (serveurs dans ~/.config/smithy/config.toml).";
+
+/// Les arguments : `--fresh` seul. Renvoie `true` s'il faut démarrer sans restaurer les onglets.
+fn parse_args() -> Result<bool> {
+    let mut fresh = false;
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "--fresh" => fresh = true,
+            "-h" | "--help" => {
+                println!("{USAGE}");
+                std::process::exit(0);
+            }
+            other => anyhow::bail!("argument inconnu : {other}\n\n{USAGE}"),
+        }
+    }
+    Ok(fresh)
 }
 
 fn build_provider(
@@ -500,6 +527,7 @@ async fn run(
     servers: Vec<Server>,
     wanted: Option<String>,
     store: Option<SessionStore>,
+    fresh: bool,
 ) -> Result<()> {
     let recent_store = RecentStore::default_location();
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, Msg)>();
@@ -526,140 +554,154 @@ async fn run(
     for name in &order {
         announce(&mut app, &backends[name]);
     }
-    // Serveur demandé, sinon le premier qui a des identifiants (sinon le premier, avec login).
-    let initial = wanted
-        .filter(|w| backends.contains_key(w))
-        .or_else(|| {
-            order
-                .iter()
-                .find(|n| backends[*n].provider.is_some())
-                .cloned()
-        })
-        .or_else(|| order.first().cloned())
-        .unwrap_or_default();
-    app.set_initial_server(&initial);
+    // Une seule instance restaure et sauvegarde les onglets (voir `workspace`).
+    let dir = workspace::state_dir();
+    let (tabs_store, owner_lock) = match dir.as_deref().map(workspace::acquire) {
+        Some(workspace::Ownership::Owner(lock)) => {
+            (dir.as_deref().map(workspace::TabsStore::in_dir), Some(lock))
+        }
+        Some(workspace::Ownership::Other) => {
+            app.shared_instance = true;
+            (None, None)
+        }
+        _ => (None, None),
+    };
+    let restored = !fresh
+        && tabs_store
+            .as_ref()
+            .and_then(workspace::TabsStore::load)
+            .is_some_and(|saved| app.restore(saved));
+    // Sinon : le serveur demandé, sinon le premier qui a des identifiants (sinon le premier,
+    // avec login). Restauré, c'est le serveur de l'onglet affiché.
+    let initial = if restored {
+        app.server_name.clone()
+    } else {
+        let initial = wanted
+            .filter(|w| backends.contains_key(w))
+            .or_else(|| {
+                order
+                    .iter()
+                    .find(|n| backends[*n].provider.is_some())
+                    .cloned()
+            })
+            .or_else(|| order.first().cloned())
+            .unwrap_or_default();
+        app.set_initial_server(&initial);
+        initial
+    };
+    let mut last_saved_tabs: Option<workspace::SavedTabs> = None;
     if backends[&initial].provider.is_none() {
         app.open_login(&initial, &backends[&initial].username, false);
     }
     let mut last_refresh = Instant::now();
 
+    let _lock = owner_lock;
     while !app.should_quit {
         terminal.draw(|f| ui::draw(f, &app))?;
 
-        if event::poll(TICK)? {
-            if let Event::Key(k) = event::read()? {
-                if k.kind == KeyEventKind::Press {
-                    let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
-                    if ctrl && k.code == KeyCode::Char('c') {
-                        app.should_quit = true;
-                    } else if let Some(form) = app.login.as_ref().map(|f| f.server.clone()) {
-                        match k.code {
-                            KeyCode::Esc => app.should_quit = app.login_escape(),
-                            KeyCode::Enter => {
-                                if let Some((user, pass)) = app.login_enter() {
-                                    let b = &backends[&form];
-                                    spawn_login(&b.server, &tx, user, pass, b.known_token());
-                                }
-                            }
-                            KeyCode::Tab | KeyCode::Up | KeyCode::Down => app.login_toggle_field(),
-                            KeyCode::Backspace => app.login_backspace(),
-                            KeyCode::Char(c) if !ctrl => app.login_type(c),
-                            _ => {}
+        if event::poll(TICK)?
+            && let Event::Key(k) = event::read()?
+            && k.kind == KeyEventKind::Press
+        {
+            let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
+            if ctrl && k.code == KeyCode::Char('c') {
+                app.should_quit = true;
+            } else if let Some(form) = app.login.as_ref().map(|f| f.server.clone()) {
+                match k.code {
+                    KeyCode::Esc => app.should_quit = app.login_escape(),
+                    KeyCode::Enter => {
+                        if let Some((user, pass)) = app.login_enter() {
+                            let b = &backends[&form];
+                            spawn_login(&b.server, &tx, user, pass, b.known_token());
                         }
-                    } else if app.server_form.is_some() {
-                        match k.code {
-                            KeyCode::Esc => app.server_form_cancel(),
-                            KeyCode::Enter => {
-                                if let Some(draft) = app.server_form_enter() {
-                                    if let Err(e) =
-                                        save_server(&mut app, &mut backends, store.as_ref(), draft)
-                                    {
-                                        app.server_form_fail(e);
-                                    }
-                                }
-                            }
-                            KeyCode::Tab | KeyCode::Down => app.server_form_move(1),
-                            KeyCode::BackTab | KeyCode::Up => app.server_form_move(-1),
-                            KeyCode::Backspace => app.server_form_backspace(),
-                            KeyCode::Char(c) if !ctrl => app.server_form_type(c),
-                            _ => {}
+                    }
+                    KeyCode::Tab | KeyCode::Up | KeyCode::Down => app.login_toggle_field(),
+                    KeyCode::Backspace => app.login_backspace(),
+                    KeyCode::Char(c) if !ctrl => app.login_type(c),
+                    _ => {}
+                }
+            } else if app.server_form.is_some() {
+                match k.code {
+                    KeyCode::Esc => app.server_form_cancel(),
+                    KeyCode::Enter => {
+                        if let Some(draft) = app.server_form_enter()
+                            && let Err(e) =
+                                save_server(&mut app, &mut backends, store.as_ref(), draft)
+                        {
+                            app.server_form_fail(e);
                         }
-                    } else if app.server_picker.is_some() {
-                        if app.server_delete.is_some() {
-                            match k.code {
-                                KeyCode::Char('y' | 'o') => {
-                                    if let Some(name) = app.server_delete_confirm() {
-                                        if let Err(e) = delete_server(
-                                            &mut app,
-                                            &mut backends,
-                                            store.as_ref(),
-                                            &name,
-                                        ) {
-                                            app.server_note = Some(e);
-                                        }
-                                    }
-                                }
-                                _ => app.server_delete_cancel(),
-                            }
-                        } else {
-                            match k.code {
-                                KeyCode::Esc | KeyCode::Char('q' | 'S') => {
-                                    app.close_server_picker()
-                                }
-                                KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
-                                    app.server_picker_move(1)
-                                }
-                                KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
-                                    app.server_picker_move(-1)
-                                }
-                                KeyCode::Char('a') => app.server_form_add(),
-                                KeyCode::Char('e') => app.server_form_edit(),
-                                KeyCode::Char('d') => app.server_delete_ask(),
-                                KeyCode::Enter => {
-                                    // Pas encore connecté : le login d'abord, la bascule ensuite.
-                                    if let Some(name) = app.server_picker_choose() {
-                                        app.open_login(&name, &backends[&name].username, true);
-                                    }
-                                }
-                                _ => {}
+                    }
+                    KeyCode::Tab | KeyCode::Down => app.server_form_move(1),
+                    KeyCode::BackTab | KeyCode::Up => app.server_form_move(-1),
+                    KeyCode::Backspace => app.server_form_backspace(),
+                    KeyCode::Char(c) if !ctrl => app.server_form_type(c),
+                    _ => {}
+                }
+            } else if app.server_picker.is_some() {
+                if app.server_delete.is_some() {
+                    match k.code {
+                        KeyCode::Char('y' | 'o') => {
+                            if let Some(name) = app.server_delete_confirm()
+                                && let Err(e) =
+                                    delete_server(&mut app, &mut backends, store.as_ref(), &name)
+                            {
+                                app.server_note = Some(e);
                             }
                         }
-                    } else if app.tab_picker.is_some() {
-                        tab_picker_key(&mut app, k.code);
-                    } else if k.code == KeyCode::Char('S') && !app.home().is_some_and(|h| h.editing)
-                    {
-                        app.open_server_picker();
-                    } else if tab_key(&mut app, k.code) {
-                        // pris par les onglets
-                    } else if app.home().is_some() {
-                        home_key(&mut app, k.code);
-                    } else if app.repo_page().is_some() {
-                        list_key(&mut app, k.code, App::repo_enter);
-                    } else if app.runs().is_some() {
-                        list_key(&mut app, k.code, App::open_logs);
-                    } else if app.logs().is_some() {
-                        match k.code {
-                            KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
-                                app.close_logs()
-                            }
-                            KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
-                            KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
-                            KeyCode::Char(' ') => app.text_toggle_section(),
-                            KeyCode::Right => app.text_select_section(1),
-                            KeyCode::Left => app.text_select_section(-1),
-                            KeyCode::Char('a') => app.text_toggle_all(),
-                            KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
-                            KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
-                            KeyCode::Char('g') | KeyCode::Home => app.text_top(),
-                            KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
-                            KeyCode::Char('w') => app.text_toggle_wrap(),
-                            KeyCode::Char('r') => app.refetch_logs(),
-                            _ => {}
+                        _ => app.server_delete_cancel(),
+                    }
+                } else {
+                    match k.code {
+                        KeyCode::Esc | KeyCode::Char('q' | 'S') => app.close_server_picker(),
+                        KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => {
+                            app.server_picker_move(1)
                         }
-                    } else if app.browser().is_some() {
-                        browser_key(&mut app, k.code);
+                        KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => {
+                            app.server_picker_move(-1)
+                        }
+                        KeyCode::Char('a') => app.server_form_add(),
+                        KeyCode::Char('e') => app.server_form_edit(),
+                        KeyCode::Char('d') => app.server_delete_ask(),
+                        KeyCode::Enter => {
+                            // Pas encore connecté : le login d'abord, la bascule ensuite.
+                            if let Some(name) = app.server_picker_choose() {
+                                app.open_login(&name, &backends[&name].username, true);
+                            }
+                        }
+                        _ => {}
                     }
                 }
+            } else if app.tab_picker.is_some() {
+                tab_picker_key(&mut app, k.code);
+            } else if k.code == KeyCode::Char('S') && !app.home().is_some_and(|h| h.editing) {
+                app.open_server_picker();
+            } else if tab_key(&mut app, k.code) {
+                // pris par les onglets
+            } else if app.home().is_some() {
+                home_key(&mut app, k.code);
+            } else if app.repo_page().is_some() {
+                list_key(&mut app, k.code, App::repo_enter);
+            } else if app.runs().is_some() {
+                list_key(&mut app, k.code, App::open_logs);
+            } else if app.logs().is_some() {
+                match k.code {
+                    KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => app.close_logs(),
+                    KeyCode::Char('j') | KeyCode::Down => app.text_scroll(1),
+                    KeyCode::Char('k') | KeyCode::Up => app.text_scroll(-1),
+                    KeyCode::Char(' ') => app.text_toggle_section(),
+                    KeyCode::Right => app.text_select_section(1),
+                    KeyCode::Left => app.text_select_section(-1),
+                    KeyCode::Char('a') => app.text_toggle_all(),
+                    KeyCode::PageDown | KeyCode::Char('f') => app.text_page(1),
+                    KeyCode::PageUp | KeyCode::Char('b') => app.text_page(-1),
+                    KeyCode::Char('g') | KeyCode::Home => app.text_top(),
+                    KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
+                    KeyCode::Char('w') => app.text_toggle_wrap(),
+                    KeyCode::Char('r') => app.refetch_logs(),
+                    _ => {}
+                }
+            } else if app.browser().is_some() {
+                browser_key(&mut app, k.code);
             }
         }
 
@@ -738,8 +780,21 @@ async fn run(
         app.requeue(waiting);
         if app.recents_dirty {
             app.recents_dirty = false;
-            if let Some(Err(e)) = recent_store.as_ref().map(|r| r.save(&app.recents)) {
-                app.error = Some(format!("historique non sauvegardé : {e}"));
+            match recent_store.as_ref().map(|r| r.save_merged(&app.recents)) {
+                Some(Ok(merged)) => app.recents = merged,
+                Some(Err(e)) => app.error = Some(format!("historique non sauvegardé : {e}")),
+                None => {}
+            }
+        }
+        // Les onglets sont réécrits dès qu'ils changent (et non à la fermeture : un plantage ou
+        // un Ctrl+C ne doit rien faire perdre).
+        if let Some(store) = &tabs_store {
+            let snapshot = app.snapshot();
+            if last_saved_tabs.as_ref() != Some(&snapshot) {
+                match store.save(&snapshot) {
+                    Ok(()) => last_saved_tabs = Some(snapshot),
+                    Err(e) => app.error = Some(format!("onglets non sauvegardés : {e}")),
+                }
             }
         }
     }

@@ -108,6 +108,12 @@ impl HomeView {
         }
     }
 
+    /// Retrouve la section (et la ligne) d'une sauvegarde ; les indices hors bornes sont ramenés.
+    pub fn restore(&mut self, section: usize, selected: usize) {
+        self.section = Section::ALL[section.min(Section::ALL.len() - 1)];
+        self.data_mut().selected = selected;
+    }
+
     pub fn data(&self) -> &SectionData {
         &self.data[self.section.index()]
     }

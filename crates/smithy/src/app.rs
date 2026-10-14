@@ -14,6 +14,7 @@ use crate::{
     request::Request,
     session::Session,
     timeago,
+    workspace::{SavedPage, SavedTab, SavedTabs},
 };
 
 pub enum Msg {
@@ -191,6 +192,9 @@ pub struct App {
     pub server_delete: Option<String>,
     /// Message affiché dans la liste des serveurs (refus, confirmation).
     pub server_note: Option<String>,
+    /// Une autre instance de smithy gère déjà la sauvegarde des onglets : celle-ci ne les
+    /// restaure ni ne les sauvegarde (voir `workspace`).
+    pub shared_instance: bool,
     /// Joignabilité des serveurs, mesurée tant que la liste est ouverte.
     pub reach: std::collections::HashMap<String, Reach>,
     probes: Vec<String>,
@@ -246,6 +250,7 @@ impl App {
             server_form: None,
             server_delete: None,
             server_note: None,
+            shared_instance: false,
             reach: std::collections::HashMap::new(),
             probes: Vec::new(),
             caps: std::collections::HashMap::new(),
@@ -1017,6 +1022,127 @@ impl App {
         if i < self.active {
             self.active -= 1;
         }
+    }
+
+    // --- sauvegarde et restauration des onglets
+
+    /// L'état à sauvegarder : pour chaque onglet son serveur et ses pages. Les logs ne sont pas
+    /// gardés (ils demandent le run entier) : l'onglet revient à la liste des runs.
+    pub fn snapshot(&self) -> SavedTabs {
+        let tabs = (0..self.tabs.len())
+            .map(|i| SavedTab {
+                server: if i == self.active {
+                    self.server_name.clone()
+                } else {
+                    self.tab_servers[i].clone()
+                },
+                pages: self
+                    .stack_of(i)
+                    .iter()
+                    .filter_map(|p| match p {
+                        Page::Home(h) => Some(SavedPage::Home {
+                            section: h.section.index(),
+                            selected: h.data().selected,
+                        }),
+                        Page::Repo(r) => Some(SavedPage::Repo {
+                            repo: r.info.repo.clone(),
+                            selected: r.selected,
+                        }),
+                        Page::Runs(r) => Some(SavedPage::Runs {
+                            repo: r.repo.clone(),
+                        }),
+                        Page::Browser(b) => Some(SavedPage::Browser {
+                            repo: b.repo.clone(),
+                            reference: b.reference.clone(),
+                            path: b.path.clone(),
+                        }),
+                        Page::Logs(_) => None,
+                    })
+                    .collect(),
+            })
+            .collect();
+        SavedTabs::new(self.active, tabs)
+    }
+
+    /// Rouvre les onglets sauvegardés. Les serveurs qui n'existent plus sont écartés (avec leur
+    /// onglet). Renvoie `false` s'il ne reste rien à restaurer : l'état n'a alors pas changé.
+    /// Les données sont redemandées, chaque requête étiquetée du serveur de son onglet.
+    pub fn restore(&mut self, saved: SavedTabs) -> bool {
+        let known = |s: &str| self.servers.iter().any(|e| e.name == s);
+        let kept: Vec<(usize, &SavedTab)> = saved
+            .tabs
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| known(&t.server))
+            .take(MAX_TABS)
+            .collect();
+        if kept.is_empty() {
+            return false;
+        }
+        // L'onglet affiché : le même s'il reste, sinon le premier qui le suit (ou le dernier).
+        let active = kept
+            .iter()
+            .position(|(i, _)| *i >= saved.active)
+            .unwrap_or(kept.len() - 1);
+
+        let mut requests = Vec::new();
+        let mut stacks = Vec::new();
+        let mut servers = Vec::new();
+        for (_, tab) in &kept {
+            let mut stack = Vec::new();
+            for page in &tab.pages {
+                match page {
+                    SavedPage::Home { section, selected } => {
+                        let mut h = HomeView::new();
+                        h.restore(*section, *selected);
+                        requests.extend(h.request_current().map(|r| (tab.server.clone(), r)));
+                        stack.push(Page::Home(h));
+                    }
+                    SavedPage::Repo { repo, selected } => {
+                        let mut v = RepoView::placeholder(repo.clone());
+                        v.selected = *selected;
+                        requests.push((tab.server.clone(), Request::RepoInfo(repo.clone())));
+                        requests.push((tab.server.clone(), Request::Pipelines(repo.clone())));
+                        stack.push(Page::Repo(v));
+                    }
+                    SavedPage::Runs { repo } => {
+                        requests.push((tab.server.clone(), Request::Pipelines(repo.clone())));
+                        stack.push(Page::Runs(RunsView::new(repo.clone())));
+                    }
+                    SavedPage::Browser {
+                        repo,
+                        reference,
+                        path,
+                    } => stack.push(Page::Browser(Browser::restore(
+                        repo.clone(),
+                        reference.clone(),
+                        path.clone(),
+                    ))),
+                }
+            }
+            // Une pile commence toujours par l'accueil.
+            if !matches!(stack.first(), Some(Page::Home(_))) {
+                let mut h = HomeView::new();
+                requests.extend(h.request_current().map(|r| (tab.server.clone(), r)));
+                stack.insert(0, Page::Home(h));
+            }
+            stacks.push(stack);
+            servers.push(tab.server.clone());
+        }
+
+        self.pending.clear();
+        self.pending.extend(requests);
+        self.tabs = vec![Vec::new(); stacks.len()];
+        self.stack = std::mem::take(&mut stacks[active]);
+        for (i, s) in stacks.into_iter().enumerate() {
+            if i != active {
+                self.tabs[i] = s;
+            }
+        }
+        self.tab_servers = servers;
+        self.active = active;
+        self.sync_server();
+        true
     }
 
     // --- serveurs
@@ -3346,5 +3472,162 @@ mod tests {
         // Un serveur supprimé n'a plus d'état
         a.server_delete_done(vec![]);
         assert!(a.reach.is_empty());
+    }
+
+    // --- sauvegarde et restauration des onglets
+
+    fn saved(server: &str, pages: Vec<SavedPage>) -> SavedTab {
+        SavedTab {
+            server: server.into(),
+            pages,
+        }
+    }
+
+    fn home_page(section: usize, selected: usize) -> SavedPage {
+        SavedPage::Home { section, selected }
+    }
+
+    #[test]
+    fn instantane_des_onglets() {
+        let mut a = two_tabs_on_a(); // onglet 2 = copie des runs, ouvert sur les logs
+        a.switch_server("B");
+        a.switch_tab(-1);
+        let snap = a.snapshot();
+        assert_eq!(snap.active, 0);
+        assert_eq!(snap.tabs.len(), 2);
+        assert_eq!(snap.tabs[0].server, "A");
+        assert_eq!(
+            snap.tabs[0].pages,
+            [
+                home_page(0, 0),
+                SavedPage::Repo {
+                    repo: repo("a"),
+                    selected: 0
+                },
+                SavedPage::Runs { repo: repo("a") },
+            ]
+        );
+        assert_eq!(snap.tabs[1], saved("B", vec![home_page(0, 0)]));
+        // Les logs ne sont pas gardés : l'onglet revient à la liste des runs
+        let mut b = app_on_run(Status::Running);
+        b.open_logs();
+        let pages = &b.snapshot().tabs[0].pages;
+        assert!(
+            matches!(pages.last(), Some(SavedPage::Runs { .. })),
+            "{pages:?}"
+        );
+    }
+
+    #[test]
+    fn restauration_des_onglets_avec_leurs_requetes() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_caps("A", true, true);
+        a.set_caps("B", true, true);
+        let r = repo("a");
+        let saved = SavedTabs::new(
+            1,
+            vec![
+                saved(
+                    "A",
+                    vec![
+                        home_page(2, 4),
+                        SavedPage::Repo {
+                            repo: r.clone(),
+                            selected: 1,
+                        },
+                    ],
+                ),
+                saved(
+                    "B",
+                    vec![
+                        home_page(0, 0),
+                        SavedPage::Repo {
+                            repo: r.clone(),
+                            selected: 0,
+                        },
+                        SavedPage::Browser {
+                            repo: r.clone(),
+                            reference: "feature/x".into(),
+                            path: "src".into(),
+                        },
+                    ],
+                ),
+            ],
+        );
+        assert!(a.restore(saved.clone()));
+        assert_eq!(
+            (a.tab_count(), active_index(&a), a.server_name.as_str()),
+            (2, 1, "B")
+        );
+        let b = a.browser().unwrap();
+        assert_eq!(
+            (b.reference.as_str(), b.path.as_str()),
+            ("feature/x", "src")
+        );
+        // Un instantané refait donne la même chose (aller-retour)
+        assert_eq!(a.snapshot(), saved);
+        // Chaque requête part vers le serveur de son onglet
+        let reqs = a.take_tagged_requests();
+        let for_server = |s: &str| {
+            reqs.iter()
+                .filter(|(n, _)| n == s)
+                .map(|(_, r)| r.clone())
+                .collect::<Vec<_>>()
+        };
+        assert!(for_server("B").contains(&Request::RepoInfo(r.clone())));
+        assert!(for_server("B").contains(&Request::Branches(r.clone())));
+        assert!(for_server("B").iter().any(
+            |q| matches!(q, Request::Dir { reference, path, .. } if reference == "feature/x" && path == "src")
+        ));
+        // L'onglet 1 : section « Étoilés » (la 3e) rechargée, fiche et runs du dépôt
+        assert!(
+            for_server("A")
+                .iter()
+                .any(|q| matches!(q, Request::Repos(RepoSource::Starred)))
+        );
+        assert!(for_server("A").contains(&Request::Pipelines(r)));
+        // Les requêtes de l'accueil par défaut ne sont pas parties en plus
+        assert!(!reqs.iter().any(|(n, _)| n.is_empty()));
+        a.switch_tab(-1);
+        // Section et ligne de l'accueil de l'onglet 1 retrouvées sous sa page de dépôt
+        let Page::Home(h) = &a.stack[0] else {
+            panic!("pas d'accueil au fond");
+        };
+        assert_eq!((h.section.index(), h.data().selected), (2, 4));
+    }
+
+    #[test]
+    fn restauration_ecarte_les_serveurs_disparus() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A")]);
+        a.set_caps("A", true, true);
+        let before = a.snapshot();
+        // Rien d'exploitable : l'état ne change pas
+        assert!(!a.restore(SavedTabs::new(0, vec![saved("Z", vec![home_page(0, 0)])])));
+        assert_eq!(a.snapshot(), before);
+        // L'onglet du serveur disparu est écarté, l'actif retombe sur le suivant
+        let ok = a.restore(SavedTabs::new(
+            1,
+            vec![
+                saved("A", vec![home_page(1, 0)]),
+                saved("Z", vec![home_page(0, 0)]),
+                saved("A", vec![home_page(3, 0)]),
+            ],
+        ));
+        assert!(ok);
+        assert_eq!((a.tab_count(), active_index(&a)), (2, 1));
+        assert_eq!(a.home().unwrap().section.index(), 3);
+        // Pile sans accueil, section hors bornes : réparées
+        let ok = a.restore(SavedTabs::new(
+            0,
+            vec![saved(
+                "A",
+                vec![SavedPage::Runs { repo: repo("a") }, home_page(99, 0)],
+            )],
+        ));
+        assert!(ok);
+        assert!(matches!(a.stack[0], Page::Home(_)));
+        assert!(a.snapshot().tabs[0].pages.len() >= 2);
     }
 }
