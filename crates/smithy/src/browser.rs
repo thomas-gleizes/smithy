@@ -111,6 +111,26 @@ impl Browser {
         }
     }
 
+    /// Fil d'Ariane de la page : dépôt, « Code », branche, puis les dossiers (ou le fichier).
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let reference = if self.reference.is_empty() {
+            "…"
+        } else {
+            &self.reference
+        };
+        let path = match &self.mode {
+            Mode::File(fv) => fv.path.as_str(),
+            _ => self.path.as_str(),
+        };
+        let mut out = vec![
+            self.repo.full_name(),
+            "Code".to_owned(),
+            reference.to_owned(),
+        ];
+        out.extend(path.split('/').filter(|s| !s.is_empty()).map(str::to_owned));
+        out
+    }
+
     pub fn screen(&self) -> Screen {
         match self.mode {
             Mode::Dir => Screen::Dir,
@@ -599,6 +619,32 @@ mod tests {
         assert_eq!(b.list_offset.get(), 0);
         b.open_branches();
         assert_eq!(b.picker_offset.get(), 0);
+    }
+
+    #[test]
+    fn fil_d_ariane_de_l_explorateur() {
+        let mut b = Browser::open(repo());
+        assert_eq!(b.breadcrumb(), ["o/r", "Code", "…"], "branche inconnue");
+        b.take_requests();
+        b.on_branches(&repo(), Ok(vec![branch("feature/x", true)]));
+        assert_eq!(
+            b.breadcrumb(),
+            ["o/r", "Code", "feature/x"],
+            "un slash de branche reste un seul élément"
+        );
+        b.path = "src/deep".into();
+        assert_eq!(b.breadcrumb(), ["o/r", "Code", "feature/x", "src", "deep"]);
+        b.mode = Mode::File(FileView {
+            path: "src/deep/a.rs".into(),
+            text: TextView::new(),
+        });
+        assert_eq!(
+            b.breadcrumb(),
+            ["o/r", "Code", "feature/x", "src", "deep", "a.rs"]
+        );
+        b.path.clear();
+        b.mode = Mode::Dir;
+        assert_eq!(b.breadcrumb().len(), 3, "racine : pas de segment vide");
     }
 
     #[test]

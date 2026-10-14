@@ -36,32 +36,101 @@ fn border(focused: bool) -> Style {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    if let Some(view) = &app.logs {
-        draw_logs(f, app, view);
-    } else if let Some(b) = &app.browser {
-        draw_browser(f, app, b);
+    // Une ligne en haut pour dire où l'on est, le reste pour la page.
+    let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(f.area());
+    draw_breadcrumb(f, app, top);
+    if let Some(view) = app.logs() {
+        draw_logs(f, app, view, body);
+    } else if let Some(b) = app.browser() {
+        draw_browser(f, app, b, body);
     } else {
-        draw_lists(f, app);
+        draw_lists(f, app, body);
     }
     if let Some(form) = &app.login {
         draw_login(f, form, &app.server_label);
     }
 }
 
-fn draw_logs(f: &mut Frame, app: &App, view: &LogView) {
-    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
+const CRUMB_SEP: &str = " › ";
+
+fn text_width(s: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(s)
+}
+
+fn joined_width(parts: &[String]) -> usize {
+    text_width(&parts.join(CRUMB_SEP))
+}
+
+/// Fil d'Ariane qui tient dans `width` colonnes : on garde le serveur au début et la page à la
+/// fin (ce qui compte), on remplace le milieu par « … » en commençant par le plus ancien, et en
+/// dernier recours on coupe le début du texte.
+fn fit_breadcrumb(crumbs: &[String], width: usize) -> Vec<String> {
+    if crumbs.is_empty() || joined_width(crumbs) <= width {
+        return crumbs.to_vec();
+    }
+    let n = crumbs.len();
+    for dropped in 1..n.saturating_sub(1) {
+        let mut parts = vec![crumbs[0].clone(), "…".to_owned()];
+        parts.extend_from_slice(&crumbs[1 + dropped..]);
+        if joined_width(&parts) <= width {
+            return parts;
+        }
+    }
+    let mut parts = vec![crumbs[0].clone()];
+    if n > 1 {
+        parts.push("…".to_owned());
+        parts.push(crumbs[n - 1].clone());
+    }
+    if joined_width(&parts) <= width {
+        return parts;
+    }
+    // Même ainsi trop long : on ne garde que la fin, la partie la plus précise.
+    let text = crumbs.join(CRUMB_SEP);
+    let mut kept: Vec<char> = Vec::new();
+    let mut used = 1; // la place du « … » de tête
+    for c in text.chars().rev() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width {
+            break;
+        }
+        used += w;
+        kept.push(c);
+    }
+    if width == 0 {
+        return vec![String::new()];
+    }
+    kept.reverse();
+    vec![format!("…{}", kept.into_iter().collect::<String>())]
+}
+
+fn draw_breadcrumb(f: &mut Frame, app: &App, area: Rect) {
+    let parts = fit_breadcrumb(&app.breadcrumb(), area.width as usize);
+    let last = parts.len().saturating_sub(1);
+    let mut spans = Vec::new();
+    for (i, p) in parts.into_iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(CRUMB_SEP, Style::new().fg(Color::DarkGray)));
+        }
+        let style = if i == last {
+            Style::new().bold()
+        } else {
+            Style::new().fg(Color::DarkGray)
+        };
+        spans.push(Span::styled(p, style));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_logs(f: &mut Frame, app: &App, view: &LogView, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
     let (status, color) = status_style(view.pipeline.status);
+    // Le dépôt, le workflow et le job sont déjà dans le fil d'Ariane : le cadre garde le statut.
     let title = Line::from(vec![
-        Span::raw(format!(
-            " Logs · {} · {} · {} · ",
-            view.repo.full_name(),
-            view.pipeline.workflow,
-            view.pipeline.job
-        )),
+        Span::raw(format!(" {} · ", view.pipeline.job)),
         Span::styled(format!("{status} "), Style::new().fg(color)),
     ]);
     draw_text_pane(f, app, rows[0], title, view);
-    draw_footer(f, app, rows[1], logs_help(f.area().width as usize), None);
+    draw_footer(f, app, rows[1], logs_help(area.width as usize), None);
 }
 
 /// Volet de texte plein cadre : sortie d'un job ou contenu d'un fichier, avec sa position et sa
@@ -218,32 +287,17 @@ fn branches_help(width: usize) -> &'static str {
 }
 
 /// Taille d'un octet à l'écran : `Nom` à gauche, `Taille` à droite.
-fn draw_browser(f: &mut Frame, app: &App, b: &Browser) {
-    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(f.area());
-    let width = f.area().width as usize;
-    let reference = if b.reference.is_empty() {
-        "…"
-    } else {
-        &b.reference
-    };
+fn draw_browser(f: &mut Frame, app: &App, b: &Browser, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).split(area);
+    let width = area.width as usize;
+    // Dépôt et branche sont dans le fil d'Ariane : le cadre montre le chemin.
     if let Mode::File(fv) = &b.mode {
-        let title = Line::from(format!(
-            " Explorateur · {} @ {} · /{} ",
-            b.repo.full_name(),
-            reference,
-            fv.path
-        ));
+        let title = Line::from(format!(" /{} ", fv.path));
         draw_text_pane(f, app, rows[0], title, &fv.text);
         draw_footer(f, app, rows[1], file_help(width), None);
         return;
     }
-    let title = format!(
-        " Explorateur · {} @ {} · /{} ",
-        b.repo.full_name(),
-        reference,
-        b.path
-    );
-    draw_dir(f, app, b, rows[0], title);
+    draw_dir(f, app, b, rows[0], format!(" /{} ", b.path));
     let help = if matches!(b.mode, Mode::Branches { .. }) {
         branches_help(width)
     } else {
@@ -375,8 +429,8 @@ fn draw_branch_picker(f: &mut Frame, b: &Browser, selected: usize) {
     b.picker_offset.set(ls.offset());
 }
 
-fn draw_lists(f: &mut Frame, app: &App) {
-    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(f.area());
+fn draw_lists(f: &mut Frame, app: &App, area: Rect) {
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
     let cols = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
@@ -456,7 +510,7 @@ fn draw_lists(f: &mut Frame, app: &App) {
         Line::from("")
     };
     let help = Line::from(Span::styled(
-        lists_help(f.area().width as usize),
+        lists_help(area.width as usize),
         Style::new().fg(Color::DarkGray),
     ));
     f.render_widget(Paragraph::new(vec![help, second]), rows[1]);
@@ -647,7 +701,7 @@ mod tests {
         });
         app.focus = Focus::Pipelines;
         app.open_logs();
-        app.logs.as_mut().unwrap().state = state;
+        app.logs_mut().unwrap().state = state;
         app
     }
 
@@ -688,18 +742,19 @@ mod tests {
             .map(|i| line(LineKind::Text, &format!("ligne-{i:02}")))
             .collect();
         let mut app = app_with_logs(LogState::Ready(lines));
-        let _ = render(&app, 80, 12); // le rendu publie la hauteur utile (12 - 2 bordures - 1 pied)
-        assert_eq!(app.viewport.get(), 9);
+        // Le rendu publie la hauteur utile : 12 - 1 fil d'Ariane - 2 bordures - 1 pied.
+        let _ = render(&app, 80, 12);
+        assert_eq!(app.viewport.get(), 8);
         app.text_scroll(20);
         let text = render(&app, 80, 12);
-        assert!(text.contains("ligne-21") && text.contains("ligne-29"));
-        assert!(!text.contains("ligne-20") && !text.contains("ligne-30"));
-        assert!(text.contains("21-29/50"));
+        assert!(text.contains("ligne-21") && text.contains("ligne-28"));
+        assert!(!text.contains("ligne-20") && !text.contains("ligne-29"));
+        assert!(text.contains("21-28/50"));
     }
 
     fn app_with_job(steps: Vec<smithy_core::StepLog>) -> App {
         let mut app = app_with_logs(LogState::Loading);
-        let v = app.logs.as_mut().unwrap();
+        let v = app.logs_mut().unwrap();
         v.set_log(&smithy_core::JobLog {
             steps,
             notice: None,
@@ -777,7 +832,7 @@ mod tests {
     }
 
     fn feed_dir(app: &mut App, path: &str, entries: Vec<Entry>) {
-        let b = app.browser.as_mut().unwrap();
+        let b = app.browser_mut().unwrap();
         b.on_branches(
             &tree_repo(),
             Ok(vec![
@@ -804,7 +859,7 @@ mod tests {
     }
 
     fn browser(app: &App) -> &Browser {
-        app.browser.as_ref().unwrap()
+        app.browser().unwrap()
     }
 
     #[test]
@@ -822,8 +877,7 @@ mod tests {
         );
         let text = render(&app, 100, 14);
         for needle in [
-            "Explorateur",
-            "smithy/tree @ main",
+            "smithy/tree › Code › main",
             "▸ src/",
             "README.md",
             "1,5 Kio",
@@ -849,14 +903,14 @@ mod tests {
         let mut app = explorer_app();
         assert!(render(&app, 100, 10).contains("chargement"));
         assert!(
-            render(&app, 100, 10).contains("@ …"),
+            render(&app, 100, 10).contains("Code › …"),
             "branche inconnue pendant le chargement"
         );
         feed_dir(&mut app, "", vec![]);
         assert!(render(&app, 100, 10).contains("(dossier vide)"));
-        app.browser.as_mut().unwrap().empty_repo = true;
+        app.browser_mut().unwrap().empty_repo = true;
         assert!(render(&app, 100, 10).contains("dépôt vide"));
-        let b = app.browser.as_mut().unwrap();
+        let b = app.browser_mut().unwrap();
         b.on_dir(
             &tree_repo(),
             "main",
@@ -865,7 +919,7 @@ mod tests {
         );
         assert!(render(&app, 100, 10).contains("erreur"));
         // Message d'information (lien symbolique) : en pied de page à la place de l'aide
-        app.browser.as_mut().unwrap().info = Some("lien : lien symbolique, non ouvert".into());
+        app.browser_mut().unwrap().info = Some("lien : lien symbolique, non ouvert".into());
         let t = render(&app, 100, 10);
         assert!(t.contains("non ouvert") && !t.contains("B branche"));
     }
@@ -875,7 +929,7 @@ mod tests {
         let mut app = explorer_app();
         feed_dir(&mut app, "", vec![e("src", EntryKind::Dir, 0)]);
         {
-            let b = app.browser.as_mut().unwrap();
+            let b = app.browser_mut().unwrap();
             b.path = "src/deep".into();
             b.on_dir(
                 &tree_repo(),
@@ -884,14 +938,16 @@ mod tests {
                 Ok(vec![e("x.rs", EntryKind::File, 3)]),
             );
         }
-        assert!(render(&app, 100, 10).contains("@ main · /src/deep"));
+        let t = render(&app, 100, 10);
+        assert!(t.contains("Code › main › src › deep"), "{t}");
+        assert!(t.contains("/src/deep"), "le cadre montre le chemin");
     }
 
     #[test]
     fn explorateur_selecteur_de_branche() {
         let mut app = explorer_app();
         feed_dir(&mut app, "", vec![e("a.txt", EntryKind::File, 1)]);
-        app.browser.as_mut().unwrap().open_branches();
+        app.browser_mut().unwrap().open_branches();
         let t = render(&app, 100, 14);
         assert!(
             t.contains("Branche") && t.contains("● main (défaut)") && t.contains("feature/x"),
@@ -899,9 +955,9 @@ mod tests {
         );
         assert!(t.contains("j/k choisir"));
         // Liste pas encore chargée, puis en erreur
-        app.browser.as_mut().unwrap().branches = None;
+        app.browser_mut().unwrap().branches = None;
         assert!(render(&app, 100, 14).contains("chargement"));
-        app.browser.as_mut().unwrap().branches_error = Some("coupé".into());
+        app.browser_mut().unwrap().branches_error = Some("coupé".into());
         assert!(render(&app, 100, 14).contains("erreur : coupé"));
     }
 
@@ -913,7 +969,7 @@ mod tests {
             .collect();
         feed_dir(&mut app, "", entries);
         for _ in 0..150 {
-            app.browser.as_mut().unwrap().move_selection(1);
+            app.browser_mut().unwrap().move_selection(1);
             render(&app, 80, 12);
         }
         let t = render(&app, 80, 12);
@@ -924,7 +980,7 @@ mod tests {
         assert!(t.contains("151/200"));
         // On remonte d'une entrée : la liste ne saute pas (décalage mémorisé)
         let before = browser(&app).list_offset.get();
-        app.browser.as_mut().unwrap().move_selection(-1);
+        app.browser_mut().unwrap().move_selection(-1);
         render(&app, 80, 12);
         assert_eq!(browser(&app).list_offset.get(), before);
     }
@@ -940,7 +996,7 @@ mod tests {
             .collect();
         feed_dir(&mut app, "", root.clone());
         {
-            let b = app.browser.as_mut().unwrap();
+            let b = app.browser_mut().unwrap();
             b.move_selection(3); // « many »
             b.enter();
             let many: Vec<_> = (0..130)
@@ -959,7 +1015,7 @@ mod tests {
         }
         assert!(browser(&app).list_offset.get() > 100);
         {
-            let b = app.browser.as_mut().unwrap();
+            let b = app.browser_mut().unwrap();
             b.up();
             b.on_dir(&tree_repo(), "main", "", Ok(root));
         }
@@ -992,9 +1048,9 @@ mod tests {
     fn explorateur_fichier() {
         let mut app = explorer_app();
         feed_dir(&mut app, "", vec![e("a.txt", EntryKind::File, 30)]);
-        app.browser.as_mut().unwrap().enter();
+        app.browser_mut().unwrap().enter();
         assert!(render(&app, 100, 10).contains("chargement"));
-        app.browser.as_mut().unwrap().on_file(
+        app.browser_mut().unwrap().on_file(
             &tree_repo(),
             "main",
             "a.txt",
@@ -1018,7 +1074,7 @@ mod tests {
         }
         assert!(!t.contains("Nom"), "plus de liste de dossier");
         // Erreur, et très petits terminaux
-        app.browser.as_mut().unwrap().on_file(
+        app.browser_mut().unwrap().on_file(
             &tree_repo(),
             "main",
             "a.txt",
@@ -1041,7 +1097,7 @@ mod tests {
         for (w, h) in [(1, 1), (5, 2), (12, 4)] {
             render(&app, w, h);
         }
-        app.browser.as_mut().unwrap().open_branches();
+        app.browser_mut().unwrap().open_branches();
         for (w, h) in [(1, 1), (8, 3), (20, 6)] {
             render(&app, w, h);
         }
@@ -1057,6 +1113,104 @@ mod tests {
         }
         assert!(dir_help(120).contains("B branche") && dir_help(120).contains("remonter"));
         assert!(file_help(120).contains("w retour à la ligne"));
+    }
+
+    // --- fil d'Ariane
+
+    fn crumbs(parts: &[&str]) -> Vec<String> {
+        parts.iter().map(|s| (*s).to_owned()).collect()
+    }
+
+    fn shown(parts: &[&str], width: usize) -> String {
+        fit_breadcrumb(&crumbs(parts), width).join(CRUMB_SEP)
+    }
+
+    #[test]
+    fn fil_d_ariane_tient_dans_la_largeur() {
+        let path = [
+            "maison",
+            "Accueil",
+            "smithy/tree",
+            "Code",
+            "main",
+            "src",
+            "deep",
+            "main.rs",
+        ];
+        // Assez large : tel quel
+        assert_eq!(
+            shown(&path, 200),
+            "maison › Accueil › smithy/tree › Code › main › src › deep › main.rs"
+        );
+        // Trop long : le serveur reste au début, la page à la fin, le plus ancien du milieu part d'abord
+        let s = shown(&path, 50);
+        assert!(
+            s.starts_with("maison › … › ") && s.ends_with("main.rs"),
+            "{s}"
+        );
+        assert!(text_width(&s) <= 50, "{s}");
+        // Plus étroit encore : serveur … page
+        assert_eq!(shown(&path, 22), "maison › … › main.rs");
+        // Même ainsi trop long : on ne garde que la fin, la partie la plus précise
+        let s = shown(&path, 12);
+        assert!(
+            s.starts_with('…') && s.ends_with("main.rs") && text_width(&s) <= 12,
+            "{s}"
+        );
+        // Cas limites
+        assert_eq!(shown(&[], 10), "");
+        assert_eq!(shown(&["seul"], 10), "seul");
+        assert!(shown(&["maison", "Accueil"], 3).chars().count() <= 3);
+        assert_eq!(shown(&path, 0), "");
+        assert!(fit_breadcrumb(&crumbs(&path), 1).join("").chars().count() <= 1);
+    }
+
+    #[test]
+    fn fil_d_ariane_largeur_en_colonnes_pas_en_caracteres() {
+        // Chaque idéogramme occupe 2 colonnes.
+        let s = shown(&["maison", "日本語日本語日本語", "fin"], 14);
+        assert!(text_width(&s) <= 14, "{s} = {} colonnes", text_width(&s));
+        assert!(s.ends_with("fin"), "{s}");
+    }
+
+    #[test]
+    fn fil_d_ariane_affiche_a_l_ecran() {
+        let mut app = App::new();
+        app.server_name = "maison".into();
+        let t = render(&app, 80, 10);
+        assert!(t.contains("maison › Accueil"), "{t}");
+        // Dans les logs : dépôt, CI, workflow, job
+        let mut app = app_with_logs(LogState::Loading);
+        app.server_name = "maison".into();
+        let t = render(&app, 100, 10);
+        assert!(
+            t.contains("maison › Accueil › smithy/demo › CI › fail.yml › test"),
+            "{t}"
+        );
+        // Dans l'explorateur : dépôt, Code, branche, dossiers
+        let mut app = explorer_app();
+        app.server_name = "maison".into();
+        feed_dir(&mut app, "", vec![e("src", EntryKind::Dir, 0)]);
+        {
+            let b = app.browser_mut().unwrap();
+            b.move_selection(0);
+            b.enter();
+            b.on_dir(
+                &tree_repo(),
+                "main",
+                "src",
+                Ok(vec![e("main.rs", EntryKind::File, 3)]),
+            );
+        }
+        let t = render(&app, 100, 10);
+        assert!(
+            t.contains("maison › Accueil › smithy/tree › Code › main › src"),
+            "{t}"
+        );
+        // Très petits terminaux : pas de panique
+        for (w, h) in [(1, 1), (5, 2), (12, 3)] {
+            render(&app, w, h);
+        }
     }
 
     #[test]
@@ -1119,7 +1273,7 @@ mod tests {
     #[test]
     fn reserve_de_version_affichee() {
         let mut app = app_with_logs(LogState::Ready(vec![line(LineKind::Text, "ok")]));
-        app.logs.as_mut().unwrap().notice = Some("Forgejo 14.0.0 : version non vérifiée".into());
+        app.logs_mut().unwrap().notice = Some("Forgejo 14.0.0 : version non vérifiée".into());
         let text = render(&app, 100, 10);
         assert!(text.contains("⚠") && text.contains("non vérifiée"));
         assert!(!render(&app_with_logs(LogState::Loading), 100, 10).contains("⚠"));
@@ -1130,7 +1284,7 @@ mod tests {
         let mut app = app_with_logs(LogState::Failed("session expirée".into()));
         app.open_login("thomas");
         let text = render(&app, 100, 20);
-        assert!(text.contains("Connexion") && text.contains("Logs"));
+        assert!(text.contains("Connexion") && text.contains("CI"));
     }
 
     #[test]

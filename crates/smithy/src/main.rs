@@ -90,13 +90,13 @@ fn fetch_logs<P: Provider + 'static>(
 
 /// Touches de l'explorateur de code : un écran à la fois (dossier, sélecteur de branche, fichier).
 fn browser_key(app: &mut App, code: KeyCode) {
-    let Some(screen) = app.browser.as_ref().map(Browser::screen) else {
+    let Some(screen) = app.browser().map(Browser::screen) else {
         return;
     };
     match screen {
         Screen::File => match code {
             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Left | KeyCode::Backspace => {
-                if let Some(b) = app.browser.as_mut() {
+                if let Some(b) = app.browser_mut() {
                     b.up();
                 }
             }
@@ -108,14 +108,14 @@ fn browser_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
             KeyCode::Char('w') => app.text_toggle_wrap(),
             KeyCode::Char('r') => {
-                if let Some(b) = app.browser.as_mut() {
+                if let Some(b) = app.browser_mut() {
                     b.refresh();
                 }
             }
             _ => {}
         },
         Screen::Branches => {
-            let Some(b) = app.browser.as_mut() else {
+            let Some(b) = app.browser_mut() else {
                 return;
             };
             match code {
@@ -133,14 +133,14 @@ fn browser_key(app: &mut App, code: KeyCode) {
         }
         Screen::Dir => match code {
             KeyCode::Esc | KeyCode::Char('q') => {
-                if app.browser.as_mut().is_some_and(Browser::back) {
+                if app.browser_mut().is_some_and(Browser::back) {
                     app.close_browser();
                 }
             }
             KeyCode::PageDown | KeyCode::Char('f') => app.browser_page(1),
             KeyCode::PageUp | KeyCode::Char('b') => app.browser_page(-1),
             _ => {
-                let Some(b) = app.browser.as_mut() else {
+                let Some(b) = app.browser_mut() else {
                     return;
                 };
                 match code {
@@ -242,6 +242,7 @@ async fn run(
 ) -> Result<()> {
     let (tx, mut rx) = mpsc::unbounded_channel();
     let mut app = App::new();
+    app.server_name = server.name.clone();
     app.server_label = format!("{} ({})", server.name, server.url);
 
     // Le token de la config prime ; sinon celui créé lors d'un login précédent.
@@ -294,7 +295,7 @@ async fn run(
                             KeyCode::Char(c) if !ctrl => app.login_type(c),
                             _ => {}
                         }
-                    } else if app.logs.is_some() {
+                    } else if app.logs().is_some() {
                         match k.code {
                             KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
                                 app.close_logs()
@@ -313,11 +314,12 @@ async fn run(
                             KeyCode::Char('r') => need_logs = app.refetch_logs(),
                             _ => {}
                         }
-                    } else if app.browser.is_some() {
+                    } else if app.browser().is_some() {
                         browser_key(&mut app, k.code);
                     } else {
                         match k.code {
-                            KeyCode::Char('q') | KeyCode::Esc => app.should_quit = true,
+                            // Échap ne quitte jamais : il ne fait que dépiler (rien à la racine).
+                            KeyCode::Char('q') => app.should_quit = true,
                             KeyCode::Char('e') => app.open_browser(),
                             KeyCode::Char('j') | KeyCode::Down => need_pipelines = app.step(1),
                             KeyCode::Char('k') | KeyCode::Up => need_pipelines = app.step(-1),

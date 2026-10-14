@@ -12,6 +12,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible.
 - Sign in from the TUI (username and password, entered once and never stored).
+- A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it.
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
 - Backends are pluggable through the `Provider` trait; the UI adapts to what a backend supports (`Capabilities`).
@@ -97,7 +98,8 @@ Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (dire
 | `Enter`           | Open the logs of the selected run (on the repository list: go to its runs) |
 | `e`               | Explore the code of the selected repository |
 | `r`               | Refresh                   |
-| `q`, `Esc`, `Ctrl+C` | Quit                   |
+| `q`, `Ctrl+C`     | Quit (`q` only on the home screen; elsewhere it goes back) |
+| `Esc`             | Go back one page (never quits) |
 
 In the code explorer:
 
@@ -156,6 +158,10 @@ A new forge is a new crate implementing `Provider`.
 ## Roadmap
 
 - [ ] CI workflow running `make check`
+- [x] Page stack with a breadcrumb
+- [ ] Home page (my repositories, organisations, watched, explore, recent) and a repository page
+- [ ] Independent tabs, each with its own page stack and server
+- [ ] Pull requests, notifications and runners
 - [ ] Filters and search (status, branch, workflow, repository)
 - [x] Job steps and logs for Forgejo
 - [x] Code explorer (branches, folders, files)

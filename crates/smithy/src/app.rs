@@ -50,6 +50,14 @@ pub enum Focus {
     Pipelines,
 }
 
+/// Une page de la pile de navigation. La racine est l'écran des listes (dépôts et runs).
+#[derive(Debug)]
+pub enum Page {
+    Root,
+    Logs(LogView),
+    Browser(Browser),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum LoginField {
     Username,
@@ -78,12 +86,13 @@ pub struct App {
     pub login: Option<LoginForm>,
     /// Nom et URL du serveur, pour le titre du formulaire.
     pub server_label: String,
-    /// Vue des logs ouverte sur le job sélectionné, le cas échéant.
-    pub logs: Option<LogView>,
+    /// Pages empilées, comme dans un navigateur : `Échap` dépile et retrouve la page d'avant
+    /// telle qu'on l'a laissée. Jamais vide : le fond est toujours `Page::Root`.
+    pub stack: Vec<Page>,
+    /// Nom du serveur, pour le fil d'Ariane.
+    pub server_name: String,
     /// Le backend sait-il fournir des logs ? (`Capabilities::logs`)
     pub logs_supported: bool,
-    /// Explorateur de code ouvert sur le dépôt sélectionné, le cas échéant (jamais avec `logs`).
-    pub browser: Option<Browser>,
     /// Le backend sait-il parcourir le code ? (`Capabilities::browse`)
     pub browse_supported: bool,
     /// Dernier choix de retour à la ligne, appliqué aux vues de logs suivantes (le temps de la session).
@@ -105,13 +114,76 @@ impl App {
             should_quit: false,
             login: None,
             server_label: String::new(),
-            logs: None,
+            stack: vec![Page::Root],
+            server_name: String::new(),
             logs_supported: false,
-            browser: None,
             browse_supported: false,
             logs_wrap: false,
             viewport: Cell::new(20),
             viewport_width: Cell::new(80),
+        }
+    }
+
+    /// Vue des logs, si c'est la page affichée.
+    pub fn logs(&self) -> Option<&LogView> {
+        match self.stack.last() {
+            Some(Page::Logs(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    pub fn logs_mut(&mut self) -> Option<&mut LogView> {
+        match self.stack.last_mut() {
+            Some(Page::Logs(v)) => Some(v),
+            _ => None,
+        }
+    }
+
+    /// Explorateur de code, si c'est la page affichée.
+    pub fn browser(&self) -> Option<&Browser> {
+        match self.stack.last() {
+            Some(Page::Browser(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    pub fn browser_mut(&mut self) -> Option<&mut Browser> {
+        match self.stack.last_mut() {
+            Some(Page::Browser(b)) => Some(b),
+            _ => None,
+        }
+    }
+
+    /// Où l'on est, du serveur à la page affichée : `maison › Accueil › smithy/demo › CI › …`.
+    pub fn breadcrumb(&self) -> Vec<String> {
+        let server = if self.server_name.is_empty() {
+            "smithy"
+        } else {
+            &self.server_name
+        };
+        let mut out = vec![server.to_owned()];
+        for page in &self.stack {
+            match page {
+                Page::Root => out.push("Accueil".to_owned()),
+                Page::Logs(v) => out.extend([
+                    v.repo.full_name(),
+                    "CI".to_owned(),
+                    v.pipeline.workflow.clone(),
+                    v.pipeline.job.clone(),
+                ]),
+                Page::Browser(b) => out.extend(b.breadcrumb()),
+            }
+        }
+        out
+    }
+
+    /// Dépile la page affichée ; la racine ne se dépile jamais. Renvoie `true` si une page est partie.
+    pub fn pop(&mut self) -> bool {
+        if self.stack.len() > 1 {
+            self.stack.pop();
+            true
+        } else {
+            false
         }
     }
 
@@ -130,7 +202,7 @@ impl App {
         let pipeline = self.selected_pipeline()?.clone();
         let mut view = LogView::new(repo.clone(), pipeline.clone());
         view.wrap = self.logs_wrap;
-        self.logs = Some(view);
+        self.stack.push(Page::Logs(view));
         Some((repo, pipeline))
     }
 
@@ -141,18 +213,19 @@ impl App {
             return;
         }
         if let Some(repo) = self.selected_repo().cloned() {
-            self.browser = Some(Browser::open(repo));
+            self.stack.push(Page::Browser(Browser::open(repo)));
         }
     }
 
     pub fn close_browser(&mut self) {
-        self.browser = None;
+        if self.browser().is_some() {
+            self.pop();
+        }
     }
 
     /// Requêtes que l'explorateur demande de lancer.
     pub fn take_requests(&mut self) -> Vec<Request> {
-        self.browser
-            .as_mut()
+        self.browser_mut()
             .map(Browser::take_requests)
             .unwrap_or_default()
     }
@@ -160,30 +233,33 @@ impl App {
     /// Page précédente (`-1`) ou suivante (`1`) de la liste de l'explorateur.
     pub fn browser_page(&mut self, pages: isize) {
         let page = self.viewport.get().saturating_sub(1).max(1) as isize;
-        if let Some(b) = self.browser.as_mut() {
+        if let Some(b) = self.browser_mut() {
             b.move_selection(pages * page);
         }
     }
 
     /// Le volet de texte à l'écran : la sortie d'un job, ou le fichier ouvert dans l'explorateur.
     fn active_text_mut(&mut self) -> Option<&mut TextView> {
-        if let Some(b) = self.browser.as_mut() {
-            return match &mut b.mode {
+        match self.stack.last_mut()? {
+            Page::Browser(b) => match &mut b.mode {
                 Mode::File(fv) => Some(&mut fv.text),
-                _ => None,
-            };
+                _ => None, // la liste d'un dossier n'est pas un volet de texte
+            },
+            Page::Logs(v) => Some(&mut **v),
+            Page::Root => None,
         }
-        self.logs.as_deref_mut()
     }
 
     pub fn close_logs(&mut self) {
-        self.logs = None;
+        if self.logs().is_some() {
+            self.pop();
+        }
     }
 
     /// Redemande les logs affichés. Le contenu déjà là reste visible pendant ce temps ;
     /// une erreur précédente repasse en chargement.
     pub fn refetch_logs(&mut self) -> Option<(Repo, Pipeline)> {
-        let v = self.logs.as_mut()?;
+        let v = self.logs_mut()?;
         if matches!(v.state, LogState::Failed(_)) {
             v.state = LogState::Loading;
         }
@@ -192,7 +268,7 @@ impl App {
 
     /// Le job affiché tourne encore : ses logs sont à rafraîchir périodiquement.
     pub fn logs_are_live(&self) -> bool {
-        let Some(v) = &self.logs else { return false };
+        let Some(v) = self.logs() else { return false };
         let current = self
             .pipelines
             .iter()
@@ -366,7 +442,7 @@ impl App {
     pub fn apply(&mut self, msg: Msg) -> bool {
         match msg {
             Msg::Branches { repo, result } => {
-                if let Some(b) = self.browser.as_mut() {
+                if let Some(b) = self.browser_mut() {
                     b.on_branches(&repo, result);
                 }
                 false
@@ -377,7 +453,7 @@ impl App {
                 path,
                 result,
             } => {
-                if let Some(b) = self.browser.as_mut() {
+                if let Some(b) = self.browser_mut() {
                     b.on_dir(&repo, &reference, &path, result);
                 }
                 false
@@ -388,7 +464,7 @@ impl App {
                 path,
                 result,
             } => {
-                if let Some(b) = self.browser.as_mut() {
+                if let Some(b) = self.browser_mut() {
                     b.on_file(&repo, &reference, &path, result);
                 }
                 false
@@ -400,8 +476,7 @@ impl App {
             } => {
                 // Réponse périmée : la vue a été fermée ou ouverte sur un autre job.
                 let current = self
-                    .logs
-                    .as_ref()
+                    .logs()
                     .is_some_and(|v| v.repo == repo && v.pipeline.id == pipeline_id);
                 if !current {
                     return false;
@@ -411,7 +486,7 @@ impl App {
                         let live = self.logs_are_live();
                         let notice = log.notice.clone();
                         let (w, h) = self.view_size();
-                        let Some(v) = self.logs.as_mut() else {
+                        let Some(v) = self.logs_mut() else {
                             return false;
                         };
                         let first_load = matches!(v.state, LogState::Loading);
@@ -432,13 +507,12 @@ impl App {
                     }
                     Err(e) => {
                         let ready = self
-                            .logs
-                            .as_ref()
+                            .logs()
                             .is_some_and(|v| matches!(v.state, LogState::Ready(_)));
                         if ready {
                             // On garde ce qu'on affiche, l'échec va dans le bandeau.
                             self.error = Some(e.to_string());
-                        } else if let Some(v) = self.logs.as_mut() {
+                        } else if let Some(v) = self.logs_mut() {
                             v.state = LogState::Failed(e.to_string());
                         }
                     }
@@ -558,7 +632,7 @@ mod tests {
     }
 
     fn lines(a: &App) -> &Vec<LogLine> {
-        match &a.logs.as_ref().unwrap().state {
+        match &a.logs().unwrap().state {
             LogState::Ready(l) => l,
             s => panic!("pas prêt : {s:?}"),
         }
@@ -570,7 +644,7 @@ mod tests {
         a.focus = Focus::Repos;
         assert!(a.open_logs().is_none());
         assert_eq!(a.focus, Focus::Pipelines);
-        assert!(a.logs.is_none());
+        assert!(a.logs().is_none());
     }
 
     #[test]
@@ -578,11 +652,11 @@ mod tests {
         let mut a = app_on_run(Status::Success);
         let (r, p) = a.open_logs().unwrap();
         assert_eq!((r, p.id), (repo("a"), 7));
-        assert!(matches!(a.logs.as_ref().unwrap().state, LogState::Loading));
+        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
 
         let mut b = app_on_run(Status::Success);
         b.logs_supported = false;
-        assert!(b.open_logs().is_none() && b.logs.is_none() && b.error.is_some());
+        assert!(b.open_logs().is_none() && b.logs().is_none() && b.error.is_some());
 
         let mut c = App::new(); // aucun run sélectionné
         c.logs_supported = true;
@@ -604,7 +678,7 @@ mod tests {
         };
         deliver(&mut a, 7, Ok(log));
         // L'étape réussie est repliée (une seule ligne d'écran) : l'étape en échec est la 2e.
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 1);
+        assert_eq!(a.logs().unwrap().scroll, 1);
         let all = lines(&a);
         assert_eq!(all[0].text, "▸ Set up job (9 lignes)");
         assert_eq!(all[10].kind, LineKind::Step(Status::Failure));
@@ -621,12 +695,12 @@ mod tests {
         let mut done = app_on_run(Status::Success);
         done.open_logs();
         deliver(&mut done, 7, Ok(log(Status::Success)));
-        assert_eq!(done.logs.as_ref().unwrap().scroll, 0);
+        assert_eq!(done.logs().unwrap().scroll, 0);
 
         let mut live = app_on_run(Status::Running);
         live.open_logs();
         deliver(&mut live, 7, Ok(log(Status::Running)));
-        assert_eq!(live.logs.as_ref().unwrap().scroll, 21 - 5);
+        assert_eq!(live.logs().unwrap().scroll, 21 - 5);
     }
 
     #[test]
@@ -639,27 +713,27 @@ mod tests {
         };
         deliver(&mut a, 7, Ok(log(20)));
         deliver(&mut a, 7, Ok(log(30))); // on était en bas : on suit
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 31 - 5);
+        assert_eq!(a.logs().unwrap().scroll, 31 - 5);
         a.text_scroll(-3);
-        let pos = a.logs.as_ref().unwrap().scroll;
+        let pos = a.logs().unwrap().scroll;
         deliver(&mut a, 7, Ok(log(40))); // on a remonté : on reste
-        assert_eq!(a.logs.as_ref().unwrap().scroll, pos);
+        assert_eq!(a.logs().unwrap().scroll, pos);
     }
 
     #[test]
     fn reponse_de_logs_perimee_ignoree() {
         let mut a = app_on_run(Status::Success);
         deliver(&mut a, 7, Ok(JobLog::default())); // vue fermée
-        assert!(a.logs.is_none());
+        assert!(a.logs().is_none());
         a.open_logs();
         deliver(&mut a, 8, Ok(JobLog::default())); // autre run
-        assert!(matches!(a.logs.as_ref().unwrap().state, LogState::Loading));
+        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
         a.apply(Msg::Logs {
             repo: repo("autre"),
             pipeline_id: 7,
             result: Ok(JobLog::default()),
         });
-        assert!(matches!(a.logs.as_ref().unwrap().state, LogState::Loading));
+        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
     }
 
     #[test]
@@ -672,12 +746,12 @@ mod tests {
         };
         deliver(&mut a, 7, Ok(log));
         assert_eq!(
-            a.logs.as_ref().unwrap().notice.as_deref(),
+            a.logs().unwrap().notice.as_deref(),
             Some("version non vérifiée")
         );
         // Un rafraîchissement sans réserve l'efface
         deliver(&mut a, 7, Ok(JobLog::default()));
-        assert_eq!(a.logs.as_ref().unwrap().notice, None);
+        assert_eq!(a.logs().unwrap().notice, None);
     }
 
     fn long_log() -> JobLog {
@@ -699,17 +773,17 @@ mod tests {
         a.open_logs();
         deliver(&mut a, 7, Ok(long_log())); // « ▸ s », 25 x, « fin » : 3 lignes
         a.text_bottom();
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 0, "tout tient sans repli");
+        assert_eq!(a.logs().unwrap().scroll, 0, "tout tient sans repli");
 
         a.text_toggle_wrap();
-        assert!(a.logs.as_ref().unwrap().wrap);
+        assert!(a.logs().unwrap().wrap);
         a.text_bottom(); // 1 + 3 (25 caractères sur 10 colonnes) + 1 = 5 lignes d'écran
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 2);
-        let v = a.logs.as_ref().unwrap();
+        assert_eq!(a.logs().unwrap().scroll, 2);
+        let v = a.logs().unwrap();
         assert_eq!(v.window(10, 3).last().map(|r| r.text), Some("fin"));
 
         a.text_toggle_wrap();
-        assert!(!a.logs.as_ref().unwrap().wrap);
+        assert!(!a.logs().unwrap().wrap);
     }
 
     #[test]
@@ -721,7 +795,7 @@ mod tests {
         deliver(&mut a, 7, Ok(long_log()));
         a.text_toggle_wrap();
         deliver(&mut a, 7, Ok(long_log()));
-        assert!(a.logs.as_ref().unwrap().wrap);
+        assert!(a.logs().unwrap().wrap);
     }
 
     #[test]
@@ -742,7 +816,7 @@ mod tests {
             ..Default::default()
         };
         deliver(&mut a, 7, Ok(more));
-        let v = a.logs.as_ref().unwrap();
+        let v = a.logs().unwrap();
         assert_eq!(v.window(10, 3).last().map(|r| r.text), Some("encore"));
     }
 
@@ -750,15 +824,15 @@ mod tests {
     fn le_choix_de_repli_est_garde_pour_les_vues_suivantes() {
         let mut a = app_on_run(Status::Success);
         a.open_logs();
-        assert!(!a.logs.as_ref().unwrap().wrap, "désactivé par défaut");
+        assert!(!a.logs().unwrap().wrap, "désactivé par défaut");
         a.text_toggle_wrap();
         a.close_logs();
         a.open_logs();
-        assert!(a.logs.as_ref().unwrap().wrap, "conservé à la réouverture");
+        assert!(a.logs().unwrap().wrap, "conservé à la réouverture");
         a.text_toggle_wrap();
         a.close_logs();
         a.open_logs();
-        assert!(!a.logs.as_ref().unwrap().wrap);
+        assert!(!a.logs().unwrap().wrap);
     }
 
     #[test]
@@ -775,37 +849,104 @@ mod tests {
         };
         deliver(&mut a, 7, Ok(log));
         let view = |a: &App| -> Vec<String> {
-            let v = a.logs.as_ref().unwrap();
+            let v = a.logs().unwrap();
             v.window(80, 3).iter().map(|r| r.text.to_owned()).collect()
         };
         // Ouvert sur l'étape en échec (la réussie est repliée au-dessus)
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 1);
+        assert_eq!(a.logs().unwrap().scroll, 1);
         assert_eq!(view(&a), ["▾ Tests", "Tests 1", "Tests 2"]);
         a.text_scroll(-1);
         assert_eq!(view(&a)[0], "▸ Set up job (9 lignes)");
         a.text_toggle_section(); // déplier « Set up job »
         assert_eq!(view(&a)[1], "Set up job 1");
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
+        assert_eq!(a.logs().unwrap().scroll, 0);
         a.text_toggle_section(); // et la replier
         assert_eq!(view(&a)[0], "▸ Set up job (9 lignes)");
         // `a` : tout déplier (une étape est repliée), puis tout replier
         a.text_toggle_all();
-        assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
+        assert_eq!(a.logs().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
         a.text_toggle_all();
-        assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 2);
+        assert_eq!(a.logs().unwrap().window(80, 40).len(), 2);
         // Flèches : on atteint l'autre section sans défiler (tout tient presque à l'écran)
         a.viewport.set(10); // tout est replié (dernier `a`) et tient à l'écran
         a.text_select_section(1);
         a.text_toggle_section();
-        assert_eq!(a.logs.as_ref().unwrap().window(80, 10)[2].text, "Tests 1");
+        assert_eq!(a.logs().unwrap().window(80, 10)[2].text, "Tests 1");
         a.text_select_section(-1);
         a.text_toggle_section();
-        assert_eq!(a.logs.as_ref().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
+        assert_eq!(a.logs().unwrap().window(80, 40).len(), 1 + 9 + 1 + 2);
         // Aucune vue ouverte : sans effet
         let mut none = App::new();
         none.text_toggle_section();
         none.text_toggle_all();
         none.text_select_section(1);
+    }
+
+    // --- pile de pages
+
+    #[test]
+    fn la_pile_commence_a_la_racine_et_ne_se_vide_jamais() {
+        let mut a = app_on_run(Status::Success);
+        assert!(matches!(a.stack[..], [Page::Root]));
+        assert!(a.logs().is_none() && a.browser().is_none());
+        assert!(!a.pop(), "la racine ne se dépile pas");
+        assert_eq!(a.stack.len(), 1);
+        a.open_logs();
+        assert_eq!(a.stack.len(), 2);
+        assert!(a.logs().is_some());
+        assert!(a.pop());
+        assert!(a.logs().is_none() && a.stack.len() == 1);
+    }
+
+    #[test]
+    fn fermer_une_page_ne_depile_que_la_bonne() {
+        let mut a = app_on_run(Status::Success);
+        a.browse_supported = true;
+        a.open_logs();
+        a.close_browser(); // l'explorateur n'est pas la page affichée : rien ne bouge
+        assert!(a.logs().is_some());
+        a.close_logs();
+        assert_eq!(a.stack.len(), 1);
+        a.close_logs(); // déjà à la racine : sans effet
+        a.close_browser();
+        assert_eq!(a.stack.len(), 1);
+        a.open_browser();
+        assert!(a.browser().is_some() && a.logs().is_none());
+        a.close_logs(); // les logs ne sont pas la page affichée
+        assert!(a.browser().is_some());
+        a.close_browser();
+        assert!(matches!(a.stack[..], [Page::Root]));
+    }
+
+    #[test]
+    fn fil_d_ariane_de_la_pile() {
+        let mut a = app_on_run(Status::Success);
+        a.server_name = "maison".into();
+        assert_eq!(a.breadcrumb(), ["maison", "Accueil"]);
+        a.open_logs();
+        assert_eq!(
+            a.breadcrumb(),
+            [
+                "maison",
+                "Accueil",
+                "a/a".to_owned().replace("a/a", "o/a").as_str(),
+                "CI",
+                "ci.yml",
+                "build"
+            ]
+        );
+        a.close_logs();
+        a.browse_supported = true;
+        a.open_browser();
+        assert_eq!(
+            a.breadcrumb(),
+            ["maison", "Accueil", "o/a", "Code", "…"],
+            "branche inconnue pendant le chargement"
+        );
+        let mut anonymous = App::new();
+        assert_eq!(anonymous.breadcrumb(), ["smithy", "Accueil"]);
+        anonymous.server_name = "x".into();
+        assert_eq!(anonymous.breadcrumb()[0], "x");
     }
 
     // --- explorateur de code
@@ -852,7 +993,7 @@ mod tests {
     #[test]
     fn ouverture_de_l_explorateur_et_file_de_requetes() {
         let mut a = explorer();
-        assert!(a.browser.is_some());
+        assert!(a.browser().is_some());
         let reqs = a.take_requests();
         assert_eq!(reqs, [crate::browser::Request::Branches(repo("a"))]);
         assert!(a.take_requests().is_empty(), "la file est vidée");
@@ -862,7 +1003,7 @@ mod tests {
             matches!(&reqs[..], [crate::browser::Request::Dir { reference, .. }] if reference == "main")
         );
         a.close_browser();
-        assert!(a.browser.is_none());
+        assert!(a.browser().is_none());
         assert!(
             a.take_requests().is_empty(),
             "sans explorateur, rien à demander"
@@ -873,12 +1014,12 @@ mod tests {
     fn explorateur_refuse_si_le_backend_ne_sait_pas() {
         let mut a = app_on_run(Status::Success);
         a.open_browser();
-        assert!(a.browser.is_none());
+        assert!(a.browser().is_none());
         assert!(a.error.is_some());
         let mut none = App::new();
         none.browse_supported = true;
         none.open_browser(); // aucun dépôt sélectionné
-        assert!(none.browser.is_none());
+        assert!(none.browser().is_none());
     }
 
     #[test]
@@ -891,7 +1032,7 @@ mod tests {
             path: "a.txt".into(),
             result: Err(Error::Network("x".into())),
         });
-        assert!(a.browser.is_none());
+        assert!(a.browser().is_none());
     }
 
     #[test]
@@ -901,7 +1042,7 @@ mod tests {
         a.viewport.set(3);
         a.viewport_width.set(10);
         {
-            let b = a.browser.as_mut().unwrap();
+            let b = a.browser_mut().unwrap();
             b.move_selection(1); // « a.txt » (dossiers d'abord)
             b.enter();
         }
@@ -915,7 +1056,7 @@ mod tests {
                 truncated: false,
             }),
         });
-        let rows = |a: &App, w: usize| match &a.browser.as_ref().unwrap().mode {
+        let rows = |a: &App, w: usize| match &a.browser().unwrap().mode {
             Mode::File(fv) => fv.text.total_rows(w),
             _ => 0,
         };
@@ -928,12 +1069,12 @@ mod tests {
         );
         assert!(a.logs_wrap, "le choix est partagé avec la vue des logs");
         a.text_bottom();
-        let Mode::File(fv) = &a.browser.as_ref().unwrap().mode else {
+        let Mode::File(fv) = &a.browser().unwrap().mode else {
             panic!()
         };
         assert_eq!(fv.text.scroll, 1);
         // Dans la liste d'un dossier, ces actions sont sans effet
-        a.browser.as_mut().unwrap().up();
+        a.browser_mut().unwrap().up();
         a.text_scroll(5);
         a.text_toggle_wrap();
     }
@@ -945,12 +1086,12 @@ mod tests {
         a.viewport.set(1);
         a.browser_page(1);
         assert_eq!(
-            a.browser.as_ref().unwrap().selected,
+            a.browser().unwrap().selected,
             1,
             "une page = au moins 1 entrée"
         );
         a.browser_page(-1);
-        assert_eq!(a.browser.as_ref().unwrap().selected, 0);
+        assert_eq!(a.browser().unwrap().selected, 0);
         App::new().browser_page(1);
     }
 
@@ -980,16 +1121,16 @@ mod tests {
             }),
         ); // 20 lignes
         a.text_scroll(-1);
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
+        assert_eq!(a.logs().unwrap().scroll, 0);
         a.text_scroll(100);
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 15);
+        assert_eq!(a.logs().unwrap().scroll, 15);
         a.text_top();
         a.text_page(1);
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 4, "une page = hauteur - 1");
+        assert_eq!(a.logs().unwrap().scroll, 4, "une page = hauteur - 1");
         a.text_page(-5);
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 0);
+        assert_eq!(a.logs().unwrap().scroll, 0);
         a.text_bottom();
-        assert_eq!(a.logs.as_ref().unwrap().scroll, 15);
+        assert_eq!(a.logs().unwrap().scroll, 15);
         // Pas de panique sans vue ni contenu
         App::new().text_scroll(3);
     }
@@ -1000,11 +1141,11 @@ mod tests {
         a.open_logs();
         deliver(&mut a, 7, Err(Error::SessionExpired));
         assert!(
-            matches!(a.logs.as_ref().unwrap().state, LogState::Failed(ref m) if m.contains("reconnexion"))
+            matches!(a.logs().unwrap().state, LogState::Failed(ref m) if m.contains("reconnexion"))
         );
         // Une relance repasse en chargement, puis un succès remplace l'erreur
         assert!(a.refetch_logs().is_some());
-        assert!(matches!(a.logs.as_ref().unwrap().state, LogState::Loading));
+        assert!(matches!(a.logs().unwrap().state, LogState::Loading));
         deliver(
             &mut a,
             7,
@@ -1040,7 +1181,7 @@ mod tests {
         let mut a = app_on_run(Status::Success);
         a.open_logs();
         a.close_logs();
-        assert!(a.logs.is_none() && a.refetch_logs().is_none());
+        assert!(a.logs().is_none() && a.refetch_logs().is_none());
     }
 
     fn typed(app: &mut App, text: &str) {
