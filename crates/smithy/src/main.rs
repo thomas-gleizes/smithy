@@ -59,6 +59,37 @@ fn build_provider(
     }
 }
 
+/// Touches des onglets, valables sur toutes les pages. Renvoie `true` si la touche est prise.
+fn tab_key(app: &mut App, code: KeyCode) -> bool {
+    // En pleine saisie du filtre, `t`, `x` et les autres sont du texte.
+    if app.home().is_some_and(|h| h.editing) {
+        return false;
+    }
+    match code {
+        KeyCode::Tab => app.switch_tab(1),
+        KeyCode::BackTab => app.switch_tab(-1),
+        KeyCode::Char('t') => app.open_in_new_tab(),
+        KeyCode::Char('x') => app.close_tab(),
+        KeyCode::Char('T') => app.open_tab_picker(),
+        _ => return false,
+    }
+    true
+}
+
+/// Touches de la liste des onglets (`T`).
+fn tab_picker_key(app: &mut App, code: KeyCode) {
+    match code {
+        KeyCode::Esc | KeyCode::Char('q' | 'T') => app.tab_picker = None,
+        KeyCode::Char('j') | KeyCode::Down | KeyCode::Tab => app.tab_picker_move(1),
+        KeyCode::Char('k') | KeyCode::Up | KeyCode::BackTab => app.tab_picker_move(-1),
+        KeyCode::Home | KeyCode::Char('g') => app.tab_picker_move(isize::MIN / 2),
+        KeyCode::End | KeyCode::Char('G') => app.tab_picker_move(isize::MAX / 2),
+        KeyCode::Enter => app.tab_picker_go(),
+        KeyCode::Char('x') => app.tab_picker_close(),
+        _ => {}
+    }
+}
+
 /// Touches de l'accueil. Pendant une saisie (filtre ou recherche), presque tout est du texte.
 fn home_key(app: &mut App, code: KeyCode) {
     if app.home().is_some_and(|h| h.editing) {
@@ -350,6 +381,10 @@ async fn run(
                             KeyCode::Char(c) if !ctrl => app.login_type(c),
                             _ => {}
                         }
+                    } else if app.tab_picker.is_some() {
+                        tab_picker_key(&mut app, k.code);
+                    } else if tab_key(&mut app, k.code) {
+                        // pris par les onglets
                     } else if app.home().is_some() {
                         home_key(&mut app, k.code);
                     } else if app.repo_page().is_some() {

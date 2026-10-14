@@ -14,7 +14,7 @@ pub const FILE_LIMIT_BYTES: usize = 1024 * 1024;
 /// Lignes affichées au plus (un million de lignes vides tiendrait dans la limite d'octets).
 pub const FILE_LIMIT_LINES: usize = 50_000;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum DirState {
     Loading,
     Ready(Vec<Entry>),
@@ -22,13 +22,13 @@ pub enum DirState {
 }
 
 /// Un fichier ouvert, dans un volet de texte (défilement, retour à la ligne).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FileView {
     pub path: String,
     pub text: TextView,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Mode {
     Dir,
     /// Sélecteur de branche par-dessus le dossier.
@@ -46,7 +46,7 @@ pub enum Screen {
     File,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Browser {
     pub repo: Repo,
     /// Branche affichée ; vide tant que la branche par défaut n'est pas connue.
@@ -118,6 +118,14 @@ impl Browser {
             Mode::Branches { .. } => Screen::Branches,
             Mode::File(_) => Screen::File,
         }
+    }
+
+    /// Copie pour un autre onglet : l'état est le même, mais les requêtes en attente de l'original
+    /// ne sont pas redemandées (leur réponse arrive aux deux onglets).
+    pub fn fork(&self) -> Browser {
+        let mut b = self.clone();
+        b.requests.clear();
+        b
     }
 
     pub fn take_requests(&mut self) -> Vec<Request> {
@@ -955,5 +963,23 @@ mod tests {
         assert_eq!(fmt_size(1_536_000), "1,5 Mio");
         assert_eq!(fmt_size(5 * 1024 * 1024 * 1024), "5,0 Gio");
         assert!(fmt_size(u64::MAX).ends_with("Gio"));
+    }
+
+    #[test]
+    fn copie_pour_un_autre_onglet_sans_les_requetes_en_attente() {
+        let mut original = Browser::open(repo());
+        assert_eq!(original.requests.len(), 1, "« branches » est en attente");
+        let mut copy = original.fork();
+        assert!(copy.take_requests().is_empty());
+        assert_eq!(copy.repo, original.repo);
+        assert_eq!(
+            original.take_requests().len(),
+            1,
+            "l'original garde les siennes"
+        );
+        // Les deux évoluent séparément
+        original.on_branches(&repo(), Ok(vec![branch("main", true)]));
+        assert_eq!(original.reference, "main");
+        assert_eq!(copy.reference, "");
     }
 }

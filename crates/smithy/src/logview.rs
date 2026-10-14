@@ -28,7 +28,7 @@ pub struct LogLine {
     pub step: Option<usize>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LogState {
     Loading,
     Ready(Vec<LogLine>),
@@ -53,7 +53,7 @@ impl Default for TextView {
 }
 
 /// Vue plein écran de la sortie d'un job : un volet de texte et le job qu'il montre.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct LogView {
     pub repo: Repo,
     pub pipeline: Pipeline,
@@ -92,7 +92,7 @@ pub enum Start {
 }
 
 /// Une étape, pliable.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct Section {
     name: String,
     /// Indice de son titre dans les lignes.
@@ -125,7 +125,7 @@ fn default_collapsed(status: Status) -> bool {
 
 /// Début de chaque ligne de log, en lignes d'écran (`starts[i]`), plus le total à la fin.
 /// Mis en cache : le recalcul coûte O(lignes), pas question de le refaire à chaque image.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RowIndex {
     /// 0 quand le repli est désactivé : la largeur n'a alors aucun effet.
     width: usize,
@@ -133,7 +133,7 @@ struct RowIndex {
 }
 
 /// Volet de texte : des lignes, éventuellement groupées en sections, et leur défilement.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TextView {
     pub state: LogState,
     /// Première ligne d'écran affichée.

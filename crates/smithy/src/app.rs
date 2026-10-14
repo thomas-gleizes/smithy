@@ -58,8 +58,27 @@ pub enum Msg {
     LoggedIn(Result<Session, String>),
 }
 
+/// Nombre maximal d'onglets : chacun garde ses pages (un log peut compter 50 000 lignes).
+pub const MAX_TABS: usize = 10;
+
+/// Ce qu'un onglet en arrière-plan signale dans la barre d'onglets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabMarker {
+    /// Un job est en cours dans cet onglet.
+    Running,
+    /// Il s'est terminé avec ce statut.
+    Done(Status),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabTitle {
+    pub text: String,
+    pub marker: Option<TabMarker>,
+    pub active: bool,
+}
+
 /// Une page de la pile de navigation, avec son propre état de vue.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Page {
     /// L'accueil : au fond de la pile, toujours.
     Home(HomeView),
@@ -67,6 +86,16 @@ pub enum Page {
     Runs(RunsView),
     Logs(LogView),
     Browser(Browser),
+}
+
+impl Page {
+    /// Copie pour un autre onglet (voir `Browser::fork`).
+    fn fork(&self) -> Page {
+        match self {
+            Page::Browser(b) => Page::Browser(b.fork()),
+            other => other.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -93,9 +122,15 @@ pub struct App {
     pub login: Option<LoginForm>,
     /// Nom et URL du serveur, pour le titre du formulaire.
     pub server_label: String,
-    /// Pages empilées, comme dans un navigateur : `Échap` dépile et retrouve la page d'avant
-    /// telle qu'on l'a laissée. Jamais vide : le fond est toujours l'accueil.
+    /// Pages empilées de l'onglet affiché, comme dans un navigateur : `Échap` dépile et retrouve
+    /// la page d'avant telle qu'on l'a laissée. Jamais vide : le fond est toujours l'accueil.
     pub stack: Vec<Page>,
+    /// Les piles de tous les onglets, dans l'ordre ; à la place de l'onglet affiché (`active`)
+    /// se trouve une pile vide, la sienne étant `stack`. Changer d'onglet échange les deux.
+    tabs: Vec<Vec<Page>>,
+    active: usize,
+    /// Liste des onglets ouverte par-dessus l'interface (indice de la ligne choisie).
+    pub tab_picker: Option<usize>,
     /// Nom du serveur, pour le fil d'Ariane et l'historique.
     pub server_name: String,
     /// Le backend sait-il fournir des logs ? (`Capabilities::logs`)
@@ -125,6 +160,9 @@ impl App {
             login: None,
             server_label: String::new(),
             stack: vec![Page::Home(home)],
+            tabs: vec![Vec::new()],
+            active: 0,
+            tab_picker: None,
             server_name: String::new(),
             logs_supported: false,
             browse_supported: false,
@@ -236,15 +274,31 @@ impl App {
         }
     }
 
-    /// Les requêtes à lancer : celles de l'application, puis celles de chaque explorateur ouvert.
+    /// Les requêtes à lancer : celles de l'application, puis celles de chaque explorateur ouvert
+    /// (dans n'importe quel onglet).
     pub fn take_requests(&mut self) -> Vec<Request> {
         let mut out = std::mem::take(&mut self.pending);
-        for page in &mut self.stack {
-            if let Page::Browser(b) = page {
-                out.extend(b.take_requests());
+        for stack in self.stacks_mut() {
+            for page in stack {
+                if let Page::Browser(b) = page {
+                    out.extend(b.take_requests());
+                }
             }
         }
         out
+    }
+
+    /// Les piles de tous les onglets (l'affichée d'abord), pour diffuser une réponse réseau :
+    /// chaque page écarte ce qui ne la concerne pas.
+    fn stacks_mut(&mut self) -> impl Iterator<Item = &mut Vec<Page>> {
+        let active = self.active;
+        std::iter::once(&mut self.stack).chain(
+            self.tabs
+                .iter_mut()
+                .enumerate()
+                .filter(move |(i, _)| *i != active)
+                .map(|(_, s)| s),
+        )
     }
 
     // --- accueil
@@ -371,22 +425,12 @@ impl App {
     /// Le job affiché tourne encore : ses logs sont à rafraîchir périodiquement. Son statut
     /// courant est celui de la liste des runs, plus bas dans la pile, qui se rafraîchit aussi.
     pub fn logs_are_live(&self) -> bool {
-        let Some(v) = self.logs() else { return false };
-        let current = self
-            .stack
-            .iter()
-            .find_map(|p| match p {
-                Page::Runs(r) if r.repo == v.repo => {
-                    r.pipelines.iter().find(|x| x.id == v.pipeline.id)
-                }
-                _ => None,
-            })
-            .map_or(v.pipeline.status, |p| p.status);
-        matches!(current, Status::Running | Status::Pending)
+        live_in(&self.stack)
     }
 
     /// Toutes les 5 s : ce qui change tout seul sur la page affichée (les runs d'un dépôt, les
-    /// logs d'un job en cours).
+    /// logs d'un job en cours), et les jobs en cours des autres onglets, pour que leur titre
+    /// signale la fin.
     pub fn tick(&mut self) {
         match self.stack.last() {
             Some(Page::Runs(r)) => {
@@ -403,6 +447,20 @@ impl App {
             }
             _ => {}
         }
+        let mut background = Vec::new();
+        for (i, stack) in self.tabs.iter().enumerate() {
+            if i == self.active || !live_in(stack) {
+                continue;
+            }
+            if let Some(Page::Logs(v)) = stack.last() {
+                background.push(Request::Pipelines(v.repo.clone()));
+                background.push(Request::Logs {
+                    repo: v.repo.clone(),
+                    pipeline: v.pipeline.clone(),
+                });
+            }
+        }
+        self.pending.extend(background);
     }
 
     /// Touche `r` : recharge la page affichée.
@@ -571,28 +629,27 @@ impl App {
         Some((f.username.clone(), std::mem::take(&mut f.password)))
     }
 
-    /// Intègre une réponse du réseau. Les réponses périmées (page dépilée, autre dépôt, autre
-    /// recherche) sont ignorées par les pages concernées.
+    /// Intègre une réponse du réseau. Elle est diffusée à tous les onglets : les pages
+    /// concernées (même dépôt, même chemin, même job) la prennent, les autres l'écartent, ce qui
+    /// règle aussi les réponses périmées (page dépilée, recherche abandonnée, autre dépôt).
     pub fn apply(&mut self, msg: Msg) {
         match msg {
             Msg::Repos { source, result } => {
-                if let Some(Page::Home(h)) = self.stack.first_mut() {
-                    h.apply(&source, result);
+                for stack in self.stacks_mut() {
+                    if let Some(Page::Home(h)) = stack.first_mut() {
+                        h.apply(&source, result.clone());
+                    }
                 }
             }
             Msg::RepoInfo { repo, result } => {
-                for page in &mut self.stack {
+                for page in self.stacks_mut().flatten() {
                     if let Page::Repo(r) = page {
-                        let result = match &result {
-                            Ok(i) => Ok(i.clone()),
-                            Err(e) => Err(Error::Network(e.to_string())),
-                        };
-                        r.apply_info(&repo, result);
+                        r.apply_info(&repo, result.clone());
                     }
                 }
             }
             Msg::Pipelines { repo, result } => {
-                for page in &mut self.stack {
+                for page in self.stacks_mut().flatten() {
                     match page {
                         Page::Repo(r) => r.apply_pipelines(&repo, &result),
                         Page::Runs(r) => r.apply_pipelines(&repo, result.clone()),
@@ -601,8 +658,10 @@ impl App {
                 }
             }
             Msg::Branches { repo, result } => {
-                if let Some(b) = self.browser_mut() {
-                    b.on_branches(&repo, result);
+                for page in self.stacks_mut().flatten() {
+                    if let Page::Browser(b) = page {
+                        b.on_branches(&repo, result.clone());
+                    }
                 }
             }
             Msg::Dir {
@@ -611,8 +670,10 @@ impl App {
                 path,
                 result,
             } => {
-                if let Some(b) = self.browser_mut() {
-                    b.on_dir(&repo, &reference, &path, result);
+                for page in self.stacks_mut().flatten() {
+                    if let Page::Browser(b) = page {
+                        b.on_dir(&repo, &reference, &path, result.clone());
+                    }
                 }
             }
             Msg::File {
@@ -621,8 +682,10 @@ impl App {
                 path,
                 result,
             } => {
-                if let Some(b) = self.browser_mut() {
-                    b.on_file(&repo, &reference, &path, result);
+                for page in self.stacks_mut().flatten() {
+                    if let Page::Browser(b) = page {
+                        b.on_file(&repo, &reference, &path, result.clone());
+                    }
                 }
             }
             Msg::Logs {
@@ -630,48 +693,15 @@ impl App {
                 pipeline_id,
                 result,
             } => {
-                // Réponse périmée : la vue a été fermée ou ouverte sur un autre job.
-                let current = self
-                    .logs()
-                    .is_some_and(|v| v.repo == repo && v.pipeline.id == pipeline_id);
-                if !current {
-                    return;
+                let size = self.view_size();
+                let mut banner = None;
+                for stack in self.stacks_mut() {
+                    if let Some(e) = apply_logs(stack, &repo, pipeline_id, &result, size) {
+                        banner = Some(e);
+                    }
                 }
-                match result {
-                    Ok(log) => {
-                        let live = self.logs_are_live();
-                        let notice = log.notice.clone();
-                        let (w, h) = self.view_size();
-                        let Some(v) = self.logs_mut() else {
-                            return;
-                        };
-                        let first_load = matches!(v.state, LogState::Loading);
-                        let was_at_bottom = v.scroll >= v.max_scroll(w, h);
-                        v.notice = notice;
-                        v.set_log(&log);
-                        let start = first_load.then(|| v.initial_start(live)).flatten();
-                        v.scroll = match start {
-                            // À l'ouverture : l'étape en échec, ou la fin d'un job en cours.
-                            Some(Start::Line(i)) => v.row_of_line(w, i),
-                            Some(Start::End) => usize::MAX,
-                            None if first_load => 0,
-                            // Ensuite : on suit la fin d'un job en cours si on y était.
-                            None if live && was_at_bottom => usize::MAX,
-                            None => v.scroll,
-                        }
-                        .min(v.max_scroll(w, h));
-                    }
-                    Err(e) => {
-                        let ready = self
-                            .logs()
-                            .is_some_and(|v| matches!(v.state, LogState::Ready(_)));
-                        if ready {
-                            // On garde ce qu'on affiche, l'échec va dans le bandeau.
-                            self.error = Some(e.to_string());
-                        } else if let Some(v) = self.logs_mut() {
-                            v.state = LogState::Failed(e.to_string());
-                        }
-                    }
+                if banner.is_some() {
+                    self.error = banner;
                 }
             }
             Msg::LoggedIn(Ok(_)) => {
@@ -684,6 +714,235 @@ impl App {
                     f.field = LoginField::Password;
                     f.error = Some(e);
                 }
+            }
+        }
+    }
+}
+
+// --- onglets
+
+impl App {
+    pub fn tab_count(&self) -> usize {
+        self.tabs.len()
+    }
+
+    fn stack_of(&self, i: usize) -> &[Page] {
+        if i == self.active {
+            &self.stack
+        } else {
+            &self.tabs[i]
+        }
+    }
+
+    /// Les onglets dans l'ordre, avec leur titre et ce qu'ils signalent.
+    pub fn tab_titles(&self) -> Vec<TabTitle> {
+        (0..self.tabs.len())
+            .map(|i| {
+                let stack = self.stack_of(i);
+                TabTitle {
+                    text: stack.last().map_or_else(String::new, page_title),
+                    marker: marker_of(stack),
+                    active: i == self.active,
+                }
+            })
+            .collect()
+    }
+
+    /// Passe à l'onglet `i` (les piles s'échangent : l'affichée reste dans `stack`).
+    pub fn go_tab(&mut self, i: usize) {
+        if i >= self.tabs.len() || i == self.active {
+            return;
+        }
+        let leaving = std::mem::take(&mut self.stack);
+        self.tabs[self.active] = leaving;
+        self.stack = std::mem::take(&mut self.tabs[i]);
+        self.active = i;
+    }
+
+    /// `Tab` (`1`) et `Maj+Tab` (`-1`) : onglet suivant ou précédent, en boucle.
+    pub fn switch_tab(&mut self, delta: isize) {
+        let n = self.tabs.len() as isize;
+        if n > 1 {
+            self.go_tab((self.active as isize + delta).rem_euclid(n) as usize);
+        }
+    }
+
+    /// Touche `t` : ouvre la sélection dans un nouvel onglet. L'onglet courant est dupliqué
+    /// (toutes ses pages, dans l'état où elles sont), puis la sélection y est ouverte ; sans
+    /// sélection à ouvrir (logs, fichier), c'est une simple copie. Le nouvel onglet vient juste
+    /// après l'actuel et devient l'onglet affiché.
+    pub fn open_in_new_tab(&mut self) {
+        if self.tabs.len() >= MAX_TABS {
+            self.error = Some(format!("{MAX_TABS} onglets au maximum : fermez-en un (x)"));
+            return;
+        }
+        let copy: Vec<Page> = self.stack.iter().map(Page::fork).collect();
+        let at = self.active + 1;
+        self.tabs.insert(at, copy);
+        self.go_tab(at);
+        match self.stack.last() {
+            Some(Page::Home(_)) => self.home_enter(),
+            Some(Page::Repo(_)) => self.repo_enter(),
+            Some(Page::Runs(_)) => self.open_logs(),
+            Some(Page::Browser(_)) => {
+                if let Some(b) = self.browser_mut() {
+                    b.enter();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Touche `x` : ferme l'onglet affiché. Le dernier redevient un accueil tout neuf.
+    pub fn close_tab(&mut self) {
+        self.close_tab_at(self.active);
+    }
+
+    pub fn close_tab_at(&mut self, i: usize) {
+        if i >= self.tabs.len() {
+            return;
+        }
+        if self.tabs.len() == 1 {
+            let mut home = HomeView::new();
+            self.pending.extend(home.request_current());
+            self.stack = vec![Page::Home(home)];
+            return;
+        }
+        if i == self.active {
+            // On retombe sur l'onglet voisin (celui de gauche, sinon le premier).
+            let next = if i > 0 { i - 1 } else { 1 };
+            self.go_tab(next);
+        }
+        self.tabs.remove(i);
+        if i < self.active {
+            self.active -= 1;
+        }
+    }
+
+    // --- liste des onglets (touche `T`)
+
+    pub fn open_tab_picker(&mut self) {
+        self.tab_picker = Some(self.active);
+    }
+
+    pub fn tab_picker_move(&mut self, delta: isize) {
+        if let Some(sel) = self.tab_picker.as_mut() {
+            let max = self.tabs.len().saturating_sub(1);
+            *sel = sel.saturating_add_signed(delta).min(max);
+        }
+    }
+
+    /// Entrée dans la liste : va à l'onglet choisi et la ferme.
+    pub fn tab_picker_go(&mut self) {
+        if let Some(i) = self.tab_picker.take() {
+            self.go_tab(i);
+        }
+    }
+
+    /// `x` dans la liste : ferme l'onglet choisi, la liste reste ouverte.
+    pub fn tab_picker_close(&mut self) {
+        if let Some(i) = self.tab_picker {
+            self.close_tab_at(i);
+            self.tab_picker = Some(i.min(self.tabs.len().saturating_sub(1)));
+        }
+    }
+}
+
+/// Titre court d'une page, pour la barre d'onglets.
+fn page_title(page: &Page) -> String {
+    match page {
+        Page::Home(_) => "Accueil".to_owned(),
+        Page::Repo(r) => r.info.repo.name.clone(),
+        Page::Runs(r) => format!("{} · CI", r.repo.name),
+        Page::Logs(v) => format!("{} · {}", v.repo.name, v.pipeline.job),
+        Page::Browser(b) => {
+            let leaf = match &b.mode {
+                crate::browser::Mode::File(fv) => fv.path.as_str(),
+                _ => b.path.as_str(),
+            };
+            let leaf = leaf.rsplit('/').find(|s| !s.is_empty()).unwrap_or("Code");
+            format!("{} · {leaf}", b.repo.name)
+        }
+    }
+}
+
+/// Dans la pile d'un onglet, le job affiché tourne-t-il encore ? Son statut courant est celui
+/// de la liste des runs, plus bas dans la pile, qui se rafraîchit aussi.
+fn live_in(stack: &[Page]) -> bool {
+    let Some(Page::Logs(v)) = stack.last() else {
+        return false;
+    };
+    let current = stack
+        .iter()
+        .find_map(|p| match p {
+            Page::Runs(r) if r.repo == v.repo => r.pipelines.iter().find(|x| x.id == v.pipeline.id),
+            _ => None,
+        })
+        .map_or(v.pipeline.status, |p| p.status);
+    matches!(current, Status::Running | Status::Pending)
+}
+
+/// Un onglet qui montre des logs signale si le job tourne encore, ou comment il a fini.
+fn marker_of(stack: &[Page]) -> Option<TabMarker> {
+    let Some(Page::Logs(v)) = stack.last() else {
+        return None;
+    };
+    if live_in(stack) {
+        return Some(TabMarker::Running);
+    }
+    let status = stack
+        .iter()
+        .find_map(|p| match p {
+            Page::Runs(r) if r.repo == v.repo => r.pipelines.iter().find(|x| x.id == v.pipeline.id),
+            _ => None,
+        })
+        .map_or(v.pipeline.status, |p| p.status);
+    Some(TabMarker::Done(status))
+}
+
+/// Applique une réponse de logs à la page de logs d'une pile, si c'est bien celle de ce job.
+/// Renvoie le message à afficher quand un rafraîchissement échoue (le contenu reste en place).
+fn apply_logs(
+    stack: &mut [Page],
+    repo: &Repo,
+    pipeline_id: u64,
+    result: &Result<JobLog, Error>,
+    (w, h): (usize, usize),
+) -> Option<String> {
+    let live = live_in(stack);
+    let Some(Page::Logs(v)) = stack.last_mut() else {
+        return None;
+    };
+    // Réponse périmée : la vue a été fermée ou ouverte sur un autre job.
+    if v.repo != *repo || v.pipeline.id != pipeline_id {
+        return None;
+    }
+    match result {
+        Ok(log) => {
+            let first_load = matches!(v.state, LogState::Loading);
+            let was_at_bottom = v.scroll >= v.max_scroll(w, h);
+            v.notice = log.notice.clone();
+            v.set_log(log);
+            let start = first_load.then(|| v.initial_start(live)).flatten();
+            v.scroll = match start {
+                // À l'ouverture : l'étape en échec, ou la fin d'un job en cours.
+                Some(Start::Line(i)) => v.row_of_line(w, i),
+                Some(Start::End) => usize::MAX,
+                None if first_load => 0,
+                // Ensuite : on suit la fin d'un job en cours si on y était.
+                None if live && was_at_bottom => usize::MAX,
+                None => v.scroll,
+            }
+            .min(v.max_scroll(w, h));
+            None
+        }
+        Err(e) => {
+            if matches!(v.state, LogState::Ready(_)) {
+                // On garde ce qu'on affiche, l'échec va dans le bandeau.
+                Some(e.to_string())
+            } else {
+                v.state = LogState::Failed(e.to_string());
+                None
             }
         }
     }
@@ -1670,5 +1929,405 @@ mod tests {
             a.take_requests().is_empty(),
             "sans explorateur, rien à demander"
         );
+    }
+
+    // --- onglets
+
+    fn titles(a: &App) -> Vec<String> {
+        a.tab_titles().into_iter().map(|t| t.text).collect()
+    }
+
+    fn active_index(a: &App) -> usize {
+        a.tab_titles().iter().position(|t| t.active).unwrap()
+    }
+
+    /// Accueil avec deux dépôts (`a`, `b`) chargés, un seul onglet.
+    fn home_with_repos() -> App {
+        let mut a = fresh();
+        a.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("a"), info("b")]),
+        });
+        a
+    }
+
+    #[test]
+    fn un_seul_onglet_au_depart() {
+        let a = App::new();
+        assert_eq!(a.tab_count(), 1);
+        assert_eq!(
+            a.tab_titles(),
+            [TabTitle {
+                text: "Accueil".into(),
+                marker: None,
+                active: true
+            }]
+        );
+        let mut b = App::new();
+        b.switch_tab(1); // sans autre onglet : sans effet
+        b.switch_tab(-1);
+        b.go_tab(3);
+        assert_eq!((b.tab_count(), active_index(&b)), (1, 0));
+    }
+
+    #[test]
+    fn t_sur_l_accueil_ouvre_le_depot_dans_un_nouvel_onglet() {
+        let mut a = home_with_repos();
+        a.list_move(1); // « b »
+        a.open_in_new_tab();
+        assert_eq!(a.tab_count(), 2);
+        assert_eq!(
+            (titles(&a), active_index(&a)),
+            (vec!["Accueil".to_owned(), "b".to_owned()], 1)
+        );
+        assert!(
+            a.repo_page().is_some(),
+            "le nouvel onglet est affiché, sur la page du dépôt"
+        );
+        assert_eq!(a.stack.len(), 2);
+        assert_eq!(
+            a.take_requests(),
+            [Request::RepoInfo(repo("b")), Request::Pipelines(repo("b"))]
+        );
+        // L'onglet d'origine est resté sur l'accueil, sélection comprise
+        a.switch_tab(-1);
+        assert!(a.home().is_some() && a.stack.len() == 1);
+        assert_eq!(a.home().unwrap().selected(2), 1);
+        // L'ouverture est aussi dans l'historique
+        assert_eq!(a.recents[0].name, "b");
+    }
+
+    #[test]
+    fn les_onglets_sont_independants() {
+        let mut a = home_with_repos();
+        a.open_in_new_tab(); // onglet 2 : dépôt « a »
+        a.repo_enter(); // … puis la CI
+        a.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(vec![pipe(7)]),
+        });
+        a.open_logs();
+        assert_eq!(a.stack.len(), 4);
+        // Onglet 1 : toujours l'accueil, on peut y naviguer sans toucher à l'autre
+        a.switch_tab(-1);
+        assert_eq!(a.stack.len(), 1);
+        a.home_switch(1); // « Suivis »
+        a.switch_tab(1);
+        assert_eq!(a.stack.len(), 4, "l'autre onglet n'a pas bougé");
+        assert!(a.logs().is_some());
+        a.close_logs();
+        a.pop();
+        assert_eq!(a.stack.len(), 2);
+        a.switch_tab(1); // boucle : retour à l'onglet 1
+        assert_eq!(a.home().unwrap().section, crate::pages::Section::Watched);
+        assert_eq!(a.stack.len(), 1);
+    }
+
+    #[test]
+    fn t_selon_la_page() {
+        // Page du dépôt : la rubrique choisie s'ouvre dans le nouvel onglet
+        let mut a = app_on_repo();
+        a.open_in_new_tab();
+        assert!(a.runs().is_some(), "« CI » est sélectionnée");
+        a.switch_tab(-1);
+        assert!(
+            a.repo_page().is_some(),
+            "l'original reste sur la page du dépôt"
+        );
+        a.list_move(1);
+        a.open_in_new_tab();
+        assert!(a.browser().is_some(), "« Code » dans un autre onglet");
+        // Runs : le run sélectionné ouvre ses logs dans un nouvel onglet
+        let mut r = app_on_run(Status::Success);
+        r.open_in_new_tab();
+        assert!(r.logs().is_some());
+        r.switch_tab(-1);
+        assert!(r.runs().is_some() && r.logs().is_none());
+        // Logs : simple copie de l'onglet
+        let mut l = app_on_run(Status::Success);
+        l.open_logs();
+        let depth = l.stack.len();
+        l.open_in_new_tab();
+        assert_eq!((l.tab_count(), l.stack.len()), (2, depth));
+        assert!(l.logs().is_some());
+    }
+
+    #[test]
+    fn t_dans_l_explorateur_ouvre_l_entree_dans_un_nouvel_onglet() {
+        let mut a = explorer();
+        feed(&mut a);
+        a.list_move(0);
+        a.open_in_new_tab(); // la 1re entrée est un dossier : « src »
+        assert_eq!(a.browser().unwrap().path, "src");
+        a.switch_tab(-1);
+        assert_eq!(
+            a.browser().unwrap().path,
+            "",
+            "l'original est resté à la racine"
+        );
+        // Un explorateur copié ne redemande pas ce qui était déjà en attente
+        let mut b = explorer(); // requête « branches » encore en file
+        b.open_in_new_tab();
+        let branches = b
+            .take_requests()
+            .into_iter()
+            .filter(|r| matches!(r, Request::Branches(_)))
+            .count();
+        assert_eq!(branches, 1, "une seule demande pour les deux onglets");
+    }
+
+    #[test]
+    fn limite_d_onglets() {
+        let mut a = home_with_repos();
+        for _ in 0..MAX_TABS + 3 {
+            a.open_in_new_tab();
+            if a.tab_count() < MAX_TABS {
+                a.pop();
+            }
+        }
+        assert_eq!(a.tab_count(), MAX_TABS);
+        assert!(a.error.as_deref().unwrap().contains("onglets au maximum"));
+    }
+
+    #[test]
+    fn changer_d_onglet_en_boucle() {
+        let mut a = home_with_repos();
+        a.open_in_new_tab();
+        a.pop();
+        a.open_in_new_tab();
+        a.pop();
+        assert_eq!(a.tab_count(), 3);
+        assert_eq!(active_index(&a), 2);
+        a.switch_tab(1);
+        assert_eq!(active_index(&a), 0, "après le dernier, le premier");
+        a.switch_tab(-1);
+        assert_eq!(active_index(&a), 2, "avant le premier, le dernier");
+        a.go_tab(1);
+        assert_eq!(active_index(&a), 1);
+        a.go_tab(1); // déjà là
+        a.go_tab(9); // inexistant
+        assert_eq!(active_index(&a), 1);
+    }
+
+    #[test]
+    fn fermer_des_onglets() {
+        let mut a = home_with_repos();
+        a.list_move(1);
+        a.open_in_new_tab(); // « b »
+        a.switch_tab(-1);
+        a.list_move(-1);
+        a.open_in_new_tab(); // « a » juste après l'accueil : [Accueil, a, b]
+        assert_eq!(titles(&a), ["Accueil", "a", "b"]);
+        assert_eq!(active_index(&a), 1);
+        // Fermer l'onglet affiché : on retombe à gauche
+        a.close_tab();
+        assert_eq!(
+            (titles(&a), active_index(&a)),
+            (vec!["Accueil".to_owned(), "b".to_owned()], 0)
+        );
+        // Fermer un onglet à gauche de l'affiché décale l'indice sans changer d'onglet
+        a.go_tab(1);
+        a.close_tab_at(0);
+        assert_eq!((titles(&a), active_index(&a)), (vec!["b".to_owned()], 0));
+        assert!(a.repo_page().is_some());
+        // Le dernier onglet redevient un accueil tout neuf
+        a.take_requests();
+        a.close_tab();
+        assert_eq!((a.tab_count(), titles(&a)), (1, vec!["Accueil".to_owned()]));
+        assert!(a.home().is_some());
+        assert_eq!(a.take_requests(), [Request::Repos(RepoSource::Mine)]);
+        a.close_tab_at(5); // inexistant : sans effet
+    }
+
+    #[test]
+    fn les_reponses_atteignent_tous_les_onglets() {
+        let mut a = app_on_run(Status::Success);
+        a.open_in_new_tab(); // onglet 2 : les logs du run 7
+        a.take_requests();
+        a.switch_tab(-1); // retour sur l'onglet 1 (liste des runs)
+        // Une liste arrive pendant qu'on est sur l'onglet 1 : l'onglet 2 la reçoit aussi
+        let mut done = pipe(7);
+        done.status = Status::Failure;
+        a.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(vec![done, pipe(8)]),
+        });
+        assert_eq!(a.runs().unwrap().pipelines.len(), 2);
+        a.switch_tab(1);
+        a.pop(); // sous les logs de l'onglet 2 : sa propre liste des runs
+        assert_eq!(
+            a.runs().unwrap().pipelines.len(),
+            2,
+            "l'onglet en arrière-plan a été mis à jour"
+        );
+        // Des logs arrivent pour l'onglet 2 alors qu'on est ailleurs
+        let mut b = app_on_run(Status::Success);
+        b.open_logs();
+        b.open_in_new_tab(); // copie de l'onglet des logs
+        b.switch_tab(-1);
+        deliver(
+            &mut b,
+            7,
+            Ok(JobLog {
+                steps: vec![step("s", Status::Failure, 2)],
+                ..Default::default()
+            }),
+        );
+        b.switch_tab(1);
+        assert!(
+            matches!(b.logs().unwrap().state, LogState::Ready(_)),
+            "la copie reçoit aussi les logs"
+        );
+        // Une recherche d'accueil aboutit dans l'onglet où elle a été lancée, même en arrière-plan
+        let mut c = fresh();
+        c.home_switch(3);
+        c.home_mut().unwrap().start_edit();
+        "tree"
+            .chars()
+            .for_each(|ch| c.home_mut().unwrap().type_char(ch));
+        c.home_commit();
+        c.apply(Msg::Repos {
+            source: RepoSource::Mine,
+            result: Ok(vec![info("zz")]),
+        });
+        c.open_in_new_tab(); // copie de l'accueil, sans sélection à ouvrir
+        c.apply(Msg::Repos {
+            source: RepoSource::Search("tree".into()),
+            result: Ok(vec![info("tree")]),
+        });
+        c.switch_tab(-1);
+        assert_eq!(c.home_rows().len(), 1);
+    }
+
+    #[test]
+    fn marqueurs_des_onglets() {
+        let mut a = app_on_run(Status::Running);
+        assert_eq!(
+            a.tab_titles()[0].marker,
+            None,
+            "pas de marqueur hors des logs"
+        );
+        a.open_logs();
+        assert_eq!(a.tab_titles()[0].marker, Some(TabMarker::Running));
+        a.open_in_new_tab(); // copie de l'onglet des logs
+        a.switch_tab(-1);
+        a.pop(); // l'onglet 1 quitte les logs
+        assert_eq!(a.tab_titles()[0].marker, None);
+        assert_eq!(a.tab_titles()[1].marker, Some(TabMarker::Running));
+        // Le job se termine : la liste des runs, sous les logs de l'onglet 2, le dit
+        let mut failed = pipe(7);
+        failed.status = Status::Failure;
+        a.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(vec![failed]),
+        });
+        assert_eq!(
+            a.tab_titles()[1].marker,
+            Some(TabMarker::Done(Status::Failure))
+        );
+        assert_eq!(titles(&a), ["a · CI", "a · build"]);
+    }
+
+    #[test]
+    fn tick_des_onglets_en_arriere_plan() {
+        let mut a = app_on_run(Status::Running);
+        a.open_logs();
+        a.open_in_new_tab(); // onglet 2 = copie ; on reste dessus
+        a.take_requests();
+        a.pop(); // l'onglet affiché quitte les logs : seul l'onglet 1 suit encore le job
+        a.take_requests();
+        a.tick();
+        let reqs = a.take_requests();
+        assert!(
+            reqs.iter().any(|r| matches!(r, Request::Logs { .. })),
+            "job en cours d'un autre onglet : ses logs sont suivis"
+        );
+        assert!(reqs.contains(&Request::Pipelines(repo("a"))));
+        // Une fois le job fini, plus rien à suivre en arrière-plan
+        let mut done = pipe(7);
+        done.status = Status::Success;
+        a.apply(Msg::Pipelines {
+            repo: repo("a"),
+            result: Ok(vec![done]),
+        });
+        a.tick();
+        assert!(
+            !a.take_requests()
+                .iter()
+                .any(|r| matches!(r, Request::Logs { .. }))
+        );
+    }
+
+    #[test]
+    fn titres_des_pages() {
+        let mut a = app_on_run(Status::Success);
+        assert_eq!(titles(&a), ["a · CI"]);
+        a.pop();
+        assert_eq!(titles(&a), ["a"]);
+        a.list_move(1);
+        a.repo_enter();
+        assert_eq!(titles(&a), ["a · Code"]);
+        feed(&mut a);
+        a.browser_mut().unwrap().enter(); // dossier « src »
+        a.apply(Msg::Dir {
+            repo: repo("a"),
+            reference: "main".into(),
+            path: "src".into(),
+            result: Ok(vec![]),
+        });
+        assert_eq!(titles(&a), ["a · src"]);
+    }
+
+    #[test]
+    fn liste_des_onglets() {
+        let mut a = home_with_repos();
+        a.open_in_new_tab();
+        a.pop();
+        a.open_in_new_tab();
+        a.pop();
+        a.go_tab(0);
+        assert_eq!(a.tab_picker, None);
+        a.open_tab_picker();
+        assert_eq!(a.tab_picker, Some(0), "ouverte sur l'onglet affiché");
+        a.tab_picker_move(2);
+        a.tab_picker_move(5);
+        assert_eq!(a.tab_picker, Some(2));
+        a.tab_picker_go();
+        assert_eq!((a.tab_picker, active_index(&a)), (None, 2));
+        // Fermer depuis la liste : elle reste ouverte
+        a.open_tab_picker();
+        a.tab_picker_move(-1);
+        a.tab_picker_close();
+        assert_eq!(a.tab_count(), 2);
+        assert_eq!(a.tab_picker, Some(1));
+        a.tab_picker_close();
+        assert_eq!(a.tab_picker, Some(0));
+        a.tab_picker_close(); // le dernier redevient un accueil
+        assert_eq!(a.tab_count(), 1);
+        a.tab_picker_move(1);
+        a.tab_picker_go();
+        assert!(a.tab_picker.is_none());
+    }
+
+    #[test]
+    fn requetes_d_un_explorateur_d_un_autre_onglet() {
+        let mut a = app_on_repo();
+        a.list_move(1);
+        a.repo_enter(); // explorateur ouvert : « branches » en attente, non prise
+        a.open_in_new_tab(); // copie affichée ; l'explorateur d'origine est dans l'onglet 1, inactif
+        let reqs = a.take_requests();
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| matches!(r, Request::Branches(_)))
+                .count(),
+            1,
+            "la demande de l'onglet en arrière-plan part, une seule fois (la copie n'en redemande pas)"
+        );
+        // Dépiler la page d'un explorateur abandonne aussi sa requête non lancée
+        let mut b = app_on_repo();
+        b.list_move(1);
+        b.repo_enter();
+        b.pop();
+        assert!(b.take_requests().is_empty());
     }
 }

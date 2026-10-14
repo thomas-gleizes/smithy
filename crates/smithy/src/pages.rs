@@ -54,7 +54,7 @@ impl Section {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Load {
     /// Pas encore demandée (ou, pour « Explorer », aucune recherche).
     Idle,
@@ -63,7 +63,7 @@ pub enum Load {
     Failed(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SectionData {
     pub load: Load,
     pub selected: usize,
@@ -80,7 +80,7 @@ pub struct HomeRow {
     pub opened: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HomeView {
     pub section: Section,
     data: [SectionData; 5],
@@ -305,7 +305,7 @@ impl Default for HomeView {
 // ---------------------------------------------------------------------------------------------
 // Page d'un dépôt
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum LastRun {
     Loading,
     /// Aucun run.
@@ -314,7 +314,7 @@ pub enum LastRun {
     Failed(String),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RepoView {
     pub info: RepoInfo,
     pub last_run: LastRun,
@@ -386,7 +386,7 @@ impl RepoView {
 // ---------------------------------------------------------------------------------------------
 // Runs de la CI
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RunsView {
     pub repo: Repo,
     pub pipelines: Vec<Pipeline>,

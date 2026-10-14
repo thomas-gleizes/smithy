@@ -10,7 +10,7 @@ use ratatui::{
 use smithy_core::{EntryKind, RepoInfo, Status};
 
 use crate::{
-    app::{App, LoginField, LoginForm},
+    app::{App, LoginField, LoginForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
     logview::{LineKind, LogState, LogView, TextView},
     pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
@@ -30,8 +30,19 @@ pub fn status_style(s: Status) -> (&'static str, Color) {
 }
 
 pub fn draw(f: &mut Frame, app: &App) {
-    // Une ligne en haut pour dire où l'on est, le reste pour la page.
-    let [top, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).areas(f.area());
+    // En haut : la barre d'onglets (s'il y en a plusieurs), puis une ligne pour dire où l'on est ;
+    // le reste est pour la page.
+    let tabs = app.tab_count() > 1;
+    let layout = Layout::vertical([
+        Constraint::Length(u16::from(tabs)),
+        Constraint::Length(1),
+        Constraint::Min(0),
+    ])
+    .split(f.area());
+    if tabs {
+        draw_tab_bar(f, app, layout[0]);
+    }
+    let (top, body) = (layout[1], layout[2]);
     draw_breadcrumb(f, app, top);
     if let Some(view) = app.logs() {
         draw_logs(f, app, view, body);
@@ -44,9 +55,186 @@ pub fn draw(f: &mut Frame, app: &App) {
     } else if let Some(h) = app.home() {
         draw_home(f, app, h, body);
     }
+    if let Some(selected) = app.tab_picker {
+        draw_tab_picker(f, app, selected);
+    }
     if let Some(form) = &app.login {
         draw_login(f, form, &app.server_label);
     }
+}
+
+/// Une case de la barre d'onglets.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TabCell {
+    label: String,
+    marker: Option<TabMarker>,
+    active: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct TabBar {
+    cells: Vec<TabCell>,
+    more_left: bool,
+    more_right: bool,
+}
+
+/// Largeur maximale du titre d'un onglet.
+const TAB_TITLE_MAX: usize = 20;
+
+fn truncate_end(s: &str, max: usize) -> String {
+    if text_width(s) <= max {
+        return s.to_owned();
+    }
+    let mut out = String::new();
+    let mut used = 1; // la place du « … »
+    for c in s.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > max {
+            break;
+        }
+        used += w;
+        out.push(c);
+    }
+    out.push('…');
+    out
+}
+
+fn marker_symbol(m: TabMarker) -> (&'static str, Color) {
+    match m {
+        TabMarker::Running => ("●", Color::Yellow),
+        TabMarker::Done(Status::Success) => ("✔", Color::Green),
+        TabMarker::Done(Status::Failure) => ("✘", Color::Red),
+        TabMarker::Done(_) => ("⊘", Color::DarkGray),
+    }
+}
+
+fn cell_width(c: &TabCell) -> usize {
+    // espace, marqueur éventuel + espace, titre, espace
+    1 + if c.marker.is_some() { 2 } else { 0 } + text_width(&c.label) + 1
+}
+
+/// Les onglets qui tiennent dans `width` colonnes, autour de l'onglet affiché ; ce qui est
+/// hors de la barre est signalé par `‹` / `›`.
+fn fit_tabs(titles: &[TabTitle], width: usize) -> TabBar {
+    let cells: Vec<TabCell> = titles
+        .iter()
+        .map(|t| TabCell {
+            label: truncate_end(&t.text, TAB_TITLE_MAX),
+            marker: t.marker,
+            active: t.active,
+        })
+        .collect();
+    let Some(active) = cells.iter().position(|c| c.active) else {
+        return TabBar {
+            cells: Vec::new(),
+            more_left: false,
+            more_right: false,
+        };
+    };
+    // On grandit autour de l'onglet affiché, un côté puis l'autre, tant que ça tient
+    // (2 colonnes en réserve pour les indicateurs, 1 par séparateur).
+    let budget = width.saturating_sub(4);
+    let (mut lo, mut hi) = (active, active);
+    let mut used = cell_width(&cells[active]);
+    loop {
+        let mut grew = false;
+        if hi + 1 < cells.len() {
+            let w = 1 + cell_width(&cells[hi + 1]);
+            if used + w <= budget {
+                used += w;
+                hi += 1;
+                grew = true;
+            }
+        }
+        if lo > 0 {
+            let w = 1 + cell_width(&cells[lo - 1]);
+            if used + w <= budget {
+                used += w;
+                lo -= 1;
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    TabBar {
+        more_left: lo > 0,
+        more_right: hi + 1 < cells.len(),
+        cells: cells[lo..=hi].to_vec(),
+    }
+}
+
+fn draw_tab_bar(f: &mut Frame, app: &App, area: Rect) {
+    let bar = fit_tabs(&app.tab_titles(), area.width as usize);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut spans: Vec<Span> = Vec::new();
+    if bar.more_left {
+        spans.push(Span::styled("‹ ", dim));
+    }
+    for (i, c) in bar.cells.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled("│", dim));
+        }
+        let style = if c.active {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            dim
+        };
+        spans.push(Span::styled(" ", style));
+        if let Some(m) = c.marker {
+            let (sym, color) = marker_symbol(m);
+            let marker_style = if c.active {
+                style.fg(color)
+            } else {
+                Style::new().fg(color)
+            };
+            spans.push(Span::styled(format!("{sym} "), marker_style));
+        }
+        spans.push(Span::styled(format!("{} ", c.label), style));
+    }
+    if bar.more_right {
+        spans.push(Span::styled(" ›", dim));
+    }
+    f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+fn draw_tab_picker(f: &mut Frame, app: &App, selected: usize) {
+    let titles = app.tab_titles();
+    let items: Vec<ListItem> = titles
+        .iter()
+        .enumerate()
+        .map(|(i, t)| {
+            let mut spans = vec![Span::raw(format!("{:>2}. ", i + 1))];
+            if let Some(m) = t.marker {
+                let (sym, color) = marker_symbol(m);
+                spans.push(Span::styled(format!("{sym} "), Style::new().fg(color)));
+            }
+            spans.push(Span::raw(t.text.clone()));
+            if t.active {
+                spans.push(Span::styled(
+                    "  (affiché)",
+                    Style::new().fg(Color::DarkGray),
+                ));
+            }
+            ListItem::new(Line::from(spans))
+        })
+        .collect();
+    let height = (items.len() as u16).clamp(1, 12) + 2;
+    let area = centered(f.area(), 50, height);
+    f.render_widget(Clear, area);
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Onglets ")
+                .title_bottom(Line::from(" ↵ aller · x fermer · Échap ").right_aligned())
+                .border_style(Style::new().fg(Color::Yellow)),
+        )
+        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+    let mut ls = ListState::default();
+    ls.select(Some(selected));
+    f.render_stateful_widget(list, area, &mut ls);
 }
 
 const CRUMB_SEP: &str = " › ";
@@ -245,7 +433,7 @@ fn home_help(width: usize, section: Section, editing: bool) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ naviguer · ←/→ section · ↵ ouvrir · / filtrer · r actualiser · q quitter",
+            "j/k ↑/↓ naviguer · ←/→ section · ↵ ouvrir · t onglet · / filtrer · r actualiser · q quitter",
             "j/k · ←/→ section · ↵ ouvrir · / filtrer · q quitter",
             "←/→ · ↵ · / · q quitter",
             "q",
@@ -257,7 +445,7 @@ fn repo_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ choisir · ↵/→ ouvrir · ←/Échap retour · r actualiser · q retour",
+            "j/k ↑/↓ choisir · ↵/→ ouvrir · t onglet · ←/Échap retour · r actualiser · q retour",
             "j/k · ↵ ouvrir · ← retour · r actualiser",
             "↵ · ← · r",
             "Échap",
@@ -269,7 +457,7 @@ fn runs_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ naviguer · ↵/→ logs · ←/Échap retour · r actualiser · q retour",
+            "j/k ↑/↓ naviguer · ↵/→ logs · t onglet · ←/Échap retour · r actualiser · q retour",
             "j/k · ↵ logs · ← retour · r actualiser",
             "↵ · ← · r",
             "Échap",
@@ -294,7 +482,7 @@ fn dir_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ naviguer · →/↵ ouvrir · ←/⌫ remonter · B branche · r actualiser · Esc retour",
+            "j/k ↑/↓ naviguer · →/↵ ouvrir · ←/⌫ remonter · B branche · t onglet · r actualiser · Esc retour",
             "j/k · →/↵ ouvrir · ← remonter · B branche · Esc retour",
             "→ ouvrir · ← haut · B branche · Esc",
             "→ · ← · B · Esc",
@@ -1647,6 +1835,179 @@ mod tests {
             }
         }
         assert!(repo_help(120).contains("↵/→ ouvrir") && runs_help(120).contains("logs"));
+    }
+
+    // --- onglets
+
+    fn tt(text: &str, marker: Option<TabMarker>, active: bool) -> TabTitle {
+        TabTitle {
+            text: text.into(),
+            marker,
+            active,
+        }
+    }
+
+    fn many_titles(n: usize, active: usize) -> Vec<TabTitle> {
+        (0..n)
+            .map(|i| tt(&format!("onglet-{i}"), None, i == active))
+            .collect()
+    }
+
+    fn bar_width(bar: &TabBar) -> usize {
+        let cells: usize =
+            bar.cells.iter().map(cell_width).sum::<usize>() + bar.cells.len().saturating_sub(1);
+        cells + 2 * usize::from(bar.more_left) + 2 * usize::from(bar.more_right)
+    }
+
+    #[test]
+    fn titres_d_onglets_tronques() {
+        assert_eq!(truncate_end("court", 20), "court");
+        assert_eq!(
+            truncate_end("exactement-vingt-cars", 21),
+            "exactement-vingt-cars"
+        );
+        let t = truncate_end("un-titre-beaucoup-trop-long-pour-la-barre", 20);
+        assert!(t.ends_with('…') && text_width(&t) <= 20, "{t}");
+        let cjk = truncate_end("日本語日本語日本語日本語日本語", 9);
+        assert!(
+            text_width(&cjk) <= 9 && cjk.ends_with('…'),
+            "{cjk} = {} colonnes",
+            text_width(&cjk)
+        );
+        assert_eq!(truncate_end("", 5), "");
+    }
+
+    #[test]
+    fn barre_d_onglets_qui_tient() {
+        let bar = fit_tabs(&many_titles(3, 1), 80);
+        assert_eq!(bar.cells.len(), 3);
+        assert!(!bar.more_left && !bar.more_right);
+        assert!(bar.cells[1].active && !bar.cells[0].active);
+    }
+
+    #[test]
+    fn barre_d_onglets_autour_de_l_onglet_affiche() {
+        // 10 onglets de 10 colonnes ne tiennent pas dans 45 : on garde ceux qui entourent l'actif.
+        for active in [0usize, 4, 9] {
+            let bar = fit_tabs(&many_titles(10, active), 45);
+            assert!(
+                bar.cells.iter().any(|c| c.active),
+                "l'onglet affiché est toujours visible (actif {active})"
+            );
+            assert!(
+                bar_width(&bar) <= 45,
+                "actif {active} : {} colonnes",
+                bar_width(&bar)
+            );
+            assert!(bar.cells.len() >= 3 && bar.cells.len() < 10);
+            assert_eq!(
+                bar.more_left,
+                active > 0 && bar.cells[0].label != "onglet-0"
+            );
+            assert_eq!(
+                bar.more_right,
+                active < 9 && bar.cells.last().unwrap().label != "onglet-9"
+            );
+        }
+        let first = fit_tabs(&many_titles(10, 0), 45);
+        assert!(!first.more_left && first.more_right);
+        let last = fit_tabs(&many_titles(10, 9), 45);
+        assert!(last.more_left && !last.more_right);
+        let middle = fit_tabs(&many_titles(10, 5), 45);
+        assert!(middle.more_left && middle.more_right);
+    }
+
+    #[test]
+    fn barre_d_onglets_cas_limites() {
+        // Largeur minuscule : au moins l'onglet affiché
+        let bar = fit_tabs(&many_titles(5, 2), 3);
+        assert_eq!(bar.cells.len(), 1);
+        assert!(bar.cells[0].active);
+        // Les marqueurs prennent 2 colonnes de plus
+        let with = fit_tabs(&[tt("a", Some(TabMarker::Running), true)], 80);
+        let without = fit_tabs(&[tt("a", None, true)], 80);
+        assert_eq!(
+            cell_width(&with.cells[0]),
+            cell_width(&without.cells[0]) + 2
+        );
+        // Aucun onglet affiché (ne devrait pas arriver) ou liste vide : rien, sans panique
+        assert!(fit_tabs(&[], 80).cells.is_empty());
+        assert!(fit_tabs(&[tt("x", None, false)], 80).cells.is_empty());
+    }
+
+    #[test]
+    fn barre_d_onglets_a_l_ecran() {
+        // Un seul onglet : pas de barre, le fil d'Ariane est en première ligne
+        let app = home_app(vec![info_full("a")]);
+        let one = render(&app, 90, 8);
+        assert!(one.starts_with("maison › Accueil"), "{one}");
+        // Deux onglets : la barre en haut, le fil d'Ariane dessous
+        let mut app = home_app(vec![info_full("a")]);
+        app.open_in_new_tab();
+        let two = render(&app, 90, 8);
+        assert!(two.trim_start().starts_with("Accueil"), "{two}");
+        assert!(
+            two.contains(" a ") && two.contains("maison › Accueil › smithy/a"),
+            "{two}"
+        );
+        assert!(two.contains('│'), "séparateur entre onglets");
+        // Des marqueurs d'état dans les onglets
+        let mut app = app_on_runs(vec![pipe(1, "ok.yml", Status::Running)]);
+        app.open_logs();
+        app.open_in_new_tab();
+        let t = render(&app, 100, 10);
+        assert!(t.contains("● "), "job en cours : {t}");
+        app.apply(Msg::Pipelines {
+            repo: Repo {
+                owner: "smithy".into(),
+                name: "demo".into(),
+            },
+            result: Ok(vec![pipe(1, "ok.yml", Status::Failure)]),
+        });
+        assert!(render(&app, 100, 10).contains("✘ "), "job terminé en échec");
+        // Très petits terminaux
+        for (w, h) in [(1, 1), (6, 3), (20, 5)] {
+            render(&app, w, h);
+        }
+    }
+
+    #[test]
+    fn la_barre_marque_l_onglet_affiche_en_video_inverse() {
+        let mut app = home_app(vec![info_full("a")]);
+        app.open_in_new_tab();
+        let mut term = Terminal::new(TestBackend::new(60, 6)).unwrap();
+        term.draw(|f| draw(f, &app)).unwrap();
+        let buf = term.backend().buffer();
+        let reversed: String = (0..60)
+            .map(|x| &buf[(x, 0)])
+            .filter(|c| c.modifier.contains(Modifier::REVERSED))
+            .map(|c| c.symbol())
+            .collect();
+        assert_eq!(
+            reversed.trim(),
+            "a",
+            "seul l'onglet affiché est inversé : {reversed:?}"
+        );
+    }
+
+    #[test]
+    fn liste_des_onglets_a_l_ecran() {
+        let mut app = app_on_runs(vec![pipe(1, "ok.yml", Status::Running)]);
+        app.open_logs();
+        app.open_in_new_tab();
+        app.open_tab_picker();
+        let t = render(&app, 100, 14);
+        for needle in ["Onglets", "1. ", "2. ", "(affiché)", "↵ aller", "x fermer"] {
+            assert!(t.contains(needle), "absent : {needle}\n{t}");
+        }
+        assert!(t.contains("demo · build"), "{t}");
+        assert!(
+            t.contains("●"),
+            "le marqueur du job en cours est aussi dans la liste"
+        );
+        for (w, h) in [(1, 1), (10, 4), (30, 6)] {
+            render(&app, w, h);
+        }
     }
 
     #[test]

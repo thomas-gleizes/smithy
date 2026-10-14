@@ -12,7 +12,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step.
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible.
 - Sign in from the TUI (username and password, entered once and never stored).
-- A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it.
+- A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`.
 - Run status translated to a common model (`Status`), whatever the forge.
 - Automatic refresh every 5 seconds, manual refresh with `r`.
 - Backends are pluggable through the `Provider` trait; the UI adapts to what a backend supports (`Capabilities`).
@@ -93,6 +93,17 @@ Both are kept per server in `~/.local/state/smithy/sessions/<server>.json` (dire
 
 Everywhere: `Esc` goes back one page (it never quits), `Ctrl+C` quits, `r` refreshes the current page.
 
+Tabs, on every page (except while typing a filter):
+
+| Key                   | Action                          |
+|-----------------------|---------------------------------|
+| `t`                   | Open the selection in a **new tab**: the current tab is duplicated, page by page, then the selected item is opened in the copy |
+| `Tab` / `Shift+Tab`   | Next / previous tab (wraps around) |
+| `T`                   | List the tabs (`j`/`k`, `Enter` to go, `x` to close, `Esc`) |
+| `x`                   | Close the current tab (the last one becomes a fresh home page) |
+
+Tabs are independent: each keeps its own page stack, selection and scroll position. A tab showing a job's logs tells you in the tab bar whether the job is still running (`●`) or how it ended (`✔`, `✘`), and keeps following a running job while you work in another tab. Up to 10 tabs. They are not restored when smithy restarts.
+
 On the home page:
 
 | Key                   | Action                          |
@@ -167,7 +178,9 @@ A new forge is a new crate implementing `Provider`.
 - [x] Page stack with a breadcrumb
 - [x] Home page (my repositories, watched, starred, explore, recent) and a repository page
 - [ ] Organisations on the home page (needs an extra `read:organization` token scope)
-- [ ] Independent tabs, each with its own page stack and server
+- [x] Independent tabs, each with its own page stack
+- [ ] One server per tab (several servers at once)
+- [ ] Restore the open tabs at startup
 - [ ] Pull requests, notifications and runners
 - [ ] Filters and search (status, branch, workflow, repository)
 - [x] Job steps and logs for Forgejo

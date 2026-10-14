@@ -4,7 +4,7 @@ use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     #[error("erreur réseau : {0}")]
     Network(String),
