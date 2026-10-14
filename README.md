@@ -161,6 +161,8 @@ The repository page lists five sections: *CI*, *Code*, *Commits*, *Branches* and
 
 On a repository page and on the list of runs: `j`/`k` move, `Enter` or `→` opens (CI or Code; a run's logs), `←`, `Esc`, `q` or `Backspace` go back, `PgDn`/`PgUp`, `g`/`G` as above.
 
+The list of runs has one line per job: the jobs of a run follow each other in the workflow's order, linked by `┌ ├ └`, with the run number, workflow, branch, commit and title written once on the first line. `Enter` opens the selected job's logs.
+
 On the list of runs, two filters combine:
 
 | Key                   | Action                          |

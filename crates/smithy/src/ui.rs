@@ -15,7 +15,7 @@ use crate::{
     highlight::{self, Tok},
     history::{BranchesView, CommitView, CommitsView},
     logview::{LineKind, LogState, LogView, TextView},
-    pages::{HomeView, LastRun, Load, RepoView, RunsView, Section},
+    pages::{HomeView, LastRun, Load, RepoView, RunPos, RunsView, Section, run_positions},
     pulls::{self, PullView, PullsView},
     textsearch::{self, Hit},
     timeago,
@@ -1810,13 +1810,41 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
         let line = Line::from(Span::styled(text, Style::new().fg(color)));
         f.render_widget(Paragraph::new(line).block(block), rows[0]);
     } else {
+        // Les jobs d'un même run se suivent : le run n'est écrit qu'une fois, ses jobs reliés.
+        let positions = run_positions(&visible);
+        let dim = Style::new().fg(Color::DarkGray);
         let table_rows: Vec<Row> = visible
             .iter()
-            .map(|p| {
+            .zip(&positions)
+            .map(|(p, pos)| {
                 let (label, color) = status_style(p.status);
+                let branch = match pos {
+                    RunPos::Single => "",
+                    RunPos::First => "┌ ",
+                    RunPos::Middle => "├ ",
+                    RunPos::Last => "└ ",
+                };
+                let job = Cell::from(Line::from(vec![
+                    Span::styled(branch, dim),
+                    Span::raw(p.job.clone()),
+                ]));
+                let status = Cell::from(Span::styled(label, Style::new().fg(color)));
+                if matches!(pos, RunPos::Middle | RunPos::Last) {
+                    return Row::new(vec![
+                        status,
+                        Cell::from(""),
+                        Cell::from(""),
+                        job,
+                        Cell::from(""),
+                        Cell::from(""),
+                        Cell::from(""),
+                    ]);
+                }
                 Row::new(vec![
-                    Cell::from(Span::styled(label, Style::new().fg(color))),
+                    status,
+                    Cell::from(Span::styled(format!("#{}", p.number), dim)),
                     Cell::from(p.workflow.clone()),
+                    job,
                     Cell::from(p.branch.clone()),
                     Cell::from(p.commit.chars().take(7).collect::<String>()),
                     Cell::from(p.title.clone()),
@@ -1827,15 +1855,19 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
             table_rows,
             [
                 Constraint::Length(13),
+                Constraint::Length(6),
                 Constraint::Length(14),
+                Constraint::Max(20),
                 Constraint::Length(14),
                 Constraint::Length(8),
                 Constraint::Min(10),
             ],
         )
         .header(
-            Row::new(["Statut", "Workflow", "Branche", "Commit", "Titre"])
-                .style(Style::new().bold()),
+            Row::new([
+                "Statut", "Run", "Workflow", "Job", "Branche", "Commit", "Titre",
+            ])
+            .style(Style::new().bold()),
         )
         .block(
             block.title_bottom(
@@ -2018,6 +2050,54 @@ mod tests {
             assert!(text.contains(needle), "absent du rendu : {needle}\n{text}");
         }
         assert!(!text.contains("Mes dépôts"), "l'accueil n'est plus affiché");
+    }
+
+    #[test]
+    fn les_jobs_d_un_run_sont_regroupes() {
+        let job = |id: u64, name: &str| Pipeline {
+            number: 7,
+            job: name.into(),
+            ..pipe(id, "build.yml", Status::Success)
+        };
+        // Comme l'API : ids décroissants ; un autre run d'un seul job en dessous
+        let app = app_on_runs(vec![
+            job(14, "deploy"),
+            job(13, "test"),
+            job(12, "build"),
+            Pipeline {
+                number: 6,
+                job: "lint".into(),
+                ..pipe(11, "build.yml", Status::Failure)
+            },
+        ]);
+        let width = 130;
+        let text = render(&app, width, 14);
+        let lines: Vec<String> = text
+            .chars()
+            .collect::<Vec<_>>()
+            .chunks(width as usize)
+            .map(|c| c.iter().collect::<String>())
+            .collect();
+        let row = |needle: &str| {
+            lines
+                .iter()
+                .find(|l| l.contains(needle))
+                .unwrap_or_else(|| panic!("{needle} absent :\n{}", lines.join("\n")))
+                .clone()
+        };
+        assert!(row("Job").contains("Run"));
+        // Première ligne du run : tout ; les suivantes : le statut et le job seulement
+        let first = row("┌ build");
+        assert!(first.contains("#7") && first.contains("build.yml") && first.contains("titre 12"));
+        let middle = row("├ test");
+        assert!(
+            !middle.contains("build.yml") && !middle.contains("#7") && !middle.contains("titre")
+        );
+        let last = row("└ deploy");
+        assert!(!last.contains("build.yml"));
+        // Un run d'un seul job : pas de lien
+        let single = row(" lint");
+        assert!(single.contains("#6") && !single.contains('┌') && single.contains("failure"));
     }
 
     #[test]

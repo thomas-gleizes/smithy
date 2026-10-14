@@ -446,6 +446,50 @@ fn matches_words(p: &Pipeline, words: &[String]) -> bool {
     words.iter().all(|w| hay.contains(w.as_str()))
 }
 
+/// Place d'une ligne dans son run : les jobs d'un même run se suivent dans la liste et sont
+/// reliés à l'affichage (`┌ ├ └`), le reste du run n'étant écrit que sur la première ligne.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunPos {
+    /// Run d'un seul job (parmi les lignes affichées).
+    Single,
+    First,
+    Middle,
+    Last,
+}
+
+/// Regroupe les lignes consécutives d'un même run (même numéro).
+pub fn run_positions(rows: &[&Pipeline]) -> Vec<RunPos> {
+    let same = |i: usize, j: usize| rows[i].number == rows[j].number;
+    (0..rows.len())
+        .map(|i| {
+            let prev = i > 0 && same(i - 1, i);
+            let next = i + 1 < rows.len() && same(i, i + 1);
+            match (prev, next) {
+                (false, false) => RunPos::Single,
+                (false, true) => RunPos::First,
+                (true, true) => RunPos::Middle,
+                (true, false) => RunPos::Last,
+            }
+        })
+        .collect()
+}
+
+/// Les jobs d'un run arrivent du plus récent au plus ancien : on les remet dans l'ordre de
+/// déclaration du workflow (ids croissants), sans toucher à l'ordre des runs.
+fn jobs_in_order(list: &mut [Pipeline]) {
+    let mut start = 0;
+    while start < list.len() {
+        let number = list[start].number;
+        let end = start
+            + list[start..]
+                .iter()
+                .take_while(|p| p.number == number)
+                .count();
+        list[start..end].sort_by_key(|p| p.id);
+        start = end;
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct RunsView {
     pub repo: Repo,
@@ -562,8 +606,9 @@ impl RunsView {
         }
         self.loading = false;
         match result {
-            Ok(list) => {
+            Ok(mut list) => {
                 let keep = self.selected_pipeline().map(|p| p.id);
+                jobs_in_order(&mut list);
                 self.pipelines = list;
                 self.error = None;
                 let visible = self.visible();
@@ -606,6 +651,59 @@ mod tests {
             status: Status::Success,
             url: None,
         }
+    }
+
+    fn job(id: u64, number: u64, name: &str) -> Pipeline {
+        Pipeline {
+            number,
+            job: name.into(),
+            ..pipe(id)
+        }
+    }
+
+    #[test]
+    fn jobs_regroupes_par_run_dans_l_ordre_du_workflow() {
+        let mut r = RunsView::new(repo("a"));
+        // Comme l'API : ids décroissants, le run 2 a trois jobs, le run 1 un seul
+        r.apply_pipelines(
+            &repo("a"),
+            Ok(vec![
+                job(13, 2, "deploy"),
+                job(12, 2, "test"),
+                job(11, 2, "build"),
+                job(10, 1, "build"),
+            ]),
+        );
+        let jobs: Vec<&str> = r.pipelines.iter().map(|p| p.job.as_str()).collect();
+        assert_eq!(jobs, ["build", "test", "deploy", "build"]);
+        let visible = r.visible();
+        assert_eq!(
+            run_positions(&visible),
+            [RunPos::First, RunPos::Middle, RunPos::Last, RunPos::Single]
+        );
+        // Filtré, un run qui ne garde qu'un job redevient une ligne simple
+        r.filter = "test".into();
+        assert_eq!(run_positions(&r.visible()), [RunPos::Single]);
+        r.filter = "deploy build".into();
+        assert!(r.visible().is_empty());
+        r.filter = "#2".into();
+        assert_eq!(
+            run_positions(&r.visible()),
+            [RunPos::First, RunPos::Middle, RunPos::Last]
+        );
+        // La sélection suit le même job quand la liste revient
+        r.filter.clear();
+        r.selected = 1; // test
+        r.apply_pipelines(
+            &repo("a"),
+            Ok(vec![
+                job(14, 3, "build"),
+                job(13, 2, "deploy"),
+                job(12, 2, "test"),
+                job(11, 2, "build"),
+            ]),
+        );
+        assert_eq!(r.selected_pipeline().map(|p| p.id), Some(12));
     }
 
     fn recent(server: &str, name: &str, opened: i64) -> RecentEntry {
