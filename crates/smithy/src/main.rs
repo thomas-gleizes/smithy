@@ -1,5 +1,6 @@
 mod app;
 mod browser;
+mod clipboard;
 mod config;
 mod graph;
 mod highlight;
@@ -1169,6 +1170,8 @@ fn on_key(
             KeyCode::Esc => app.should_quit = app.device_escape(),
             KeyCode::Enter => app.device_retry(),
             KeyCode::Char('t') if !ctrl => app.device_manual(),
+            KeyCode::Char('c') if !ctrl => app.device_copy(false),
+            KeyCode::Char('u') if !ctrl => app.device_copy(true),
             _ => {}
         }
     } else if app.server_form.is_some() {
@@ -1444,6 +1447,12 @@ async fn run(
     let _lock = owner_lock;
     while !app.should_quit {
         terminal.draw(|f| ui::draw(f, &app))?;
+        if let Some(text) = app.take_copy() {
+            use std::io::Write;
+            let mut out = std::io::stdout();
+            let _ = out.write_all(clipboard::osc52(&text).as_bytes());
+            let _ = out.flush();
+        }
 
         if event::poll(TICK)? {
             match event::read()? {

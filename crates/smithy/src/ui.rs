@@ -2088,7 +2088,7 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
 }
 
 fn draw_device(f: &mut Frame, form: &DeviceForm, quits: bool) {
-    let area = centered(f.area(), 64, 11);
+    let area = centered(f.area(), 80, 11);
     f.render_widget(Clear, area);
     let dim = Style::new().fg(Color::DarkGray);
     let mut lines = vec![Line::from("")];

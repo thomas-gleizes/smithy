@@ -262,6 +262,8 @@ pub struct DeviceForm {
     /// Comme `LoginForm::switch_to` : l'onglet ne bascule qu'une fois connecté.
     pub switch_to: bool,
     pub state: DeviceState,
+    /// Retour d'une copie (le terminal ne confirme rien : on dit seulement qu'elle est envoyée).
+    pub note: Option<String>,
 }
 
 pub struct App {
@@ -277,6 +279,8 @@ pub struct App {
     pub github_device: bool,
     /// Serveur dont `main` doit lancer (ou relancer) la demande de code.
     device_start: Option<String>,
+    /// Texte à copier dans le presse-papiers : `main` l'envoie au terminal (OSC 52).
+    copy: Option<String>,
     /// Les serveurs configurés, pour la liste (`S`) et les libellés de connexion.
     pub servers: Vec<ServerEntry>,
     /// Liste des serveurs ouverte par-dessus l'interface (indice de la ligne choisie).
@@ -345,6 +349,7 @@ impl App {
             device: None,
             github_device: false,
             device_start: None,
+            copy: None,
             servers: Vec::new(),
             server_picker: None,
             server_form: None,
@@ -1846,6 +1851,7 @@ impl App {
             label,
             switch_to,
             state: DeviceState::Requesting,
+            note: None,
         });
         self.device_start = Some(server.to_owned());
     }
@@ -1862,6 +1868,27 @@ impl App {
             f.state = DeviceState::Requesting;
             self.device_start = Some(f.server.clone());
         }
+    }
+
+    pub fn take_copy(&mut self) -> Option<String> {
+        self.copy.take()
+    }
+
+    /// `c` : le code ; `u` : l'adresse. Seulement une fois le code connu.
+    pub fn device_copy(&mut self, address: bool) {
+        let Some(f) = self.device.as_mut() else {
+            return;
+        };
+        let DeviceState::Waiting(info) = &f.state else {
+            return;
+        };
+        let (text, what) = if address {
+            (info.verification_uri.clone(), "adresse")
+        } else {
+            (info.user_code.clone(), "code")
+        };
+        self.copy = Some(text);
+        f.note = Some(format!("{what} envoyé au presse-papiers du terminal"));
     }
 
     /// `t` : renoncer au code et saisir un token à la main.
@@ -4053,6 +4080,41 @@ mod tests {
         a.server_form.as_mut().unwrap().name = "gh2".into();
         a.server_form.as_mut().unwrap().field = ServerField::Token;
         assert!(a.server_form_enter().is_none());
+    }
+
+    #[test]
+    fn copie_du_code_et_de_l_adresse() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A")]);
+        a.open_device("A", false);
+        a.take_device_start();
+        // Rien à copier avant l'arrivée du code
+        a.device_copy(false);
+        assert_eq!(a.take_copy(), None);
+        a.apply_for(
+            "A",
+            Msg::Device {
+                server: "A".into(),
+                result: Ok(device_info()),
+            },
+        );
+        a.device_copy(false);
+        assert_eq!(a.take_copy().as_deref(), Some("ABCD-1234"));
+        assert_eq!(a.take_copy(), None);
+        a.device_copy(true);
+        assert_eq!(
+            a.take_copy().as_deref(),
+            Some("https://github.com/login/device")
+        );
+        assert!(
+            a.device
+                .as_ref()
+                .unwrap()
+                .note
+                .as_deref()
+                .unwrap()
+                .contains("adresse")
+        );
     }
 
     #[test]
