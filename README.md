@@ -11,7 +11,7 @@ Built for machines without a desktop (e.g. a server behind a VPN): a single stat
 - A home page like a web dashboard: your repositories, the ones you watch or starred, a server-wide search, and the ones you opened recently. Each row shows its tags (private, archived, fork, empty), open pull requests, stars and last update; type `/` to filter. Open a repository to get its own page: the latest CI run at a glance, then the CI runs list, the code explorer, the **commit history**, the **branches** and the **pull requests**.
 - Read the steps and output of any job, in the terminal (`Enter` on a run): steps are foldable sections like in the web UI (successful ones start folded, failing or running ones open), ANSI colours and progress bars are cleaned, a running job is refreshed and followed, and the view opens on the first failing step. Filter the list of runs (`/` for text, `s` for status) and search inside logs, files and rendered Markdown (`/`, then `n` / `N`).
 - Explore the code of a repository (`e`): branches, folders, files, without leaving the terminal. Files are read-only, capped at 1 MiB, with binary files detected and control characters made visible, and **syntax highlighting** for the common languages (Rust, TypeScript, Python, TOML, JSON, YAML, Dockerfile, Makefile, HTML/CSS, shell, SQL, Markdown source, …). The colours are the 16 ANSI colours of your terminal, so they follow its theme. **Markdown files** (`.md`) open rendered: headings, emphasis, lists (nested, ordered, task lists), quotes, tables, links (the target is shown), images (alt text), rules, and code blocks coloured by their language; raw HTML is shown dimmed. Press `m` to switch to the highlighted source.
-- Sign in from the TUI on Forgejo (username and password, entered once and never stored); GitHub uses a token.
+- Sign in from the TUI on Forgejo (username and password, entered once and never stored); GitHub uses a code to authorize on github.com (or a token).
 - A breadcrumb on the first line shows where you are (`server › Home › repo › CI › workflow › job`); pages stack like in a web browser and `Esc` goes back to the previous one exactly as you left it. Open several independent tabs with `t`; each tab has its own server, which you can change from the tab (`S`) without touching the other tabs.
 - **Mouse and trackpad**: click a row to select it, click it again (or double-click) to open it; click a tab, a home section or a breadcrumb segment to go there; the wheel scrolls lists and text; clicking a step title in the logs folds or unfolds it.
 - Run status translated to a common model (`Status`), whatever the forge.
@@ -103,7 +103,10 @@ token = "<your token>"   # required for GitHub
 
 ### GitHub
 
-GitHub has no password login in its API, so a **token is required** (no login form: when a GitHub server has no token, smithy opens the server form on its token field instead). Either a *classic* token with the `repo` scope (add `read:org` to list organisation repositories), or a *fine-grained* token with read access to *Actions*, *Contents*, *Pull requests*, *Commit statuses* and *Metadata*. With the GitHub CLI installed, `gh auth token` prints one you already have. The token goes into the config like any other (`S`, then `e`, or `kind = "github"` in `config.toml`).
+GitHub has no password login in its API, so smithy needs a token. Two ways to get one:
+
+- **Sign in by code** (device flow): when a GitHub server has no token, smithy shows a code and an address (`github.com/login/device`); open it in any browser (not necessarily on the machine running smithy), enter the code and authorize. smithy receives the token and keeps it in `~/.local/state/smithy/sessions/<server>.json` (`0600`), never in the config. `t` switches to typing a token by hand, `Enter` asks for a new code after a failure. This needs the public *client ID* of an OAuth App with *Device Flow* enabled (GitHub → Settings → Developer settings → OAuth Apps): it is not a secret. Set it with `SMITHY_GITHUB_CLIENT_ID` (also the way to use your own App, or GitHub Enterprise). Without any client ID, smithy falls back to the token form. The authorization asks for the `repo` scope, which an OAuth App cannot narrow to read-only; smithy only ever reads.
+- **A token you create**: the server form opens on its token field. Either a *classic* token with the `repo` scope (add `read:org` to list organisation repositories), or a *fine-grained* token with read access to *Actions*, *Contents*, *Pull requests*, *Commit statuses* and *Metadata*. With the GitHub CLI installed, `gh auth token` prints one you already have. The token goes into the config like any other (`S`, then `e`, or `kind = "github"` in `config.toml`).
 
 Everything goes through GitHub's documented REST API with that token. Some differences with Forgejo:
 
@@ -120,6 +123,7 @@ Environment variables override the first server (or define one if the file has n
 |-----------------|--------------------------------------|
 | `SMITHY_URL`    | Base URL of the forge instance       |
 | `SMITHY_TOKEN`  | API token (read-only is enough)      |
+| `SMITHY_GITHUB_CLIENT_ID` | Client ID of the OAuth App used for GitHub sign-in by code |
 | `SMITHY_SERVER` | Name of the server to use            |
 
 ### Logging in
@@ -287,7 +291,7 @@ A new forge is a new crate implementing `Provider`.
 - [ ] File search by name in the explorer, tags and commits as references
 - [ ] Open the run URL from the TUI
 - [x] GitHub backend with a token (jobs and logs, code, history, pull requests)
-- [ ] GitHub sign-in from the TUI (device flow: a code to enter on github.com)
+- [x] GitHub sign-in from the TUI (device flow: a code to enter on github.com; needs an OAuth App client ID)
 - [x] Multiple instances in the config file (selected per tab from the TUI)
 - [x] Mouse and trackpad (click, wheel)
 - [ ] GitLab, Bitbucket, Azure DevOps backends

@@ -11,7 +11,10 @@ use ratatui::{
 use smithy_core::{EntryKind, PullFilter, RepoInfo, Status};
 
 use crate::{
-    app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
+    app::{
+        App, DeviceForm, DeviceState, LoginField, LoginForm, Reach, ServerField, ServerForm,
+        TabMarker, TabTitle,
+    },
     browser::{Browser, DirState, Mode, fmt_size},
     config::ServerKind,
     graph,
@@ -88,6 +91,11 @@ pub fn draw(f: &mut Frame, app: &App) {
         app.zones.add(zone(f.area()), Target::Overlay);
         let quits = app.login_quits(form);
         draw_login(f, form, quits);
+    }
+    if let Some(form) = &app.device {
+        app.zones.add(zone(f.area()), Target::Overlay);
+        let quits = app.device_quits(form);
+        draw_device(f, form, quits);
     }
 }
 
@@ -2078,6 +2086,67 @@ fn centered(area: Rect, width: u16, height: u16) -> Rect {
     )
 }
 
+fn draw_device(f: &mut Frame, form: &DeviceForm, quits: bool) {
+    let area = centered(f.area(), 64, 11);
+    f.render_widget(Clear, area);
+    let dim = Style::new().fg(Color::DarkGray);
+    let mut lines = vec![Line::from("")];
+    let keys = match &form.state {
+        DeviceState::Requesting => {
+            lines.push(Line::from(Span::styled(
+                "demande du code à GitHub…",
+                Style::new().fg(Color::Cyan),
+            )));
+            "t saisir un token"
+        }
+        DeviceState::Waiting(info) => {
+            lines.push(Line::from("Depuis n'importe quel navigateur, ouvrez :"));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", info.verification_uri),
+                Style::new().fg(Color::Cyan),
+            )));
+            lines.push(Line::from("et saisissez le code :"));
+            lines.push(Line::from(Span::styled(
+                format!("  {}", info.user_code),
+                Style::new().fg(Color::Yellow).bold(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "en attente de l'autorisation…",
+                dim,
+            )));
+            "t saisir un token"
+        }
+        DeviceState::Failed(e) => {
+            lines.push(Line::from(Span::styled(
+                e.clone(),
+                Style::new().fg(Color::Red),
+            )));
+            "Entrée réessayer · t saisir un token"
+        }
+    };
+    while lines.len() < 8 {
+        lines.push(Line::from(""));
+    }
+    lines.push(Line::from(Span::styled(
+        format!(
+            "{keys} · {}",
+            if quits { "Esc quitter" } else { "Esc annuler" }
+        ),
+        dim,
+    )));
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(" Connexion par code · {} ", form.label))
+        .border_style(Style::new().fg(Color::Yellow));
+    f.render_widget(
+        Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .block(block),
+        area,
+    );
+}
+
 fn draw_login(f: &mut Frame, form: &LoginForm, quits: bool) {
     let area = centered(f.area(), 64, 9);
     f.render_widget(Clear, area);
@@ -3445,6 +3514,48 @@ mod tests {
 
         app.login.as_mut().unwrap().error = Some("identifiant ou mot de passe incorrect".into());
         assert!(render(&app, 100, 20).contains("incorrect"));
+    }
+
+    #[test]
+    fn connexion_par_code_montre_l_adresse_et_le_code() {
+        let mut app = App::new();
+        app.set_servers(vec![crate::app::ServerEntry {
+            name: "gh".into(),
+            url: "https://api.github.com".into(),
+            kind: ServerKind::GitHub,
+        }]);
+        app.open_device("gh", false);
+        assert!(render(&app, 100, 20).contains("demande du code"));
+        app.apply_for(
+            "gh",
+            crate::app::Msg::Device {
+                server: "gh".into(),
+                result: Ok(crate::app::DeviceInfo {
+                    user_code: "ABCD-1234".into(),
+                    verification_uri: "https://github.com/login/device".into(),
+                }),
+            },
+        );
+        let text = render(&app, 100, 20);
+        assert!(text.contains("Connexion par code · gh"));
+        assert!(text.contains("github.com/login/device") && text.contains("ABCD-1234"));
+        assert!(text.contains("Esc quitter"), "{text}");
+        assert_eq!(
+            app.zones.hit(0, 0),
+            Some(Target::Overlay),
+            "la souris n'agit pas sous la fenêtre"
+        );
+        app.apply_for(
+            "gh",
+            crate::app::Msg::Device {
+                server: "gh".into(),
+                result: Err("autorisation refusée".into()),
+            },
+        );
+        let text = render(&app, 100, 20);
+        assert!(text.contains("refusée") && text.contains("Entrée réessayer"));
+        // Très petit terminal : pas de panique
+        render(&app, 10, 3);
     }
 
     #[test]

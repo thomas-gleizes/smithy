@@ -49,6 +49,9 @@ impl SessionStore {
         Ok(self.dir.join(format!("{name}.json")))
     }
 
+    /// Une session vaut par ses cookies (Forgejo) ou par son token seul (GitHub, qui n'a pas de
+    /// cookie).
+    ///
     /// `None` si absente, illisible ou obtenue pour une autre URL : il suffit
     /// alors de se reconnecter.
     pub fn load(&self, name: &str, url: &str) -> Result<Option<Session>> {
@@ -60,7 +63,7 @@ impl SessionStore {
         };
         Ok(serde_json::from_str::<Session>(&raw)
             .ok()
-            .filter(|s| s.url == url && !s.cookies.is_empty()))
+            .filter(|s| s.url == url && (!s.cookies.is_empty() || s.token.is_some())))
     }
 
     pub fn save(&self, name: &str, session: &Session) -> Result<()> {
@@ -175,10 +178,26 @@ mod tests {
         assert_eq!(store.load("forge", "http://a").unwrap(), None);
         let vide = Session {
             cookies: BTreeMap::new(),
+            token: None,
             ..session("http://a")
         };
         store.save("forge", &vide).unwrap();
         assert_eq!(store.load("forge", "http://a").unwrap(), None);
+    }
+
+    #[test]
+    fn un_token_seul_suffit() {
+        let tmp = Tmp::new("token-seul");
+        let store = SessionStore::new(tmp.0.clone());
+        let github = Session {
+            cookies: BTreeMap::new(),
+            ..session("https://api.github.com")
+        };
+        store.save("gh", &github).unwrap();
+        assert_eq!(
+            store.load("gh", "https://api.github.com").unwrap(),
+            Some(github)
+        );
     }
 
     #[test]

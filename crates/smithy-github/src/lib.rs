@@ -8,6 +8,7 @@
 
 mod actions;
 mod code;
+pub mod oauth;
 mod pulls;
 mod repos;
 

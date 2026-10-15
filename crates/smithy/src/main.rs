@@ -253,8 +253,79 @@ fn ask_credentials(
     let Some(b) = backends.get(name) else { return };
     match b.server.kind {
         ServerKind::Forgejo => app.open_login(name, &b.username, switch_to),
+        // Connexion par code si on connaît l'identifiant de l'OAuth App, sinon un token à saisir.
+        ServerKind::GitHub if github_client_id().is_some() => app.open_device(name, switch_to),
         ServerKind::GitHub => app.open_token_form(name),
     }
+}
+
+/// Identifiant public de l'OAuth App : `SMITHY_GITHUB_CLIENT_ID` (GitHub Enterprise, ou une App
+/// à soi) prime sur celui compilé dans le binaire.
+fn github_client_id() -> Option<String> {
+    std::env::var("SMITHY_GITHUB_CLIENT_ID")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            Some(smithy_github::oauth::DEFAULT_CLIENT_ID.to_owned()).filter(|v| !v.is_empty())
+        })
+}
+
+/// Connexion par code : demande le code (montré à l'utilisateur par `Msg::Device`), attend son
+/// autorisation, puis rend le token comme un login réussi (`Msg::LoggedIn`). Sans cookie : le
+/// token suffit à GitHub.
+fn spawn_device(
+    server: &Server,
+    tx: &UnboundedSender<(String, Msg)>,
+) -> tokio::task::JoinHandle<()> {
+    let (server, tx) = (server.clone(), tx.clone());
+    tokio::spawn(async move {
+        let name = server.name.clone();
+        let fail = |e: String| {
+            let _ = tx.send((
+                name.clone(),
+                Msg::Device {
+                    server: name.clone(),
+                    result: Err(e),
+                },
+            ));
+        };
+        let Some(client_id) = github_client_id() else {
+            return fail("identifiant d'OAuth App absent".to_owned());
+        };
+        let web = smithy_github::oauth::web_base(&server.url);
+        let code = match smithy_github::oauth::request_code(&web, &client_id).await {
+            Ok(c) => c,
+            Err(e) => return fail(e),
+        };
+        let _ = tx.send((
+            name.clone(),
+            Msg::Device {
+                server: name.clone(),
+                result: Ok(app::DeviceInfo {
+                    user_code: code.user_code.clone(),
+                    verification_uri: code.verification_uri.clone(),
+                }),
+            },
+        ));
+        match smithy_github::oauth::poll_token(&web, &client_id, &code).await {
+            Ok(token) => {
+                let _ = tx.send((
+                    name.clone(),
+                    Msg::LoggedIn {
+                        server: name.clone(),
+                        result: Ok(Session {
+                            url: server.url.clone(),
+                            username: String::new(),
+                            token: Some(token),
+                            cookies: BTreeMap::new(),
+                        }),
+                    },
+                ));
+            }
+            Err(e) => fail(e),
+        }
+    })
 }
 
 /// Touches des onglets, valables sur toutes les pages. Renvoie `true` si la touche est prise.
@@ -1093,6 +1164,13 @@ fn on_key(
             KeyCode::Char(c) if !ctrl => app.login_type(c),
             _ => {}
         }
+    } else if app.device.is_some() {
+        match code {
+            KeyCode::Esc => app.should_quit = app.device_escape(),
+            KeyCode::Enter => app.device_retry(),
+            KeyCode::Char('t') if !ctrl => app.device_manual(),
+            _ => {}
+        }
     } else if app.server_form.is_some() {
         match code {
             KeyCode::Esc => app.should_quit = app.server_form_escape(),
@@ -1219,7 +1297,7 @@ fn on_mouse(
     tx: &UnboundedSender<(String, Msg)>,
 ) {
     // Les formulaires se remplissent au clavier.
-    if app.login.is_some() || app.server_form.is_some() {
+    if app.login.is_some() || app.device.is_some() || app.server_form.is_some() {
         return;
     }
     let delta = match m.kind {
@@ -1360,6 +1438,7 @@ async fn run(
         Some(_) => {}
     }
     let mut last_refresh = Instant::now();
+    let mut device_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let _lock = owner_lock;
     while !app.should_quit {
@@ -1416,6 +1495,21 @@ async fn run(
             // Après `apply`, qui efface le bandeau d'erreur.
             if save_error.is_some() {
                 app.error = save_error;
+            }
+        }
+
+        // Connexion par code : la tâche qui attend l'autorisation s'arrête avec la fenêtre.
+        if app.device.is_none()
+            && let Some(t) = device_task.take()
+        {
+            t.abort();
+        }
+        if let Some(name) = app.take_device_start() {
+            if let Some(t) = device_task.take() {
+                t.abort();
+            }
+            if let Some(b) = backends.get(&name) {
+                device_task = Some(spawn_device(&b.server, &tx));
             }
         }
 

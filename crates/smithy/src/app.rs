@@ -103,6 +103,12 @@ pub enum Msg {
         url: String,
         result: Result<Option<String>, String>,
     },
+    /// Étape de la connexion par code (GitHub) : le code à faire autoriser, ou la raison de
+    /// l'échec (demande refusée, autorisation refusée, code expiré…).
+    Device {
+        server: String,
+        result: Result<DeviceInfo, String>,
+    },
     /// Résultat du login sur ce serveur : la session à conserver, ou le message d'erreur.
     LoggedIn {
         server: String,
@@ -231,12 +237,43 @@ pub struct LoginForm {
     pub busy: bool,
 }
 
+/// Ce que la connexion par code montre : où aller et quel code y saisir.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceInfo {
+    pub user_code: String,
+    pub verification_uri: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DeviceState {
+    /// Code demandé à GitHub.
+    Requesting,
+    /// En attente de l'autorisation de l'utilisateur.
+    Waiting(DeviceInfo),
+    Failed(String),
+}
+
+/// Connexion par code (« device flow » OAuth, GitHub) : fenêtre par-dessus l'interface, sur le
+/// modèle du login. La tâche qui attend l'autorisation est dans `main`.
+#[derive(Debug)]
+pub struct DeviceForm {
+    pub server: String,
+    pub label: String,
+    /// Comme `LoginForm::switch_to` : l'onglet ne bascule qu'une fois connecté.
+    pub switch_to: bool,
+    pub state: DeviceState,
+}
+
 pub struct App {
     /// Message d'erreur ou d'information passager, affiché en pied de page.
     pub error: Option<String>,
     pub should_quit: bool,
     /// Formulaire affiché par-dessus l'interface tant que l'utilisateur n'est pas connecté.
     pub login: Option<LoginForm>,
+    /// Connexion par code (GitHub), à la place du login.
+    pub device: Option<DeviceForm>,
+    /// Serveur dont `main` doit lancer (ou relancer) la demande de code.
+    device_start: Option<String>,
     /// Les serveurs configurés, pour la liste (`S`) et les libellés de connexion.
     pub servers: Vec<ServerEntry>,
     /// Liste des serveurs ouverte par-dessus l'interface (indice de la ligne choisie).
@@ -302,6 +339,8 @@ impl App {
             error: None,
             should_quit: false,
             login: None,
+            device: None,
+            device_start: None,
             servers: Vec::new(),
             server_picker: None,
             server_form: None,
@@ -1349,6 +1388,25 @@ impl App {
                     self.error = banner;
                 }
             }
+            Msg::Device { server, result } => {
+                // Une réponse pour une fenêtre fermée ou un autre serveur est ignorée.
+                if let Some(f) = self.device.as_mut().filter(|f| f.server == server) {
+                    f.state = match result {
+                        Ok(info) => DeviceState::Waiting(info),
+                        Err(e) => DeviceState::Failed(e),
+                    };
+                }
+            }
+            Msg::LoggedIn {
+                server,
+                result: Ok(_),
+            } if self.device.as_ref().is_some_and(|f| f.server == server) => {
+                let switch = self.device.take().is_some_and(|f| f.switch_to);
+                self.error = None;
+                if switch {
+                    self.switch_server(&server);
+                }
+            }
             Msg::LoggedIn { server, result } => {
                 let mine = self.login.as_ref().is_some_and(|f| f.server == server);
                 match result {
@@ -1770,6 +1828,54 @@ impl App {
             error: None,
             first_run: false,
         });
+    }
+
+    /// Ouvre la connexion par code pour ce serveur ; `main` lance la demande (`take_device_start`).
+    pub fn open_device(&mut self, server: &str, switch_to: bool) {
+        let label = self
+            .servers
+            .iter()
+            .find(|s| s.name == server)
+            .map_or_else(|| server.to_owned(), |s| format!("{} ({})", s.name, s.url));
+        self.device = Some(DeviceForm {
+            server: server.to_owned(),
+            label,
+            switch_to,
+            state: DeviceState::Requesting,
+        });
+        self.device_start = Some(server.to_owned());
+    }
+
+    pub fn take_device_start(&mut self) -> Option<String> {
+        self.device_start.take()
+    }
+
+    /// Entrée après un échec : nouvelle demande de code.
+    pub fn device_retry(&mut self) {
+        if let Some(f) = self.device.as_mut()
+            && matches!(f.state, DeviceState::Failed(_))
+        {
+            f.state = DeviceState::Requesting;
+            self.device_start = Some(f.server.clone());
+        }
+    }
+
+    /// `t` : renoncer au code et saisir un token à la main.
+    pub fn device_manual(&mut self) {
+        if let Some(f) = self.device.take() {
+            self.device_start = None;
+            self.open_token_form(&f.server);
+        }
+    }
+
+    pub fn device_quits(&self, form: &DeviceForm) -> bool {
+        !form.switch_to && self.caps.is_empty()
+    }
+
+    /// Échap. Renvoie `true` s'il faut quitter (connexion de démarrage, rien à afficher sans elle).
+    pub fn device_escape(&mut self) -> bool {
+        self.device_start = None;
+        self.device.take().is_some_and(|f| self.device_quits(&f))
     }
 
     /// Un serveur GitHub sans token : GitHub n'a pas de connexion par mot de passe, on ouvre le
@@ -3836,6 +3942,113 @@ mod tests {
         );
         assert!(a.login.is_none());
         assert_eq!(a.server_name, "B");
+    }
+
+    fn device_info() -> DeviceInfo {
+        DeviceInfo {
+            user_code: "ABCD-1234".into(),
+            verification_uri: "https://github.com/login/device".into(),
+        }
+    }
+
+    fn token_session() -> Session {
+        Session {
+            url: "http://B".into(),
+            username: String::new(),
+            token: Some("gho_x".into()),
+            cookies: Default::default(),
+        }
+    }
+
+    #[test]
+    fn connexion_par_code_du_debut_a_la_bascule() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        a.set_caps("A", true, true);
+        a.open_device("B", true);
+        assert_eq!(a.take_device_start().as_deref(), Some("B"));
+        assert_eq!(a.take_device_start(), None);
+        assert_eq!(a.device.as_ref().unwrap().state, DeviceState::Requesting);
+        // Réponse d'un autre serveur : ignorée
+        a.apply_for(
+            "C",
+            Msg::Device {
+                server: "C".into(),
+                result: Ok(device_info()),
+            },
+        );
+        assert_eq!(a.device.as_ref().unwrap().state, DeviceState::Requesting);
+        a.apply_for(
+            "B",
+            Msg::Device {
+                server: "B".into(),
+                result: Ok(device_info()),
+            },
+        );
+        assert_eq!(
+            a.device.as_ref().unwrap().state,
+            DeviceState::Waiting(device_info())
+        );
+        // L'autorisation arrive : la fenêtre se ferme et l'onglet bascule
+        a.set_caps("B", true, true);
+        a.apply_for(
+            "B",
+            Msg::LoggedIn {
+                server: "B".into(),
+                result: Ok(token_session()),
+            },
+        );
+        assert!(a.device.is_none());
+        assert_eq!(a.server_name, "B");
+    }
+
+    #[test]
+    fn echec_puis_nouvel_essai_ou_token_a_la_main() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        a.set_caps("A", true, true);
+        a.open_device("B", true);
+        a.take_device_start();
+        // Entrée n'a d'effet qu'après un échec
+        a.device_retry();
+        assert_eq!(a.take_device_start(), None);
+        a.apply_for(
+            "B",
+            Msg::Device {
+                server: "B".into(),
+                result: Err("autorisation refusée".into()),
+            },
+        );
+        a.device_retry();
+        assert_eq!(a.take_device_start().as_deref(), Some("B"));
+        assert_eq!(a.device.as_ref().unwrap().state, DeviceState::Requesting);
+        // `t` : le formulaire du token remplace la fenêtre, plus aucune demande en attente
+        a.device_manual();
+        assert!(a.device.is_none());
+        assert_eq!(a.take_device_start(), None);
+        assert_eq!(a.server_form.as_ref().unwrap().field, ServerField::Token);
+    }
+
+    #[test]
+    fn echap_dans_la_connexion_par_code() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        // Démarrage, rien de connecté : quitte
+        a.caps.clear();
+        a.open_device("A", false);
+        assert!(a.device_escape());
+        assert_eq!(a.take_device_start(), None);
+        // Bascule annulée : ferme seulement
+        a.open_device("B", true);
+        assert!(!a.device_escape());
+        // Un autre serveur est connecté : ferme seulement
+        a.set_caps("B", true, true);
+        a.open_device("A", false);
+        assert!(!a.device_escape());
+        assert!(a.device.is_none());
     }
 
     #[test]
