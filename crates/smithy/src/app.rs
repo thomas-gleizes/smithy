@@ -4587,6 +4587,7 @@ mod tests {
             author: "ana".into(),
             date: Some("2026-10-14T10:00:00Z".into()),
             url: Some(format!("http://x/c/{n}")),
+            parents: vec![],
         }
     }
 

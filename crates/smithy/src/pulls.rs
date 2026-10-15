@@ -693,6 +693,7 @@ mod tests {
                 author: "smithy".into(),
                 date: Some("2026-10-14T10:00:00Z".into()),
                 url: None,
+                parents: vec![],
             }],
             commits_truncated: false,
             reviews: vec![

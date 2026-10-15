@@ -14,6 +14,7 @@ use crate::{
     app::{App, LoginField, LoginForm, Reach, ServerField, ServerForm, TabMarker, TabTitle},
     browser::{Browser, DirState, Mode, fmt_size},
     config::ServerKind,
+    graph,
     highlight::{self, Tok},
     history::{BranchesView, CommitView, CommitsView},
     logview::{LineKind, LogState, LogView, TextView},
@@ -1167,6 +1168,28 @@ fn list_footer(
     f.render_widget(Paragraph::new(vec![first, help]), area);
 }
 
+/// Couleur ANSI d'une voie du graphe.
+fn lane_color(lane: usize) -> Color {
+    const PALETTE: [Color; 6] = [
+        Color::Cyan,
+        Color::Magenta,
+        Color::Green,
+        Color::Yellow,
+        Color::Blue,
+        Color::Red,
+    ];
+    PALETTE[lane % PALETTE.len()]
+}
+
+fn graph_line(cells: &[graph::Cell]) -> Line<'static> {
+    Line::from(
+        cells
+            .iter()
+            .map(|(ch, lane)| Span::styled(ch.to_string(), Style::new().fg(lane_color(*lane))))
+            .collect::<Vec<_>>(),
+    )
+}
+
 fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(2)]).split(area);
     let mut title = format!(" Commits · {}", v.branch_label());
@@ -1200,10 +1223,18 @@ fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
         );
     } else {
         let now = timeago::now_epoch();
+        // Le graphe suit l'ordre complet : un filtre le casserait, on le masque alors.
+        let graph = (!v.filter.active()).then(|| graph::layout(&v.commits));
+        let graph_width = graph.as_deref().map_or(0, graph::width);
         let table_rows: Vec<Row> = visible
             .iter()
-            .map(|c| {
-                Row::new(vec![
+            .enumerate()
+            .map(|(i, c)| {
+                let mut cells = Vec::new();
+                if let Some(g) = &graph {
+                    cells.push(Cell::from(graph_line(&g[i])));
+                }
+                cells.extend([
                     Cell::from(Span::styled(
                         c.short_sha().to_owned(),
                         Style::new().fg(Color::Yellow),
@@ -1216,7 +1247,8 @@ fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
                     ),
                     Cell::from(c.author.clone()),
                     Cell::from(c.summary().to_owned()),
-                ])
+                ]);
+                Row::new(cells)
             })
             .collect();
         let more = if v.has_more { "+" } else { "" };
@@ -1230,18 +1262,23 @@ fn draw_commits(f: &mut Frame, app: &App, v: &CommitsView, area: Rect) {
         } else {
             format!(" {}/{}{more} ", v.selected + 1, visible.len())
         };
-        let table = Table::new(
-            table_rows,
-            [
-                Constraint::Length(8),
-                Constraint::Length(14),
-                Constraint::Length(14),
-                Constraint::Min(10),
-            ],
-        )
-        .header(Row::new(["Commit", "Date", "Auteur", "Message"]).style(Style::new().bold()))
-        .block(block.title_bottom(Line::from(counter).right_aligned()))
-        .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        let mut widths = Vec::new();
+        let mut header = Vec::new();
+        if graph_width > 0 {
+            widths.push(Constraint::Length(graph_width as u16));
+            header.push("");
+        }
+        widths.extend([
+            Constraint::Length(8),
+            Constraint::Length(14),
+            Constraint::Length(14),
+            Constraint::Min(10),
+        ]);
+        header.extend(["Commit", "Date", "Auteur", "Message"]);
+        let table = Table::new(table_rows, widths)
+            .header(Row::new(header).style(Style::new().bold()))
+            .block(block.title_bottom(Line::from(counter).right_aligned()))
+            .row_highlight_style(Style::new().add_modifier(Modifier::REVERSED));
         let mut ts = TableState::default().with_offset(v.list_offset.get());
         ts.select(Some(v.selected));
         f.render_stateful_widget(table, rows[0], &mut ts);
@@ -3910,6 +3947,7 @@ mod tests {
             author: "ana".into(),
             date: Some("2026-10-14T10:00:00Z".into()),
             url: Some(format!("http://x/commit/{n}")),
+            parents: vec![],
         }
     }
 

@@ -1,6 +1,7 @@
 mod app;
 mod browser;
 mod config;
+mod graph;
 mod highlight;
 mod history;
 mod logview;

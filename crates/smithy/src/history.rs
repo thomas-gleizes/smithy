@@ -670,6 +670,7 @@ mod tests {
             author: if n.is_multiple_of(2) { "ana" } else { "bob" }.into(),
             date: Some("2026-10-14T10:00:00Z".into()),
             url: None,
+            parents: vec![],
         }
     }
 

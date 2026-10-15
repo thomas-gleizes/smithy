@@ -111,6 +111,7 @@ impl ApiCommit {
                 .and_then(|a| a.date.clone())
                 .filter(|d| !d.is_empty()),
             url: self.html_url.clone().filter(|u| !u.is_empty()),
+            parents: self.parents.iter().map(|p| p.sha.clone()).collect(),
         }
     }
 }

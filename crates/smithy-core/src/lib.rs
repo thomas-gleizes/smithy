@@ -192,6 +192,8 @@ pub struct Commit {
     pub date: Option<String>,
     /// Page web du commit.
     pub url: Option<String>,
+    /// Empreintes des parents (vide pour un commit racine), pour tracer le graphe.
+    pub parents: Vec<String>,
 }
 
 impl Commit {

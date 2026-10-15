@@ -79,6 +79,7 @@ impl ApiCommit {
                 author: self.commit.author.name,
                 date,
                 url: Some(self.html_url).filter(|u| !u.is_empty()),
+                parents: self.parents.iter().map(|p| p.sha.clone()).collect(),
             },
             ApiRest {
                 parents: self.parents,
