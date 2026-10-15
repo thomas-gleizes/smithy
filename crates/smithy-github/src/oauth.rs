@@ -19,9 +19,9 @@ use crate::DEFAULT_API;
 /// (`public_repo` pour ne voir que le public).
 pub const SCOPE: &str = "repo";
 
-/// Identifiant public de l'OAuth App de smithy (vide tant qu'elle n'est pas créée ; il n'est pas
+/// Identifiant public de l'OAuth App de smithy (il n'est pas
 /// secret). `SMITHY_GITHUB_CLIENT_ID` le remplace, notamment pour GitHub Enterprise.
-pub const DEFAULT_CLIENT_ID: &str = "";
+pub const DEFAULT_CLIENT_ID: &str = "Ov23liv1Vmbi9T3uPf7j";
 
 const GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:device_code";
 /// Rallonge imposée par `slow_down`.
