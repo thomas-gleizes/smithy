@@ -1372,6 +1372,7 @@ async fn run(
     let recent_store = RecentStore::default_location();
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, Msg)>();
     let mut app = App::new();
+    app.github_device = github_client_id().is_some();
     app.set_servers(
         servers
             .iter()

@@ -85,7 +85,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     if let Some(form) = &app.server_form {
         app.zones.add(zone(f.area()), Target::Overlay);
-        draw_server_form(f, form);
+        draw_server_form(f, form, app.github_device);
     }
     if let Some(form) = &app.login {
         app.zones.add(zone(f.area()), Target::Overlay);
@@ -353,7 +353,7 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
     picker_zone(&app.zones, f.area(), area, ls.offset(), len);
 }
 
-fn draw_server_form(f: &mut Frame, form: &ServerForm) {
+fn draw_server_form(f: &mut Frame, form: &ServerForm, device: bool) {
     let area = centered(f.area(), 76, 15);
     f.render_widget(Clear, area);
     let editing = form.original.is_some();
@@ -374,6 +374,7 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm) {
     };
     let token_hint = match (editing, form.kind) {
         (true, _) => "(vide : inchangé)",
+        (false, ServerKind::GitHub) if device => "(facultatif : sinon connexion par code)",
         (false, ServerKind::GitHub) => "(obligatoire : GitHub n'accepte pas de mot de passe)",
         (false, ServerKind::Forgejo) => "(facultatif : sinon connexion par mot de passe)",
     };

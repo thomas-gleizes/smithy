@@ -272,6 +272,9 @@ pub struct App {
     pub login: Option<LoginForm>,
     /// Connexion par code (GitHub), à la place du login.
     pub device: Option<DeviceForm>,
+    /// Un identifiant d'OAuth App est connu (réglé par `main`) : un serveur GitHub peut être
+    /// ajouté sans token, la connexion par code suit.
+    pub github_device: bool,
     /// Serveur dont `main` doit lancer (ou relancer) la demande de code.
     device_start: Option<String>,
     /// Les serveurs configurés, pour la liste (`S`) et les libellés de connexion.
@@ -340,6 +343,7 @@ impl App {
             should_quit: false,
             login: None,
             device: None,
+            github_device: false,
             device_start: None,
             servers: Vec::new(),
             server_picker: None,
@@ -1998,6 +2002,7 @@ impl App {
     /// Entrée : passe au champ suivant, ou valide sur le dernier. Renvoie ce qu'il faut
     /// enregistrer si la saisie est correcte ; sinon l'erreur reste dans le formulaire.
     pub fn server_form_enter(&mut self) -> Option<ServerDraft> {
+        let device = self.github_device;
         let f = self.server_form.as_mut()?;
         if f.field != ServerField::Token {
             self.server_form_move(1);
@@ -2022,8 +2027,8 @@ impl App {
             return None;
         }
         let token = f.token.trim();
-        // Un nouveau serveur GitHub sans token ne pourrait jamais se connecter.
-        if f.kind == ServerKind::GitHub && f.original.is_none() && token.is_empty() {
+        // Un nouveau serveur GitHub sans token ne pourrait se connecter que par code.
+        if f.kind == ServerKind::GitHub && f.original.is_none() && token.is_empty() && !device {
             f.field = ServerField::Token;
             f.error = Some("GitHub : un token est obligatoire (pas de mot de passe)".to_owned());
             return None;
@@ -4029,6 +4034,25 @@ mod tests {
         assert!(a.device.is_none());
         assert_eq!(a.take_device_start(), None);
         assert_eq!(a.server_form.as_ref().unwrap().field, ServerField::Token);
+    }
+
+    #[test]
+    fn github_sans_token_accepte_quand_la_connexion_par_code_existe() {
+        let mut a = fresh();
+        a.github_device = true;
+        a.server_form_add();
+        a.server_form_toggle_kind();
+        a.server_form.as_mut().unwrap().name = "gh".into();
+        a.server_form.as_mut().unwrap().field = ServerField::Token;
+        let draft = a.server_form_enter().expect("accepté sans token");
+        assert_eq!((draft.kind, draft.token), (ServerKind::GitHub, None));
+        // Sans identifiant d'OAuth App, le token reste obligatoire
+        a.github_device = false;
+        a.server_form_add();
+        a.server_form_toggle_kind();
+        a.server_form.as_mut().unwrap().name = "gh2".into();
+        a.server_form.as_mut().unwrap().field = ServerField::Token;
+        assert!(a.server_form_enter().is_none());
     }
 
     #[test]
