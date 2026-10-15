@@ -339,8 +339,10 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
         )));
     } else {
         block = block.title_bottom(
-            Line::from(" ↵ choisir · a ajouter · e modifier · d supprimer · Échap ")
-                .right_aligned(),
+            Line::from(
+                " ↵ choisir · a ajouter · e modifier · x déconnecter · d supprimer · Échap ",
+            )
+            .right_aligned(),
         );
     }
     let list = List::new(items)

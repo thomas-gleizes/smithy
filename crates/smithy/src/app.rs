@@ -2098,6 +2098,14 @@ impl App {
     }
 
     /// `d` dans la liste : demande confirmation, sauf si la suppression est refusée.
+    /// `x` dans la liste : le serveur sélectionné, que `main` déconnecte.
+    pub fn server_logout_ask(&mut self) -> Option<String> {
+        self.server_note = None;
+        self.server_picker
+            .and_then(|i| self.servers.get(i))
+            .map(|s| s.name.clone())
+    }
+
     pub fn server_delete_ask(&mut self) {
         self.server_note = None;
         let Some(name) = self
@@ -4115,6 +4123,17 @@ mod tests {
                 .unwrap()
                 .contains("adresse")
         );
+    }
+
+    #[test]
+    fn deconnexion_vise_le_serveur_selectionne() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        assert_eq!(a.server_logout_ask(), None, "liste fermée");
+        a.open_server_picker();
+        a.server_picker_move(1);
+        assert_eq!(a.server_logout_ask().as_deref(), Some("B"));
     }
 
     #[test]

@@ -1140,6 +1140,43 @@ fn delete_server(
     Ok(())
 }
 
+/// Oublie la session sauvegardée d'un serveur (cookie et token issus d'une connexion) : on peut
+/// alors refaire le parcours de connexion, ou changer de compte. Un token écrit dans la config
+/// reste (c'est le choix de l'utilisateur : `e` pour le retirer). Rien n'est révoqué côté forge.
+fn logout_server(
+    app: &mut App,
+    backends: &mut HashMap<String, Backend>,
+    store: Option<&SessionStore>,
+    name: &str,
+) {
+    let Some(b) = backends.get_mut(name) else {
+        return;
+    };
+    if let Some(Err(e)) = store.map(|s| s.clear(name)) {
+        app.server_note = Some(format!("session non effacée : {e}"));
+        return;
+    }
+    b.saved_token = None;
+    b.username.clear();
+    let from_config = b.server.token.clone();
+    b.provider = from_config
+        .clone()
+        .map(|t| build_provider(&b.server, t, BTreeMap::new()));
+    if b.provider.is_some() {
+        announce(app, b);
+        app.server_note =
+            Some("session effacée ; le token de config.toml reste (e pour le retirer)".to_owned());
+        return;
+    }
+    app.forget_caps(name);
+    if name == app.server_name {
+        app.close_server_picker();
+        ask_credentials(app, backends, name, false);
+    } else {
+        app.server_note = Some(format!("« {name} » déconnecté"));
+    }
+}
+
 /// Une touche, sur la page affichée ou la fenêtre ouverte par-dessus.
 fn on_key(
     app: &mut App,
@@ -1218,6 +1255,11 @@ fn on_key(
                 KeyCode::Char('a') => app.server_form_add(),
                 KeyCode::Char('e') => app.server_form_edit(),
                 KeyCode::Char('d') => app.server_delete_ask(),
+                KeyCode::Char('x') => {
+                    if let Some(name) = app.server_logout_ask() {
+                        logout_server(app, backends, store, &name);
+                    }
+                }
                 KeyCode::Enter => {
                     // Pas encore connecté : le login d'abord, la bascule ensuite.
                     if let Some(name) = app.server_picker_choose() {
