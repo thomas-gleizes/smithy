@@ -1137,6 +1137,11 @@ fn delete_server(
     app.forget_caps(name);
     let list: Vec<Server> = known.into_iter().filter(|s| s.name != name).collect();
     app.server_delete_done(entries(&list));
+    // L'onglet affiché a pu passer sur un autre serveur, pas encore connecté.
+    let shown = app.server_name.clone();
+    if !app.is_connected(&shown) && app.login.is_none() && app.device.is_none() {
+        ask_credentials(app, backends, &shown, false);
+    }
     Ok(())
 }
 

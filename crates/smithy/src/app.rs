@@ -1812,8 +1812,49 @@ impl App {
     }
 
     /// Le serveur est-il celui d'un onglet ouvert ?
-    fn server_in_use(&self, name: &str) -> bool {
-        self.server_name == name || self.tab_servers.iter().any(|s| s == name)
+    /// Serveur de l'onglet `i`.
+    fn tab_server(&self, i: usize) -> &str {
+        if i == self.active {
+            &self.server_name
+        } else {
+            &self.tab_servers[i]
+        }
+    }
+
+    /// Nombre d'onglets ouverts sur ce serveur.
+    pub fn server_tab_count(&self, name: &str) -> usize {
+        (0..self.tabs.len())
+            .filter(|&i| self.tab_server(i) == name)
+            .count()
+    }
+
+    /// Ferme les onglets d'un serveur supprimé. S'il ne reste aucun autre onglet, le dernier
+    /// passe sur un autre serveur (un connecté de préférence) avec un accueil neuf.
+    fn drop_server_tabs(&mut self, name: &str) {
+        self.pending.retain(|(tag, _)| tag != name);
+        while let Some(i) = (0..self.tabs.len())
+            .rev()
+            .find(|&i| self.tab_server(i) == name)
+        {
+            if self.tabs.len() > 1 {
+                self.close_tab_at(i);
+                continue;
+            }
+            let other = self
+                .servers
+                .iter()
+                .filter(|s| s.name != name)
+                .min_by_key(|s| !self.caps.contains_key(&s.name))
+                .map(|s| s.name.clone());
+            let Some(other) = other else { return };
+            self.server_name.clone_from(&other);
+            self.tab_servers[0] = other;
+            self.sync_server();
+            let mut home = HomeView::new();
+            self.queue_all(home.request_current());
+            self.stack = vec![Page::Home(home)];
+            return;
+        }
     }
 
     /// Oublie ce qu'on savait d'un serveur (il n'est plus connecté).
@@ -2117,10 +2158,6 @@ impl App {
         };
         if self.servers.len() <= 1 {
             self.server_note = Some("impossible de supprimer le dernier serveur".to_owned());
-        } else if self.server_in_use(&name) {
-            self.server_note = Some(format!(
-                "« {name} » est utilisé par un onglet : changez-le de serveur d'abord"
-            ));
         } else {
             self.server_delete = Some(name);
         }
@@ -2132,8 +2169,18 @@ impl App {
     }
 
     /// Après la suppression par `main` : la liste est mise à jour.
+    /// Les onglets des serveurs disparus sont fermés.
     pub fn server_delete_done(&mut self, servers: Vec<ServerEntry>) {
+        let gone: Vec<String> = self
+            .servers
+            .iter()
+            .filter(|s| !servers.iter().any(|n| n.name == s.name))
+            .map(|s| s.name.clone())
+            .collect();
         self.servers = servers;
+        for name in gone {
+            self.drop_server_tabs(&name);
+        }
         let names: Vec<&str> = self.servers.iter().map(|s| s.name.as_str()).collect();
         self.reach.retain(|n, _| names.contains(&n.as_str()));
         let max = self.servers.len().saturating_sub(1);
@@ -4365,38 +4412,64 @@ mod tests {
     }
 
     #[test]
-    fn suppression_refusee_si_utilise_ou_dernier() {
+    fn suppression_du_dernier_refusee_et_confirmation() {
         let mut a = fresh();
         a.set_servers(vec![entry("A"), entry("B"), entry("C")]);
         a.set_initial_server("A");
         a.open_server_picker();
-        // A est le serveur d'un onglet
+        // Le serveur de l'onglet affiché se supprime aussi : confirmation demandée, annulable
         a.server_delete_ask();
-        assert!(a.server_delete.is_none() && a.server_note.as_deref().unwrap().contains("onglet"));
-        // B est libre : confirmation demandée, annulable
-        a.server_picker_move(1);
-        a.server_delete_ask();
-        assert_eq!(a.server_delete.as_deref(), Some("B"));
+        assert_eq!(a.server_delete.as_deref(), Some("A"));
         assert!(a.server_note.is_none());
         a.server_delete_cancel();
         assert!(a.server_delete.is_none());
+        a.server_picker_move(1);
         a.server_delete_ask();
         assert_eq!(a.server_delete_confirm().as_deref(), Some("B"));
         a.server_delete_done(vec![entry("A"), entry("C")]);
         assert_eq!(a.servers.len(), 2);
-        // Un onglet qui n'est pas affiché compte aussi
-        a.open_in_new_tab();
-        a.switch_server("C");
-        a.switch_tab(-1);
-        a.set_caps("C", true, true);
-        a.server_picker_move(1);
-        a.server_delete_ask();
-        assert!(a.server_delete.is_none());
         // Le dernier serveur ne se supprime pas
         a.server_delete_done(vec![entry("A")]);
         a.server_picker = Some(0);
         a.server_delete_ask();
         assert!(a.server_note.as_deref().unwrap().contains("dernier"));
+    }
+
+    #[test]
+    fn supprimer_un_serveur_ferme_ses_onglets() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B"), entry("C")]);
+        a.set_initial_server("A");
+        a.set_caps("A", true, true);
+        a.set_caps("C", true, true);
+        // Onglets : A, B, B, C ; l'affiché est le 3e (B)
+        a.open_in_new_tab();
+        a.switch_server("B");
+        a.open_in_new_tab();
+        a.open_in_new_tab();
+        a.switch_server("C");
+        a.go_tab(2);
+        assert_eq!(a.tab_count(), 4);
+        assert_eq!(a.server_tab_count("B"), 2);
+        a.server_delete_done(vec![entry("A"), entry("C")]);
+        assert_eq!(a.tab_count(), 2);
+        assert_eq!(a.server_tab_count("B"), 0);
+        assert!(a.server_name == "A" || a.server_name == "C");
+        // Un onglet qui reste est complet
+        assert!(!a.stack.is_empty());
+    }
+
+    #[test]
+    fn le_dernier_onglet_passe_sur_un_autre_serveur() {
+        let mut a = fresh();
+        a.set_servers(vec![entry("A"), entry("B")]);
+        a.set_initial_server("A");
+        a.set_caps("B", true, true);
+        a.server_delete_done(vec![entry("B")]);
+        assert_eq!(a.tab_count(), 1);
+        assert_eq!(a.server_name, "B");
+        assert!(a.is_connected("B"));
+        assert!(matches!(a.stack.as_slice(), [Page::Home(_)]));
     }
 
     #[test]

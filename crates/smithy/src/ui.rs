@@ -329,7 +329,12 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
         .border_style(Style::new().fg(Color::Yellow));
     if let Some(name) = &app.server_delete {
         block = block.title_bottom(Line::from(Span::styled(
-            format!(" Supprimer « {name} » ? y oui · autre touche : non "),
+            match app.server_tab_count(name) {
+                0 => format!(" Supprimer « {name} » ? y oui · autre touche : non "),
+                n => format!(
+                    " Supprimer « {name} » et fermer ses {n} onglet(s) ? y oui · autre touche : non "
+                ),
+            },
             Style::new().fg(Color::Red).bold(),
         )));
     } else if let Some(note) = &app.server_note {
@@ -3845,9 +3850,6 @@ mod tests {
         app.server_delete_ask();
         assert!(render(&app, 110, 20).contains("Supprimer « B » ?"));
         app.server_delete_cancel();
-        app.server_picker_move(-1);
-        app.server_delete_ask();
-        assert!(render(&app, 110, 20).contains("utilisé par un onglet"));
     }
 
     #[test]
