@@ -1,3 +1,4 @@
 /target
 /dev/.env.local
 /dev/.env.v*.local
+/.idea
