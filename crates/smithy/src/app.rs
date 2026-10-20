@@ -329,6 +329,8 @@ pub struct App {
     pub browse_supported: bool,
     /// Dernier choix de retour à la ligne, appliqué aux volets de texte suivants (le temps de la session).
     pub logs_wrap: bool,
+    /// Correctifs affichés côte à côte (quand le terminal est assez large).
+    pub diff_split: bool,
     /// Hauteur et largeur utiles de la page, écrites par le rendu qui seul les connaît.
     pub viewport: Cell<usize>,
     pub viewport_width: Cell<usize>,
@@ -377,6 +379,7 @@ impl App {
             logs_supported: false,
             browse_supported: false,
             logs_wrap: false,
+            diff_split: false,
             viewport: Cell::new(20),
             viewport_width: Cell::new(80),
             zones: crate::mouse::Zones::default(),
@@ -810,7 +813,8 @@ impl App {
     pub fn pulls_enter(&mut self) {
         let Some(v) = self.pulls() else { return };
         let Some(p) = v.selected_pull() else { return };
-        let (view, requests) = PullView::open(v.repo.clone(), p.number, p.title.clone());
+        let (mut view, requests) = PullView::open(v.repo.clone(), p.number, p.title.clone());
+        view.text.split = self.diff_split;
         self.queue_all(requests);
         self.stack.push(Page::Pull(view));
     }
@@ -839,7 +843,8 @@ impl App {
         let Some(commit) = v.selected_commit().cloned() else {
             return;
         };
-        let (view, requests) = CommitView::open(v.repo.clone(), &commit, self.logs_wrap);
+        let (mut view, requests) = CommitView::open(v.repo.clone(), &commit, self.logs_wrap);
+        view.text.split = self.diff_split;
         self.queue_all(requests);
         self.stack.push(Page::Commit(view));
     }
@@ -1152,6 +1157,15 @@ impl App {
     }
 
     /// Retour à la ligne (touche `w`) : la même ligne de log reste en haut de l'écran.
+    /// Vue côte à côte des correctifs (commits, PR) ; le choix vaut pour les suivants.
+    pub fn text_toggle_split(&mut self) {
+        let (w, h) = self.view_size();
+        if let Some(v) = self.active_text_mut() {
+            v.toggle_split(w, h);
+            self.diff_split = v.split;
+        }
+    }
+
     pub fn text_toggle_wrap(&mut self) {
         // La vue Markdown se replie toujours par mots, et ne touche pas au réglage des logs.
         if self

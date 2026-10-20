@@ -671,6 +671,7 @@ fn commit_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('g') | KeyCode::Home => app.text_top(),
         KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
         KeyCode::Char('w') => app.text_toggle_wrap(),
+        KeyCode::Char('v') => app.text_toggle_split(),
         KeyCode::Char('r') => app.refresh_current(),
         _ => {}
     }

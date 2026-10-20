@@ -75,6 +75,26 @@ pub enum LogState {
     Failed(String),
 }
 
+/// En dessous, une vue côte à côte n'aurait plus assez de colonnes par moitié.
+pub const MIN_SPLIT_WIDTH: usize = 120;
+
+/// Un côté d'une ligne d'écran en vue côte à côte.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Side<'a> {
+    pub text: &'a str,
+    pub runs: &'a [Run],
+    pub line_no: usize,
+    pub info: &'a DiffInfo,
+}
+
+/// Une ligne d'écran en vue côte à côte : avant à gauche, après à droite (`None` : rien en
+/// face). Le contexte est des deux côtés.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct SplitRow<'a> {
+    pub left: Option<Side<'a>>,
+    pub right: Option<Side<'a>>,
+}
+
 /// Une ligne d'écran : un morceau de ligne de log.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Row<'a> {
@@ -94,6 +114,8 @@ pub struct Row<'a> {
     pub continuation: bool,
     /// Ligne d'un correctif : l'affichage y ajoute la gouttière et le fond.
     pub diff: Option<&'a DiffInfo>,
+    /// En vue côte à côte, les deux côtés de la ligne (`diff` décrit alors la ligne d'ancrage).
+    pub split: Option<SplitRow<'a>>,
     /// Titre de la section courante (celle que `Espace` plie ou déplie).
     pub current: bool,
 }
@@ -181,6 +203,7 @@ fn default_collapsed(status: Status) -> bool {
 struct RowIndex {
     /// 0 quand le repli est désactivé : la largeur n'a alors aucun effet.
     width: usize,
+    split: bool,
     starts: Vec<usize>,
 }
 
@@ -244,6 +267,8 @@ pub struct TextView {
     /// Colonnes de la gouttière des numéros de ligne d'un correctif (0 : aucune). Elle prend de
     /// la largeur au texte des lignes de correctif, pas aux autres.
     pub gutter: usize,
+    /// Vue côte à côte demandée : effective seulement si la largeur le permet (`split_active`).
+    pub split: bool,
     /// Empreinte du correctif affiché : une coloration n'est appliquée qu'à celui-là.
     pub diff_key: Option<u64>,
 }
@@ -261,6 +286,7 @@ impl TextView {
             selected: None,
             index: RefCell::new(None),
             gutter: 0,
+            split: false,
             diff_key: None,
         }
     }
@@ -600,6 +626,52 @@ impl TextView {
         }
     }
 
+    /// La vue côte à côte est-elle affichée à cette largeur ?
+    pub fn split_active(&self, width: usize) -> bool {
+        self.split && width >= MIN_SPLIT_WIDTH
+    }
+
+    /// Cachée en vue côte à côte : la ligne ajoutée qui a un vis-à-vis est dessinée avec lui.
+    fn gone(&self, line: &LogLine, split: bool) -> bool {
+        self.hidden(line)
+            || (split
+                && line
+                    .diff
+                    .as_ref()
+                    .is_some_and(|d| d.kind == DiffKind::Added && d.partner.is_some()))
+    }
+
+    /// Les deux côtés de la ligne `no` en vue côte à côte (`None` : en-tête, métadonnée).
+    fn split_of<'a>(lines: &'a [LogLine], no: usize) -> Option<SplitRow<'a>> {
+        let side = |no: usize| {
+            let l = lines.get(no)?;
+            Some(Side {
+                text: &l.text,
+                runs: &l.runs,
+                line_no: no,
+                info: l.diff.as_ref()?,
+            })
+        };
+        let info = lines.get(no)?.diff.as_ref()?;
+        match info.kind {
+            DiffKind::Context => Some(SplitRow {
+                left: side(no),
+                right: side(no),
+            }),
+            DiffKind::Removed => Some(SplitRow {
+                left: side(no),
+                right: info
+                    .partner
+                    .and_then(|p| side(no + (p.checked_sub(info.idx)? as usize))),
+            }),
+            DiffKind::Added => Some(SplitRow {
+                left: None,
+                right: side(no),
+            }),
+            DiffKind::Hunk | DiffKind::Meta => None,
+        }
+    }
+
     /// Les lignes de sortie d'une étape repliée n'occupent aucune ligne d'écran.
     fn hidden(&self, line: &LogLine) -> bool {
         line.kind == LineKind::Text
@@ -612,14 +684,21 @@ impl TextView {
     /// Exécute `f` sur l'index des lignes d'écran pour cette largeur, en le (re)construisant au besoin.
     fn with_index<R>(&self, width: usize, f: impl FnOnce(&RowIndex) -> R) -> R {
         let key = if self.wrap { width.max(1) } else { 0 };
+        let split = self.split_active(width);
         let mut cache = self.index.borrow_mut();
-        if cache.as_ref().is_none_or(|i| i.width != key) {
+        if cache
+            .as_ref()
+            .is_none_or(|i| i.width != key || i.split != split)
+        {
             let mut starts = Vec::with_capacity(self.lines().len() + 1);
             let mut total = 0;
             for l in self.lines() {
                 starts.push(total);
-                total += if self.hidden(l) {
+                total += if self.gone(l, split) {
                     0
+                } else if split && l.diff.is_some() {
+                    // Côte à côte, chaque moitié est coupée : une ligne d'écran par ligne.
+                    1
                 } else if self.wrap {
                     wrap::count(&l.text, self.text_width(l, key), l.hang_width(), l.words)
                 } else {
@@ -627,7 +706,11 @@ impl TextView {
                 };
             }
             starts.push(total);
-            *cache = Some(RowIndex { width: key, starts });
+            *cache = Some(RowIndex {
+                width: key,
+                split,
+                starts,
+            });
         }
         f(cache.as_ref().expect("index construit ci-dessus"))
     }
@@ -681,6 +764,15 @@ impl TextView {
     pub fn toggle_wrap(&mut self, width: usize, height: usize) {
         let top_line = self.line_of_row(width, self.scroll);
         self.wrap = !self.wrap;
+        self.scroll = self
+            .row_of_line(width, top_line)
+            .min(self.max_scroll(width, height));
+    }
+
+    /// Bascule la vue côte à côte en gardant la même ligne de log en haut de l'écran.
+    pub fn toggle_split(&mut self, width: usize, height: usize) {
+        let top_line = self.line_of_row(width, self.scroll);
+        self.split = !self.split;
         self.scroll = self
             .row_of_line(width, top_line)
             .min(self.max_scroll(width, height));
@@ -778,13 +870,19 @@ impl TextView {
         let first_row = self.row_of_line(width, first_line);
         let mut skip = self.scroll.saturating_sub(first_row);
         let current = self.current_step(width);
+        let split = self.split_active(width);
         let mut out = Vec::with_capacity(height);
         for (line_no, line) in lines
             .iter()
             .enumerate()
             .skip(first_line)
-            .filter(|(_, l)| !self.hidden(l))
+            .filter(|(_, l)| !self.gone(l, split))
         {
+            let split_row = if split {
+                Self::split_of(lines, line_no)
+            } else {
+                None
+            };
             let is_current = matches!(line.kind, LineKind::Step(_)) && line.step == current;
             let mut push = |text: &'a str, offset: usize, continuation| {
                 out.push(Row {
@@ -797,11 +895,12 @@ impl TextView {
                     line: &line.text,
                     continuation,
                     diff: line.diff.as_ref(),
+                    split: split_row,
                     current: is_current,
                 });
                 out.len() == height
             };
-            if self.wrap {
+            if self.wrap && !(split && line.diff.is_some()) {
                 let width = self.text_width(line, width);
                 let parts = wrap::layout(&line.text, width, line.hang_width(), line.words);
                 for (n, (start, end)) in parts.into_iter().enumerate() {

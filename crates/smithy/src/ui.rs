@@ -17,11 +17,11 @@ use crate::{
     },
     browser::{Browser, DirState, Mode, fmt_size},
     config::ServerKind,
-    diff::DiffKind,
+    diff::{DiffInfo, DiffKind},
     graph,
     highlight::{self, Tok},
     history::{BranchesView, CommitView, CommitsView},
-    logview::{self, LineKind, LogState, LogView, TextView},
+    logview::{self, LineKind, LogState, LogView, MIN_SPLIT_WIDTH, TextView},
     mouse::{self, Area, Target, Zones},
     pages::{HomeView, LastRun, Load, RepoView, RunPos, RunsView, Section, run_positions},
     pulls::{self, PullView, PullsView},
@@ -696,6 +696,37 @@ fn with_marks<'a>(
     out
 }
 
+/// Le texte d'une ligne de correctif en morceaux stylés : couleurs syntaxiques, mots modifiés
+/// plus marqués et occurrences de la recherche. `line` est la ligne entière, `offset` la
+/// position de `text` dedans.
+fn code_spans<'a>(
+    text: &'a str,
+    offset: usize,
+    runs: &[highlight::Run],
+    line: (usize, &str),
+    info: &DiffInfo,
+    view: &TextView,
+) -> Vec<Span<'a>> {
+    let segments = highlight::segments(text, offset, runs);
+    let ranges = view.line_matches(line.1);
+    let current = view
+        .current_match()
+        .filter(|m| m.line == line.0)
+        .map(|m| (m.start, m.end));
+    let strong = diff_background(info.kind).map(|(_, strong)| strong);
+    let pieces = textsearch::overlay(segments, offset, &ranges, current);
+    with_marks(pieces, offset, &info.marks)
+        .into_iter()
+        .map(|(text, tok, hit, marked)| {
+            let mut style = tok.map_or_else(Style::new, tok_style).patch(hit_style(hit));
+            if marked && let Some(strong) = strong {
+                style = style.bg(strong);
+            }
+            Span::styled(text, style)
+        })
+        .collect()
+}
+
 /// Une ligne d'écran d'un correctif : gouttière des numéros (vide sur la suite d'une ligne
 /// repliée), fond selon la nature de la ligne, mots modifiés plus marqués, puis les couleurs
 /// syntaxiques et la recherche comme ailleurs.
@@ -719,21 +750,13 @@ fn diff_row<'a>(r: &logview::Row<'a>, view: &'a TextView, width: usize) -> Line<
             Style::new().fg(Color::DarkGray),
         ));
     }
-    let segments = highlight::segments(r.text, r.offset, r.runs);
-    let ranges = view.line_matches(r.line);
-    let current = view
-        .current_match()
-        .filter(|m| m.line == r.line_no)
-        .map(|m| (m.start, m.end));
-    let pieces = textsearch::overlay(segments, r.offset, &ranges, current);
-    spans.extend(with_marks(pieces, r.offset, &d.marks).into_iter().map(
-        |(text, tok, hit, marked)| {
-            let mut style = tok.map_or_else(Style::new, tok_style).patch(hit_style(hit));
-            if marked && let Some((_, strong)) = bg {
-                style = style.bg(strong);
-            }
-            Span::styled(text, style)
-        },
+    spans.extend(code_spans(
+        r.text,
+        r.offset,
+        r.runs,
+        (r.line_no, r.line),
+        d,
+        view,
     ));
     let Some((line_bg, _)) = bg else {
         return Line::from(spans);
@@ -743,6 +766,86 @@ fn diff_row<'a>(r: &logview::Row<'a>, view: &'a TextView, width: usize) -> Line<
     let used: usize = spans.iter().map(Span::width).sum();
     spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
     Line::from(spans).style(Style::new().bg(line_bg))
+}
+
+/// Coupe les morceaux à `cols` colonnes ; un « … » à la place de la dernière si ça déborde.
+fn clip_spans<'a>(spans: Vec<Span<'a>>, cols: usize) -> Vec<Span<'a>> {
+    if spans.iter().map(Span::width).sum::<usize>() <= cols {
+        return spans;
+    }
+    let keep = cols.saturating_sub(1);
+    let (mut out, mut used) = (Vec::new(), 0);
+    for span in spans {
+        let mut text = String::new();
+        for c in span.content.chars() {
+            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+            if used + w > keep {
+                break;
+            }
+            used += w;
+            text.push(c);
+        }
+        let full = text.len() == span.content.len();
+        out.push(Span::styled(text, span.style));
+        if !full {
+            break;
+        }
+    }
+    out.push(Span::styled("…", Style::new().fg(Color::DarkGray)));
+    out
+}
+
+/// Une moitié d'une ligne côte à côte, sur `total` colonnes exactement : numéro, texte coupé
+/// aux colonnes qui restent, fond de la nature de la ligne. `None` : rien en face.
+fn side_spans<'a>(
+    side: Option<logview::Side<'a>>,
+    left: bool,
+    number_cols: usize,
+    total: usize,
+    view: &TextView,
+) -> Vec<Span<'a>> {
+    let Some(s) = side else {
+        return vec![Span::raw(" ".repeat(total))];
+    };
+    let n = if left { s.info.old } else { s.info.new };
+    let number = if n == 0 {
+        " ".repeat(number_cols)
+    } else {
+        format!("{n:>number_cols$}")
+    };
+    let mut spans = vec![Span::styled(
+        format!("{number} "),
+        Style::new().fg(Color::DarkGray),
+    )];
+    let text_cols = total.saturating_sub(number_cols + 1);
+    spans.extend(clip_spans(
+        code_spans(s.text, 0, s.runs, (s.line_no, s.text), s.info, view),
+        text_cols,
+    ));
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(" ".repeat(total.saturating_sub(used))));
+    match diff_background(s.info.kind) {
+        // Le fond de la moitié, sans écraser celui des mots modifiés.
+        Some((bg, _)) => spans
+            .into_iter()
+            .map(|sp| {
+                let style = Style::new().bg(bg).patch(sp.style);
+                sp.style(style)
+            })
+            .collect(),
+        None => spans,
+    }
+}
+
+/// Une ligne côte à côte : l'avant à gauche, l'après à droite, séparés par un trait.
+fn split_row<'a>(split: &logview::SplitRow<'a>, view: &TextView, width: usize) -> Line<'a> {
+    let number_cols = view.gutter.saturating_sub(2) / 2;
+    let left = width.saturating_sub(1) / 2;
+    let right = width.saturating_sub(left + 1);
+    let mut spans = side_spans(split.left, true, number_cols, left, view);
+    spans.push(Span::styled("│", Style::new().fg(Color::DarkGray)));
+    spans.extend(side_spans(split.right, false, number_cols, right, view));
+    Line::from(spans)
 }
 
 fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, view: &TextView) {
@@ -769,7 +872,8 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
             let total = view.total_rows(width);
             let end = (view.scroll + height).min(total);
             position = format!(
-                " {}{}-{}/{} ",
+                " {}{}{}-{}/{} ",
+                if view.split_active(width) { "⇄ " } else { "" },
                 if view.wrap { "↩ " } else { "" },
                 (view.scroll + 1).min(end),
                 end,
@@ -777,46 +881,51 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
             );
             view.window(width, height)
                 .into_iter()
-                .map(|r| match r.kind {
-                    LineKind::Step(st) => {
-                        let style = Style::new().fg(status_style(st).1).bold();
-                        // La section courante (celle que Espace plie) est en vidéo inverse.
-                        let style = if r.current {
-                            style.add_modifier(Modifier::REVERSED)
-                        } else {
-                            style
-                        };
-                        Line::from(Span::styled(r.text, style))
+                .map(|r| {
+                    if let Some(split) = &r.split {
+                        return split_row(split, view, width);
                     }
-                    LineKind::Text if r.diff.is_some() => diff_row(&r, view, width),
-                    LineKind::Text
-                        if r.runs.is_empty() && r.hang.is_empty() && !view.has_search() =>
-                    {
-                        Line::from(r.text)
-                    }
-                    LineKind::Text => {
-                        let mut spans = Vec::new();
-                        // Suite d'une ligne repliée : le retrait de la puce, la barre de citation.
-                        if r.continuation && !r.hang.is_empty() {
-                            spans.push(Span::styled(r.hang, tok_style(Tok::Quote)));
+                    match r.kind {
+                        LineKind::Step(st) => {
+                            let style = Style::new().fg(status_style(st).1).bold();
+                            // La section courante (celle que Espace plie) est en vidéo inverse.
+                            let style = if r.current {
+                                style.add_modifier(Modifier::REVERSED)
+                            } else {
+                                style
+                            };
+                            Line::from(Span::styled(r.text, style))
                         }
-                        let segments = highlight::segments(r.text, r.offset, r.runs);
-                        // Les occurrences de la recherche, de toute la ligne (une occurrence peut
-                        // être à cheval sur deux lignes d'écran), par-dessus les couleurs.
-                        let ranges = view.line_matches(r.line);
-                        let current = view
-                            .current_match()
-                            .filter(|m| m.line == r.line_no)
-                            .map(|m| (m.start, m.end));
-                        spans.extend(
-                            textsearch::overlay(segments, r.offset, &ranges, current)
-                                .into_iter()
-                                .map(|(text, tok, hit)| {
-                                    let base = tok.map_or_else(Style::new, tok_style);
-                                    Span::styled(text, base.patch(hit_style(hit)))
-                                }),
-                        );
-                        Line::from(spans)
+                        LineKind::Text if r.diff.is_some() => diff_row(&r, view, width),
+                        LineKind::Text
+                            if r.runs.is_empty() && r.hang.is_empty() && !view.has_search() =>
+                        {
+                            Line::from(r.text)
+                        }
+                        LineKind::Text => {
+                            let mut spans = Vec::new();
+                            // Suite d'une ligne repliée : le retrait de la puce, la barre de citation.
+                            if r.continuation && !r.hang.is_empty() {
+                                spans.push(Span::styled(r.hang, tok_style(Tok::Quote)));
+                            }
+                            let segments = highlight::segments(r.text, r.offset, r.runs);
+                            // Les occurrences de la recherche, de toute la ligne (une occurrence peut
+                            // être à cheval sur deux lignes d'écran), par-dessus les couleurs.
+                            let ranges = view.line_matches(r.line);
+                            let current = view
+                                .current_match()
+                                .filter(|m| m.line == r.line_no)
+                                .map(|m| (m.start, m.end));
+                            spans.extend(
+                                textsearch::overlay(segments, r.offset, &ranges, current)
+                                    .into_iter()
+                                    .map(|(text, tok, hit)| {
+                                        let base = tok.map_or_else(Style::new, tok_style);
+                                        Span::styled(text, base.patch(hit_style(hit)))
+                                    }),
+                            );
+                            Line::from(spans)
+                        }
                     }
                 })
                 .collect()
@@ -831,6 +940,12 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
     if let Some(notice) = &view.notice {
         block = block.title_bottom(Line::from(Span::styled(
             format!(" ⚠ {notice} "),
+            Style::new().fg(Color::Yellow),
+        )));
+    }
+    if view.split && !view.split_active(width) {
+        block = block.title_bottom(Line::from(Span::styled(
+            format!(" ⚠ côte à côte : {MIN_SPLIT_WIDTH} colonnes minimum "),
             Style::new().fg(Color::Yellow),
         )));
     }
@@ -1242,9 +1357,9 @@ fn commit_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ fichier · Espace plier · a tout · / chercher · n/N · w repli · r actualiser · Esc retour",
-            "j/k défiler · ←/→ fichier · Espace plier · / chercher · w repli · Esc retour",
-            "←/→ · Espace · / · w · Esc",
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ fichier · Espace plier · a tout · / chercher · n/N · w repli · v côte à côte · r actualiser · Esc retour",
+            "j/k défiler · ←/→ fichier · Espace plier · / chercher · w repli · v côte à côte · Esc retour",
+            "←/→ · Espace · / · w · v · Esc",
             "Esc",
         ],
     )
@@ -1571,9 +1686,9 @@ fn pull_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · e code · w repli · r actualiser · Esc retour",
-            "j/k défiler · ←/→ section · Espace plier · / chercher · e code · w repli · Esc retour",
-            "←/→ · Espace · / · e · w · Esc",
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · e code · w repli · v côte à côte · r actualiser · Esc retour",
+            "j/k défiler · ←/→ section · Espace plier · / chercher · e code · w repli · v côte à côte · Esc retour",
+            "←/→ · Espace · / · e · w · v · Esc",
             "Esc",
         ],
     )
@@ -4405,6 +4520,15 @@ mod tests {
         };
         assert!(row(v).starts_with("1   -VIEUXQ"), "{}", row(v));
         assert!(row(n).starts_with("  1 +NEUFQ"), "{}", row(n));
+        // Côte à côte : trop étroit à 100 colonnes (avertissement), effectif à 130
+        let Some(crate::app::Page::Commit(v)) = app.stack.last_mut() else {
+            panic!("page d'un commit attendue");
+        };
+        v.text.split = true;
+        assert!(render(&app, 100, 24).contains("côte à côte : 120 colonnes minimum"));
+        let wide = render(&app, 130, 24);
+        assert!(wide.contains('⇄') && wide.contains("-VIEUXQ") && wide.contains("+NEUFQ"));
+        assert!(!wide.contains("120 colonnes minimum"));
     }
 
     /// Dessine l'application et renvoie la position (colonne, ligne) de la première occurrence
@@ -4583,5 +4707,52 @@ mod tests {
         let cont = rows.iter().find(|r| r.continuation && r.diff.is_some());
         let line = diff_row(cont.expect("une suite"), &view, 12);
         assert_eq!(line.spans[0].content.trim(), "");
+    }
+
+    #[test]
+    fn cote_a_cote_deux_moities_de_meme_largeur_et_texte_coupe() {
+        let long = "x".repeat(200);
+        let patch = format!(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -7,2 +7,2 @@\n-vieux\n-{long}\n+neuf\n+court\n"
+        );
+        let (parts, _) = crate::history::diff_parts(&patch, &[]);
+        let mut view = TextView::new();
+        view.split = true;
+        view.set_sectioned(Vec::new(), parts);
+        let rows = view.window(130, 100);
+        let split_rows: Vec<_> = rows.iter().filter_map(|r| r.split).collect();
+        assert_eq!(split_rows.len(), 2);
+        let text = |l: &Line| {
+            l.spans
+                .iter()
+                .map(|s| s.content.as_ref())
+                .collect::<String>()
+        };
+        let first = split_row(&split_rows[0], &view, 130);
+        let second = split_row(&split_rows[1], &view, 130);
+        for l in [&first, &second] {
+            assert_eq!(l.width(), 130, "toute la largeur, pas un caractère de plus");
+        }
+        let t = text(&first);
+        assert!(
+            t.contains("7 -vieux") && t.contains("│") && t.contains("7 +neuf"),
+            "{t}"
+        );
+        // Ligne trop longue : coupée avec « … », la moitié droite reste à sa place
+        let t = text(&second);
+        assert!(t.contains('…'), "{t}");
+        assert!(t.contains("+court"), "{t}");
+        assert_eq!(t.chars().position(|c| c == '│'), Some(64));
+        // Fonds : retiré à gauche, ajouté à droite
+        let bg = |l: &Line, s: &str| {
+            l.spans
+                .iter()
+                .find(|x| x.content.contains(s))
+                .unwrap()
+                .style
+                .bg
+        };
+        assert_eq!(bg(&first, "vieux"), Some(Color::Indexed(52)));
+        assert_eq!(bg(&first, "neuf"), Some(Color::Indexed(22)));
     }
 }

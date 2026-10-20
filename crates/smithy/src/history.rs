@@ -526,6 +526,7 @@ fn diff_line(file: usize, idx: usize, l: DiffLine) -> LogLine {
         file: file as u32,
         idx: idx as u32,
         marks: l.marks,
+        partner: l.partner,
     });
     line
 }
@@ -1084,5 +1085,65 @@ mod tests {
         assert_eq!(rows(40), 1);
         // L'en-tête (hors correctif) garde toute la largeur
         assert_eq!(v.text.total_rows(40), v.text.window(40, 100).len());
+    }
+
+    #[test]
+    fn vue_cote_a_cote_une_ligne_d_ecran_par_paire() {
+        // 2 retirées, 3 ajoutées : deux paires, puis une ajoutée sans vis-à-vis
+        let patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,3 +1,4 @@\n ctx\n-r1\n-r2\n+a1\n+a2\n+a3\n fin\n";
+        let (mut v, _) = CommitView::open(repo(), &commit(7), true);
+        v.apply_detail(&repo(), &commit(7).sha, Ok(detail(patch)));
+        let unified = v.text.total_rows(130);
+        v.text.split = true;
+        // Étroit : rien ne change
+        assert_eq!(v.text.total_rows(100), unified);
+        assert!(v.text.window(100, 400).iter().all(|r| r.split.is_none()));
+        // Large : les 2 ajoutées appariées disparaissent en tant que lignes
+        assert!(v.text.split_active(130));
+        assert_eq!(v.text.total_rows(130), unified - 2);
+        let rows = v.text.window(130, 400);
+        let sides: Vec<_> = rows
+            .iter()
+            .filter_map(|r| r.split)
+            .map(|s| (s.left.map(|l| l.text), s.right.map(|r| r.text)))
+            .collect();
+        assert_eq!(
+            sides,
+            [
+                (Some(" ctx"), Some(" ctx")),
+                (Some("-r1"), Some("+a1")),
+                (Some("-r2"), Some("+a2")),
+                (None, Some("+a3")),
+                (Some(" fin"), Some(" fin")),
+            ]
+        );
+        // L'en-tête du hunk et les métadonnées gardent toute la largeur
+        assert!(
+            rows.iter()
+                .any(|r| r.text == "@@ -1,3 +1,4 @@" && r.split.is_none())
+        );
+        // Replier un fichier retire aussi les lignes côte à côte
+        v.text.toggle_all(130, 40);
+        assert!(v.text.window(130, 400).iter().all(|r| r.split.is_none()));
+    }
+
+    #[test]
+    fn bascule_cote_a_cote_garde_la_ligne_du_haut() {
+        let mut patch = String::from("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1,50 +1,50 @@\n");
+        for i in 0..50 {
+            patch.push_str(&format!("-vieux {i}\n+neuf {i}\n"));
+        }
+        let (mut v, _) = CommitView::open(repo(), &commit(7), false);
+        v.apply_detail(&repo(), &commit(7).sha, Ok(detail(&patch)));
+        v.text.scroll = 60;
+        let top = |v: &CommitView| v.text.window(130, 1)[0].text.to_owned();
+        let before = top(&v);
+        v.text.toggle_split(130, 20);
+        assert!(v.text.split);
+        // Chaque paire tient sur une ligne : on retombe sur la même ligne ou sa voisine
+        let after = top(&v);
+        assert!(before.starts_with('-') || before.starts_with('+'));
+        assert!(after.starts_with('-') || after.starts_with('+'), "{after}");
+        assert!(v.text.scroll < 60);
     }
 }

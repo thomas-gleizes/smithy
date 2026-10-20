@@ -38,6 +38,9 @@ pub struct DiffInfo {
     pub idx: u32,
     /// Octets de `text` à mettre en évidence (mots modifiés d'une ligne remplacée).
     pub marks: Vec<(u32, u32)>,
+    /// Vis-à-vis d'une ligne remplacée (rang dans le fichier) : la retirée et l'ajoutée qui
+    /// se font face en vue côte à côte.
+    pub partner: Option<u32>,
 }
 
 pub struct DiffLine {
@@ -47,6 +50,7 @@ pub struct DiffLine {
     pub old: u32,
     pub new: u32,
     pub marks: Vec<(u32, u32)>,
+    pub partner: Option<u32>,
 }
 
 pub struct FileDiff {
@@ -162,6 +166,7 @@ pub fn parse(patch: &str, limit: usize) -> (Vec<FileDiff>, bool) {
             old,
             new,
             marks: Vec::new(),
+            partner: None,
         });
     }
     for file in &mut files {
@@ -271,6 +276,7 @@ fn ranges(s: &str, toks: &[(usize, usize)], keep: &[bool]) -> Ranges {
 /// deux (la 1re retirée avec la 1re ajoutée…) et marque ce qui change entre elles.
 fn mark_words(lines: &mut [DiffLine]) {
     let mut found: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+    let mut pairs: Vec<(usize, usize)> = Vec::new();
     let mut i = 0;
     while i < lines.len() {
         if lines[i].kind != DiffKind::Removed {
@@ -286,6 +292,7 @@ fn mark_words(lines: &mut [DiffLine]) {
             i += 1;
         }
         for k in 0..(added - removed).min(i - added) {
+            pairs.push((removed + k, added + k));
             let (o, n) = (&lines[removed + k].text, &lines[added + k].text);
             // Le préfixe (`-`, `+`) n'est pas du code : décalage de 1 octet.
             let Some((ro, rn)) = changed_words(&o[1..], &n[1..]) else {
@@ -302,6 +309,10 @@ fn mark_words(lines: &mut [DiffLine]) {
     }
     for (i, marks) in found {
         lines[i].marks = marks;
+    }
+    for (r, a) in pairs {
+        lines[r].partner = Some(a as u32);
+        lines[a].partner = Some(r as u32);
     }
 }
 
@@ -513,5 +524,14 @@ mod tests {
         let (files, cut) = parse(PATCH, 6);
         assert!(cut);
         assert_eq!(files[0].lines.len(), 6);
+    }
+
+    #[test]
+    fn vis_a_vis_des_lignes_remplacees() {
+        let patch = "diff --git a/f b/f\n@@ -1,3 +1,2 @@\n-a\n-b\n-c\n+x\n+y\n";
+        let (files, _) = parse(patch, 100);
+        let partners: Vec<_> = files[0].lines.iter().map(|l| l.partner).collect();
+        // En-tête, trois retirées, deux ajoutées : 1↔4 et 2↔5, la 3e retirée reste seule
+        assert_eq!(partners, [None, Some(4), Some(5), None, Some(1), Some(2)]);
     }
 }
