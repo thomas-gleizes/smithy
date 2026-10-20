@@ -520,7 +520,7 @@ impl TextView {
         };
         for line in lines {
             let Some(d) = &line.diff else { continue };
-            if matches!(d.kind, DiffKind::Hunk | DiffKind::Meta) {
+            if matches!(d.kind, DiffKind::Hunk | DiffKind::Meta | DiffKind::Gap) {
                 continue;
             }
             if let Some(runs) = styles
@@ -668,7 +668,7 @@ impl TextView {
                 left: None,
                 right: side(no),
             }),
-            DiffKind::Hunk | DiffKind::Meta => None,
+            DiffKind::Hunk | DiffKind::Meta | DiffKind::Gap => None,
         }
     }
 

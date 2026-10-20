@@ -14,6 +14,8 @@ pub enum DiffKind {
     Context,
     /// En-tête `@@ -a,b +c,d @@`.
     Hunk,
+    /// Lignes inchangées que le correctif ne montre pas, entre deux hunks (ou avant le premier).
+    Gap,
     /// `---`, `+++`, mode, renommage, `\ No newline…`, `Binary files…`.
     Meta,
 }
@@ -77,13 +79,26 @@ fn file_of_header(header: &str) -> String {
     }
 }
 
-/// Premières lignes de chaque côté d'un en-tête de hunk.
+/// Premières lignes de chaque côté d'un en-tête de hunk. Un côté sans ligne (`-5,0`) est
+/// annoncé avec la ligne d'avant : on donne la suivante.
 fn hunk_starts(header: &str) -> Option<(u32, u32)> {
     let rest = header.strip_prefix("@@ -")?;
     let (old, rest) = rest.split_once(' ')?;
     let new = rest.strip_prefix('+')?.split(' ').next()?;
-    let first = |s: &str| s.split(',').next()?.parse().ok();
+    let first = |s: &str| {
+        let (start, count) = s.split_once(',').unwrap_or((s, "1"));
+        let start: u32 = start.parse().ok()?;
+        Some(start + u32::from(count == "0"))
+    };
     Some((first(old)?, first(new)?))
+}
+
+fn gap_text(n: u32) -> String {
+    format!(
+        "⋯ {n} ligne{} inchangée{}",
+        if n > 1 { "s" } else { "" },
+        if n > 1 { "s" } else { "" }
+    )
 }
 
 /// Découpe un correctif en fichiers. Renvoie aussi si le plafond de lignes l'a coupé.
@@ -121,6 +136,19 @@ pub fn parse(patch: &str, limit: usize) -> (Vec<FileDiff>, bool) {
         let (kind, old, new) = if raw.starts_with("@@") {
             let starts = hunk_starts(raw);
             numbered = starts.is_some();
+            // Ce qui sépare ce hunk de la fin du précédent (ou du début du fichier).
+            let skipped = starts.map_or(0, |(_, n)| n.saturating_sub(at.map_or(1, |(_, n)| n)));
+            if skipped > 0 {
+                file.lines.push(DiffLine {
+                    kind: DiffKind::Gap,
+                    text: gap_text(skipped),
+                    old: 0,
+                    new: 0,
+                    marks: Vec::new(),
+                    partner: None,
+                });
+                total += 1;
+            }
             at = Some(starts.unwrap_or((0, 0)));
             (DiffKind::Hunk, 0, 0)
         } else if let Some((o, n)) = at.as_mut() {
@@ -419,6 +447,7 @@ mod tests {
             [
                 (DiffKind::Meta, 0, 0),
                 (DiffKind::Meta, 0, 0),
+                (DiffKind::Gap, 0, 0),
                 (DiffKind::Hunk, 0, 0),
                 (DiffKind::Context, 10, 10),
                 (DiffKind::Removed, 11, 0),
@@ -466,15 +495,15 @@ mod tests {
         let l = &files[0].lines;
         // « vieux » devient « neuf » : seul ce mot est marqué, préfixe compris dans les octets
         assert_eq!(
-            &l[4].text[l[4].marks[0].0 as usize..l[4].marks[0].1 as usize],
+            &l[5].text[l[5].marks[0].0 as usize..l[5].marks[0].1 as usize],
             "vieux"
         );
         assert_eq!(
-            &l[5].text[l[5].marks[0].0 as usize..l[5].marks[0].1 as usize],
+            &l[6].text[l[6].marks[0].0 as usize..l[6].marks[0].1 as usize],
             "neuf"
         );
         assert!(
-            l[6].marks.is_empty(),
+            l[7].marks.is_empty(),
             "la 2e ligne ajoutée n'a pas de vis-à-vis"
         );
     }
@@ -497,8 +526,8 @@ mod tests {
         let (files, _) = parse(PATCH, 100);
         let styles = highlight_file_diff(&files[0]);
         // Préfixe peint, même avant toute coloration syntaxique
-        assert_eq!(styles[4][0].tok, Tok::Removed);
-        assert_eq!(styles[5][0].tok, Tok::Added);
+        assert_eq!(styles[5][0].tok, Tok::Removed);
+        assert_eq!(styles[6][0].tok, Tok::Added);
         // `let` est un mot-clé Rust, décalé du préfixe
         let kw = |i: usize| {
             styles[i]
@@ -506,17 +535,17 @@ mod tests {
                 .find(|r| r.tok == Tok::Keyword)
                 .map(|r| (r.start, r.end))
         };
-        assert_eq!(kw(4), Some((1, 4)));
         assert_eq!(kw(5), Some((1, 4)));
-        assert_eq!(kw(3), None, "« contexte » n'est pas du code Rust");
+        assert_eq!(kw(6), Some((1, 4)));
+        assert_eq!(kw(4), None, "« contexte » n'est pas du code Rust");
     }
 
     #[test]
     fn langage_inconnu_garde_le_prefixe() {
         let patch = PATCH.replace("a.rs", "a.zzz");
         let styles = highlight_patch(&patch, 100);
-        assert_eq!(styles[0][4].len(), 1);
-        assert_eq!(styles[0][3].len(), 0);
+        assert_eq!(styles[0][5].len(), 1);
+        assert_eq!(styles[0][4].len(), 0);
     }
 
     #[test]
@@ -533,5 +562,59 @@ mod tests {
         let partners: Vec<_> = files[0].lines.iter().map(|l| l.partner).collect();
         // En-tête, trois retirées, deux ajoutées : 1↔4 et 2↔5, la 3e retirée reste seule
         assert_eq!(partners, [None, Some(4), Some(5), None, Some(1), Some(2)]);
+    }
+
+    #[test]
+    fn lignes_non_montrees_entre_les_hunks() {
+        let patch = "diff --git a/f b/f\n@@ -3,2 +3,2 @@\n a\n-b\n+B\n@@ -20,2 +20,3 @@\n c\n+d\n e\n@@ -30,0 +32,1 @@\n+z\n@@ -34 +35 @@\n-q\n+Q\n";
+        let (files, _) = parse(patch, 100);
+        let gaps: Vec<_> = files[0]
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffKind::Gap)
+            .map(|l| l.text.as_str())
+            .collect();
+        // Avant le 1er hunk : lignes 1-2 ; entre 1er et 2e : 5 à 19 ; puis 23 à 31 ; puis 33 à 34
+        assert_eq!(
+            gaps,
+            [
+                "⋯ 2 lignes inchangées",
+                "⋯ 15 lignes inchangées",
+                "⋯ 9 lignes inchangées",
+                "⋯ 2 lignes inchangées"
+            ]
+        );
+        // Un seul manquant : singulier ; contigus ou début du fichier : rien
+        let patch = "diff --git a/f b/f\n@@ -2 +2 @@\n-a\n+b\n@@ -4 +4 @@\n-c\n+d\n";
+        let (files, _) = parse(patch, 100);
+        let gaps: Vec<_> = files[0]
+            .lines
+            .iter()
+            .filter(|l| l.kind == DiffKind::Gap)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(gaps, ["⋯ 1 ligne inchangée", "⋯ 1 ligne inchangée"]);
+        let patch = "diff --git a/f b/f\n@@ -1 +1 @@\n-a\n+b\n@@ -2 +2 @@\n-c\n+d\n";
+        assert!(
+            parse(patch, 100).0[0]
+                .lines
+                .iter()
+                .all(|l| l.kind != DiffKind::Gap)
+        );
+        // Fichier ajouté ou supprimé : jamais de lignes manquantes
+        let patch = "diff --git a/f b/f\n@@ -0,0 +1,2 @@\n+a\n+b\n";
+        assert!(
+            parse(patch, 100).0[0]
+                .lines
+                .iter()
+                .all(|l| l.kind != DiffKind::Gap)
+        );
+        let patch = "diff --git a/f b/f\n@@ -1,2 +0,0 @@\n-a\n-b\n";
+        assert!(
+            parse(patch, 100).0[0]
+                .lines
+                .iter()
+                .all(|l| l.kind != DiffKind::Gap)
+        );
     }
 }

@@ -514,7 +514,7 @@ fn diff_line(file: usize, idx: usize, l: DiffLine) -> LogLine {
             },
         }],
         DiffKind::Hunk => whole(Tok::Hunk),
-        DiffKind::Meta => whole(Tok::Meta),
+        DiffKind::Meta | DiffKind::Gap => whole(Tok::Meta),
         DiffKind::Context => Vec::new(),
     };
     let mut line = LogLine::text(l.text);
