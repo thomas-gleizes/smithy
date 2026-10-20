@@ -190,12 +190,22 @@ jobs:
           cargo deb -p smithy --no-build --target "$TARGET" -o "dist/${ARCHIVE}.deb"
           ls -l dist
 
+      # Paquet Fedora/RHEL/openSUSE, même principe. Une version RPM n'admet pas
+      # de `-` : les builds manuels (`0.1.0-dev.<sha>`) n'en produisent pas.
+      - name: Paquet .rpm
+        if: matrix.os == 'linux' && !contains(steps.version.outputs.version, '-')
+        run: |
+          cargo install cargo-generate-rpm --locked
+          cargo generate-rpm -p crates/smithy --target "$TARGET" --arch "${TARGET%%-*}" -o "dist/${ARCHIVE}.rpm"
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARCHIVE }}
           path: |
             dist/${{ env.ARCHIVE }}.tar.gz
             dist/${{ env.ARCHIVE }}.deb
+            dist/${{ env.ARCHIVE }}.rpm
           if-no-files-found: error
 
   publish:
@@ -216,7 +226,7 @@ jobs:
       - name: Sommes de contrôle
         working-directory: dist
         run: |
-          sha256sum smithy_*.tar.gz smithy_*.deb > checksums.txt
+          sha256sum smithy_*.tar.gz smithy_*.deb smithy_*.rpm > checksums.txt
           cat checksums.txt
 
       - name: Publication de la release
@@ -224,7 +234,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          files=(dist/smithy_*.tar.gz dist/smithy_*.deb dist/checksums.txt)
+          files=(dist/smithy_*.tar.gz dist/smithy_*.deb dist/smithy_*.rpm dist/checksums.txt)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else

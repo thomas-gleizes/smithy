@@ -1,0 +1,26 @@
+# Maintainer: Thomas Gleizes <thomasgleizes34@gmail.com>
+#
+# Paquet « -bin » : installe le binaire statique (musl) des releases GitHub.
+# À chaque nouvelle version : mettre à jour `pkgver`, remettre `pkgrel=1`, puis
+# les sommes avec `updpkgsums` (pacman-contrib), qui lit les archives publiées.
+pkgname=smithy-bin
+pkgver=0.1.0
+pkgrel=1
+pkgdesc="TUI pour consulter la CI de forges git (Forgejo, GitHub)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/thomas-gleizes/smithy"
+license=('MIT' 'Apache-2.0')
+provides=('smithy')
+conflicts=('smithy')
+options=('!strip')
+source_x86_64=("smithy-$pkgver-x86_64.tar.gz::$url/releases/download/v$pkgver/smithy_linux_amd64.tar.gz")
+source_aarch64=("smithy-$pkgver-aarch64.tar.gz::$url/releases/download/v$pkgver/smithy_linux_arm64.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  install -Dm755 smithy "$pkgdir/usr/bin/smithy"
+  install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

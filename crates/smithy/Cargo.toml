@@ -36,5 +36,14 @@ assets = [
   ["../../LICENSE-APACHE", "usr/share/doc/smithy/LICENSE-APACHE", "644"],
 ]
 
+[package.metadata.generate-rpm]
+summary = "TUI pour consulter la CI de ses forges (Forgejo, GitHub)"
+assets = [
+  { source = "target/release/smithy", dest = "/usr/bin/smithy", mode = "755" },
+  { source = "README.md", dest = "/usr/share/doc/smithy/README.md", mode = "644", doc = true },
+  { source = "LICENSE-MIT", dest = "/usr/share/doc/smithy/LICENSE-MIT", mode = "644", doc = true },
+  { source = "LICENSE-APACHE", dest = "/usr/share/doc/smithy/LICENSE-APACHE", mode = "644", doc = true },
+]
+
 [lints]
 workspace = true

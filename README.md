@@ -72,6 +72,8 @@ curl -fLO https://github.com/thomas-gleizes/smithy/releases/latest/download/smit
 sudo apt install ./smithy_linux_amd64.deb
 ```
 
+On Fedora/RHEL/openSUSE, the same goes for the `.rpm` (`sudo dnf install ./smithy_linux_amd64.rpm`). On Arch, `packaging/arch/PKGBUILD` builds `smithy-bin` from the release archive (`makepkg -si` in that folder).
+
 Releases are published automatically: when CI passes on `main`, the next version is computed from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/): `feat` → minor, `fix`/`perf`/`refactor` → patch, `!` or `BREAKING CHANGE` → major; `docs`/`chore`/`ci`/`test` alone → no release), tagged and published. Pushing a `vX.Y.Z` tag by hand publishes that version. Any commit can also be built without publishing from the *Release* workflow (Actions tab → *Release* → *Run workflow*): the archives are kept as artifacts of the run.
 
 ### From source
