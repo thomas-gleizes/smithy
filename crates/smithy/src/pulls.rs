@@ -12,7 +12,8 @@ use smithy_core::{
 };
 
 use crate::{
-    highlight::Tok,
+    diff,
+    highlight::{Run, Tok},
     history::{FilterInput, all_words, diff_parts, plain, words_of},
     logview::{LogLine, LogState, Part, TextView},
     markdown,
@@ -263,8 +264,16 @@ impl PullView {
                 let (preface, parts, notice) = pull_layout(&d, timeago::now_epoch());
                 self.text.set_sectioned(preface, parts);
                 self.text.notice = notice;
+                self.text.diff_key = Some(diff::patch_key(&d.patch));
             }
             Err(e) => self.text.state = LogState::Failed(e.to_string()),
+        }
+    }
+
+    /// La coloration syntaxique du correctif, arrivée après le texte.
+    pub fn apply_styles(&mut self, repo: &Repo, number: u64, key: u64, styles: &[Vec<Vec<Run>>]) {
+        if *repo == self.repo && number == self.number {
+            self.text.set_diff_styles(key, styles);
         }
     }
 }

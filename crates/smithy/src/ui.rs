@@ -17,10 +17,11 @@ use crate::{
     },
     browser::{Browser, DirState, Mode, fmt_size},
     config::ServerKind,
+    diff::DiffKind,
     graph,
     highlight::{self, Tok},
     history::{BranchesView, CommitView, CommitsView},
-    logview::{LineKind, LogState, LogView, TextView},
+    logview::{self, LineKind, LogState, LogView, TextView},
     mouse::{self, Area, Target, Zones},
     pages::{HomeView, LastRun, Load, RepoView, RunPos, RunsView, Section, run_positions},
     pulls::{self, PullView, PullsView},
@@ -653,6 +654,97 @@ fn search_line(view: &TextView) -> Option<String> {
     })
 }
 
+/// Fonds d'une ligne de correctif : la ligne entière, puis les mots modifiés (plus marqués).
+/// En 256 couleurs : les 16 couleurs ANSI n'ont pas de vert ni de rouge assez sombres pour
+/// servir de fond à du texte.
+fn diff_background(kind: DiffKind) -> Option<(Color, Color)> {
+    match kind {
+        DiffKind::Added => Some((Color::Indexed(22), Color::Indexed(28))),
+        DiffKind::Removed => Some((Color::Indexed(52), Color::Indexed(88))),
+        _ => None,
+    }
+}
+
+/// Découpe aussi les morceaux aux limites des mots modifiés (`marks`, octets de la ligne).
+fn with_marks<'a>(
+    pieces: Vec<(&'a str, Option<Tok>, Hit)>,
+    offset: usize,
+    marks: &[(u32, u32)],
+) -> Vec<(&'a str, Option<Tok>, Hit, bool)> {
+    let mut out = Vec::new();
+    let mut pos = offset;
+    for (text, tok, hit) in pieces {
+        let (s, e) = (pos, pos + text.len());
+        pos = e;
+        let mut cuts = vec![s, e];
+        for &(a, b) in marks {
+            cuts.extend(
+                [a as usize, b as usize]
+                    .into_iter()
+                    .filter(|&x| x > s && x < e),
+            );
+        }
+        cuts.sort_unstable();
+        cuts.dedup();
+        for w in cuts.windows(2) {
+            let marked = marks
+                .iter()
+                .any(|&(a, b)| a as usize <= w[0] && w[1] <= b as usize);
+            out.push((&text[w[0] - s..w[1] - s], tok, hit, marked));
+        }
+    }
+    out
+}
+
+/// Une ligne d'écran d'un correctif : gouttière des numéros (vide sur la suite d'une ligne
+/// repliée), fond selon la nature de la ligne, mots modifiés plus marqués, puis les couleurs
+/// syntaxiques et la recherche comme ailleurs.
+fn diff_row<'a>(r: &logview::Row<'a>, view: &'a TextView, width: usize) -> Line<'a> {
+    let Some(d) = r.diff else {
+        return Line::from(r.text);
+    };
+    let bg = diff_background(d.kind);
+    let mut spans = Vec::new();
+    if view.gutter > 0 {
+        let w = (view.gutter - 2) / 2;
+        let number = |n: u32| {
+            if n == 0 || r.continuation {
+                " ".repeat(w)
+            } else {
+                format!("{n:>w$}")
+            }
+        };
+        spans.push(Span::styled(
+            format!("{} {} ", number(d.old), number(d.new)),
+            Style::new().fg(Color::DarkGray),
+        ));
+    }
+    let segments = highlight::segments(r.text, r.offset, r.runs);
+    let ranges = view.line_matches(r.line);
+    let current = view
+        .current_match()
+        .filter(|m| m.line == r.line_no)
+        .map(|m| (m.start, m.end));
+    let pieces = textsearch::overlay(segments, r.offset, &ranges, current);
+    spans.extend(with_marks(pieces, r.offset, &d.marks).into_iter().map(
+        |(text, tok, hit, marked)| {
+            let mut style = tok.map_or_else(Style::new, tok_style).patch(hit_style(hit));
+            if marked && let Some((_, strong)) = bg {
+                style = style.bg(strong);
+            }
+            Span::styled(text, style)
+        },
+    ));
+    let Some((line_bg, _)) = bg else {
+        return Line::from(spans);
+    };
+    // Le style d'une ligne ne déborde pas de son texte : on complète avec des espaces pour que
+    // le fond aille jusqu'au bord.
+    let used: usize = spans.iter().map(Span::width).sum();
+    spans.push(Span::raw(" ".repeat(width.saturating_sub(used))));
+    Line::from(spans).style(Style::new().bg(line_bg))
+}
+
 fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, view: &TextView) {
     let block = Block::default()
         .borders(Borders::ALL)
@@ -696,6 +788,7 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
                         };
                         Line::from(Span::styled(r.text, style))
                     }
+                    LineKind::Text if r.diff.is_some() => diff_row(&r, view, width),
                     LineKind::Text
                         if r.runs.is_empty() && r.hang.is_empty() && !view.has_search() =>
                     {
@@ -2402,6 +2495,7 @@ mod tests {
             runs: Vec::new(),
             hang: String::new(),
             words: false,
+            diff: None,
         }
     }
 
@@ -3781,7 +3875,7 @@ mod tests {
                 comments: None,
                 checks: Some(Status::Failure),
                 statuses: vec![],
-                patch: "diff --git a/a.txt b/a.txt\n+x\n".into(),
+                patch: "diff --git a/a.txt b/a.txt\n@@ -0,0 +1 @@\n+x\n".into(),
                 patch_truncated: false,
             }),
         );
@@ -3867,6 +3961,7 @@ mod tests {
             ],
             hang: String::new(),
             words: false,
+            diff: None,
         }]));
         app.viewport.set(5);
         let mut term = Terminal::new(TestBackend::new(60, 10)).unwrap();
@@ -3920,6 +4015,7 @@ mod tests {
             runs: Vec::new(),
             hang: String::new(),
             words: false,
+            diff: None,
         }]));
         app.viewport.set(5);
         app.viewport_width.set(40);
@@ -4284,15 +4380,31 @@ mod tests {
             assert!(text.contains(needle), "absent : {needle}\n{text}");
         }
         assert!(!text.contains("index 1..2"), "la ligne index est masquée");
-        let fg = |sym: &str| {
+        let cell = |sym: &str| {
             buf.content()
                 .iter()
-                .find(|c| c.symbol() == sym)
-                .map(|c| c.fg)
+                .position(|c| c.symbol() == sym)
+                .unwrap()
         };
-        assert_eq!(fg("V"), Some(Color::Red), "ligne retirée");
-        assert_eq!(fg("N"), Some(Color::Green), "ligne ajoutée");
-        assert_eq!(fg("@"), Some(Color::Cyan), "en-tête de hunk");
+        let (v, n, at) = (cell("V"), cell("N"), cell("@"));
+        // Le fond couvre toute la ligne (jusqu'au bord du cadre), le texte garde sa couleur
+        assert_eq!(buf.content()[v].bg, Color::Indexed(52), "ligne retirée");
+        assert_eq!(
+            buf.content()[v + 60].bg,
+            Color::Indexed(52),
+            "fond pleine largeur"
+        );
+        assert_eq!(buf.content()[n].bg, Color::Indexed(22), "ligne ajoutée");
+        assert_eq!(buf.content()[at].fg, Color::Cyan, "en-tête de hunk");
+        // Le préfixe est peint et la gouttière donne les numéros de ligne
+        assert_eq!(buf.content()[v - 1].fg, Color::Red);
+        assert_eq!(buf.content()[n - 1].fg, Color::Green);
+        let row = |i: usize| -> String {
+            let y = (i / 100) as u16;
+            (1..99).map(|x| buf[(x, y)].symbol()).collect()
+        };
+        assert!(row(v).starts_with("1   -VIEUXQ"), "{}", row(v));
+        assert!(row(n).starts_with("  1 +NEUFQ"), "{}", row(n));
     }
 
     /// Dessine l'application et renvoie la position (colonne, ligne) de la première occurrence
@@ -4434,5 +4546,42 @@ mod tests {
         app.open_login("maison", "", false);
         render(&app, w, h);
         assert_eq!(app.zones.hit(0, h - 1), Some(Target::Overlay));
+    }
+
+    #[test]
+    fn mots_modifies_plus_marques_et_gouttiere_vide_sur_la_suite() {
+        let patch =
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -3 +3 @@\n-let vieux = 1;\n+let neuf = 1;\n";
+        let (parts, _) = crate::history::diff_parts(patch, &[]);
+        let mut view = TextView::new();
+        view.wrap = true;
+        view.set_sectioned(Vec::new(), parts);
+        let rows = view.window(12, 100);
+        let first = rows
+            .iter()
+            .find(|r| r.text.starts_with("-let"))
+            .expect("ligne retirée");
+        let line = diff_row(first, &view, 12);
+        let bg_of = |line: &Line, text: &str| {
+            line.spans
+                .iter()
+                .find(|s| s.content == text)
+                .unwrap_or_else(|| panic!("{text} absent de {line:?}"))
+                .style
+                .bg
+        };
+        assert_eq!(line.spans[0].content, "3   ", "numéro avant, rien après");
+        // Large : les mots changés ont le fond fort, le reste de la ligne le fond de la ligne
+        let wide = view.window(40, 100);
+        let first = wide.iter().find(|r| r.text.starts_with("-let")).unwrap();
+        let line = diff_row(first, &view, 40);
+        assert_eq!(bg_of(&line, "vieux"), Some(Color::Indexed(88)));
+        let added = wide.iter().find(|r| r.text.starts_with("+let")).unwrap();
+        let line = diff_row(added, &view, 40);
+        assert_eq!(bg_of(&line, "neuf"), Some(Color::Indexed(28)));
+        // Sur la suite d'une ligne repliée, la gouttière est vide
+        let cont = rows.iter().find(|r| r.continuation && r.diff.is_some());
+        let line = diff_row(cont.expect("une suite"), &view, 12);
+        assert_eq!(line.spans[0].content.trim(), "");
     }
 }

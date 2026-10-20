@@ -10,6 +10,7 @@ use smithy_core::{
 use crate::{
     browser::{Browser, Mode},
     config::ServerKind,
+    diff::DiffTarget,
     highlight::Run,
     history::{BranchesView, CommitView, CommitsView},
     logview::{LogState, LogView, Start, TextView},
@@ -96,6 +97,14 @@ pub enum Msg {
         styles: Vec<Vec<Run>>,
         /// Markdown : régions de la vue mise en forme (empreinte de son texte, régions par ligne).
         rendered: Option<(u64, Vec<Vec<Run>>)>,
+    },
+    /// La coloration syntaxique du correctif d'un commit ou d'une PR, calculée à part une fois
+    /// le texte affiché (`key` : empreinte du correctif).
+    DiffStyles {
+        repo: Repo,
+        target: crate::diff::DiffTarget,
+        key: u64,
+        styles: Vec<Vec<Vec<Run>>>,
     },
     /// Résultat de la sonde de joignabilité d'un serveur (version si connue, ou raison).
     Reach {
@@ -1307,6 +1316,24 @@ impl App {
                 for page in self.stacks_of(server).into_iter().flatten() {
                     if let Page::Commit(v) = page {
                         v.apply_detail(&repo, &sha, result.clone());
+                    }
+                }
+            }
+            Msg::DiffStyles {
+                repo,
+                target,
+                key,
+                styles,
+            } => {
+                for page in self.stacks_of(server).into_iter().flatten() {
+                    match (page, &target) {
+                        (Page::Commit(v), DiffTarget::Commit(sha)) => {
+                            v.apply_styles(&repo, sha, key, &styles);
+                        }
+                        (Page::Pull(v), DiffTarget::Pull(number)) => {
+                            v.apply_styles(&repo, *number, key, &styles);
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -5123,6 +5150,37 @@ mod tests {
         });
         a.viewport.set(20);
         a.viewport_width.set(60);
+        // La coloration arrive à part : refusée pour un autre commit ou un autre correctif
+        let patch = "diff --git a/a.txt b/a.txt\nnew file mode 100644\n--- /dev/null\n+++ b/a.txt\n@@ -0,0 +1 @@\n+x\n";
+        let colored = |a: &App| {
+            let v = a.commit_view().unwrap();
+            let rows = v.text.window(60, 40);
+            let row = rows.iter().find(|r| r.text == "+x").unwrap();
+            row.runs.iter().any(|r| r.tok == crate::highlight::Tok::Str)
+        };
+        let styles = vec![vec![
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![crate::highlight::Run {
+                start: 1,
+                end: 2,
+                tok: crate::highlight::Tok::Str,
+            }],
+        ]];
+        let styled = |sha: String, key| Msg::DiffStyles {
+            repo: repo("a"),
+            target: crate::diff::DiffTarget::Commit(sha),
+            key,
+            styles: styles.clone(),
+        };
+        let key = crate::diff::patch_key(patch);
+        a.apply(styled(commit_of(9).sha, key));
+        a.apply(styled(commit_of(3).sha, key + 1));
+        assert!(!colored(&a));
+        a.apply(styled(commit_of(3).sha, key));
+        assert!(colored(&a));
         // Les touches de texte (recherche, sections) agissent sur le correctif
         a.text_search_begin();
         "ajout".chars().for_each(|c| a.text_prompt_type(c));

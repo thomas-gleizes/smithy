@@ -34,6 +34,7 @@ impl MdLine {
             runs: self.runs,
             hang: self.hang,
             words: self.words,
+            diff: None,
         }
     }
 }

@@ -12,6 +12,7 @@ use std::cell::RefCell;
 use smithy_core::{JobLog, Pipeline, Repo, Status};
 
 use crate::{
+    diff::{DiffInfo, DiffKind},
     highlight::Run,
     textsearch::{find_ranges, smart_case},
     wrap,
@@ -36,6 +37,8 @@ pub struct LogLine {
     /// d'une puce, barre d'une citation), et retour à la ligne par mots plutôt qu'au caractère.
     pub hang: String,
     pub words: bool,
+    /// Ligne d'un correctif : numéros, mots modifiés (voir `diff`).
+    pub diff: Option<DiffInfo>,
 }
 
 /// Une section à afficher : son titre (coloré selon `status`), ses lignes et si elle démarre pliée.
@@ -56,6 +59,7 @@ impl LogLine {
             runs: Vec::new(),
             hang: String::new(),
             words: false,
+            diff: None,
         }
     }
 
@@ -88,6 +92,8 @@ pub struct Row<'a> {
     pub line: &'a str,
     /// Suite d'une ligne repliée (et non début d'une ligne de log).
     pub continuation: bool,
+    /// Ligne d'un correctif : l'affichage y ajoute la gouttière et le fond.
+    pub diff: Option<&'a DiffInfo>,
     /// Titre de la section courante (celle que `Espace` plie ou déplie).
     pub current: bool,
 }
@@ -178,6 +184,16 @@ struct RowIndex {
     starts: Vec<usize>,
 }
 
+/// Colonnes de la gouttière : deux numéros de la largeur du plus grand, et une séparation.
+fn gutter_of(lines: &[LogLine]) -> usize {
+    let max = lines
+        .iter()
+        .filter_map(|l| l.diff.as_ref())
+        .map(|d| d.old.max(d.new))
+        .max();
+    max.map_or(0, |m| 2 * (m.max(1).ilog10() as usize + 1) + 2)
+}
+
 /// Empreinte d'un texte ligne à ligne (voir `TextView::fingerprint`).
 pub fn fingerprint_of<'a>(lines: impl IntoIterator<Item = &'a String>) -> u64 {
     use std::hash::{Hash, Hasher};
@@ -225,6 +241,11 @@ pub struct TextView {
     /// la section courante est celle de la ligne du haut.
     selected: Option<usize>,
     index: RefCell<Option<RowIndex>>,
+    /// Colonnes de la gouttière des numéros de ligne d'un correctif (0 : aucune). Elle prend de
+    /// la largeur au texte des lignes de correctif, pas aux autres.
+    pub gutter: usize,
+    /// Empreinte du correctif affiché : une coloration n'est appliquée qu'à celui-là.
+    pub diff_key: Option<u64>,
 }
 
 impl TextView {
@@ -239,6 +260,8 @@ impl TextView {
             search: None,
             selected: None,
             index: RefCell::new(None),
+            gutter: 0,
+            diff_key: None,
         }
     }
 
@@ -256,6 +279,7 @@ impl TextView {
                     runs: Vec::new(),
                     hang: String::new(),
                     words: false,
+                    diff: None,
                 })
                 .collect(),
         );
@@ -388,6 +412,7 @@ impl TextView {
         if self.wrap
             && let Some(line) = self.lines().get(m.line)
         {
+            let width = self.text_width(line, width);
             let parts = wrap::layout(&line.text, width, line.hang_width(), line.words);
             row += parts.iter().rposition(|p| p.0 <= m.start).unwrap_or(0);
         }
@@ -458,6 +483,39 @@ impl TextView {
         true
     }
 
+    /// Applique la coloration d'un correctif (par fichier, par ligne : voir `diff::highlight_patch`).
+    /// Refusée si ce n'est plus le correctif pour lequel elle a été calculée.
+    pub fn set_diff_styles(&mut self, key: u64, styles: &[Vec<Vec<Run>>]) -> bool {
+        if self.diff_key != Some(key) {
+            return false;
+        }
+        let LogState::Ready(lines) = &mut self.state else {
+            return false;
+        };
+        for line in lines {
+            let Some(d) = &line.diff else { continue };
+            if matches!(d.kind, DiffKind::Hunk | DiffKind::Meta) {
+                continue;
+            }
+            if let Some(runs) = styles
+                .get(d.file as usize)
+                .and_then(|f| f.get(d.idx as usize))
+            {
+                line.runs.clone_from(runs);
+            }
+        }
+        true
+    }
+
+    /// Largeur du texte d'une ligne : celle de l'écran, moins la gouttière d'une ligne de correctif.
+    fn text_width(&self, line: &LogLine, width: usize) -> usize {
+        if line.diff.is_some() {
+            width.saturating_sub(self.gutter).max(1)
+        } else {
+            width
+        }
+    }
+
     /// Remplace le contenu. L'état plié/déplié des étapes déjà vues est conservé ; une étape
     /// vue pour la première fois prend le réglage par défaut selon son statut (donc une étape
     /// ouverte parce qu'elle tournait le reste après sa fin). Le défilement est à recaler.
@@ -502,6 +560,7 @@ impl TextView {
                 runs: Vec::new(),
                 hang: String::new(),
                 words: false,
+                diff: None,
             });
             lines.extend(part.lines.into_iter().map(|mut l| {
                 l.step = Some(i);
@@ -509,6 +568,7 @@ impl TextView {
             }));
         }
         self.sections = sections;
+        self.gutter = gutter_of(&lines);
         self.state = LogState::Ready(lines);
         self.refresh_headers();
         self.refresh_search();
@@ -517,6 +577,7 @@ impl TextView {
     /// Remplace le contenu par des lignes sans étape, donc jamais repliées (fichier, Markdown).
     pub fn set_lines(&mut self, lines: Vec<LogLine>) {
         self.sections.clear();
+        self.gutter = gutter_of(&lines);
         self.state = LogState::Ready(lines);
         *self.index.borrow_mut() = None;
         self.refresh_search();
@@ -560,7 +621,7 @@ impl TextView {
                 total += if self.hidden(l) {
                     0
                 } else if self.wrap {
-                    wrap::count(&l.text, key, l.hang_width(), l.words)
+                    wrap::count(&l.text, self.text_width(l, key), l.hang_width(), l.words)
                 } else {
                     1
                 };
@@ -735,11 +796,13 @@ impl TextView {
                     line_no,
                     line: &line.text,
                     continuation,
+                    diff: line.diff.as_ref(),
                     current: is_current,
                 });
                 out.len() == height
             };
             if self.wrap {
+                let width = self.text_width(line, width);
                 let parts = wrap::layout(&line.text, width, line.hang_width(), line.words);
                 for (n, (start, end)) in parts.into_iter().enumerate() {
                     if skip > 0 {
@@ -791,6 +854,7 @@ mod tests {
                     runs: Vec::new(),
                     hang: String::new(),
                     words: false,
+                    diff: None,
                 })
                 .collect(),
         );
@@ -920,6 +984,7 @@ mod tests {
             runs: Vec::new(),
             hang: String::new(),
             words: false,
+            diff: None,
         }]);
         assert_eq!(v.total_rows(6), 2, "autre contenu : recalculé");
     }

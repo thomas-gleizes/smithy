@@ -2,6 +2,7 @@ mod app;
 mod browser;
 mod clipboard;
 mod config;
+mod diff;
 mod graph;
 mod highlight;
 mod history;
@@ -38,6 +39,7 @@ use tokio::sync::mpsc::{self, UnboundedSender};
 use app::{App, Msg};
 use browser::{Browser, FILE_LIMIT_BYTES, Screen};
 use config::{Server, ServerKind};
+use diff::DiffTarget;
 use mouse::Target;
 use recent::RecentStore;
 use request::Request;
@@ -794,6 +796,7 @@ fn run_request<P: Provider + 'static>(
     let (p, tx) = (p.clone(), tx.clone());
     tokio::spawn(async move {
         let mut styling = None;
+        let mut diff_styling = None;
         let msg = match req {
             Request::Repos(source) => {
                 let result = p.list_repos(&source).await;
@@ -836,6 +839,13 @@ fn run_request<P: Provider + 'static>(
                 let result = p
                     .commit_detail(&repo, &sha, history::PATCH_LIMIT_BYTES)
                     .await;
+                if let Ok(d) = &result {
+                    diff_styling = Some((
+                        repo.clone(),
+                        DiffTarget::Commit(sha.clone()),
+                        d.patch.clone(),
+                    ));
+                }
                 Msg::CommitDetail { repo, sha, result }
             }
             Request::Pulls { repo, filter, page } => {
@@ -852,6 +862,9 @@ fn run_request<P: Provider + 'static>(
                     .pull_detail(&repo, number, pulls::PATCH_LIMIT_BYTES)
                     .await
                     .map(Box::new);
+                if let Ok(d) = &result {
+                    diff_styling = Some((repo.clone(), DiffTarget::Pull(number), d.patch.clone()));
+                }
                 Msg::PullDetail {
                     repo,
                     number,
@@ -897,6 +910,26 @@ fn run_request<P: Provider + 'static>(
             }
         };
         let _ = tx.send((server.clone(), msg));
+        if let Some((repo, target, patch)) =
+            diff_styling.filter(|(_, _, p): &(_, _, String)| !p.is_empty())
+        {
+            // Même principe que pour un fichier : le texte est affiché, la coloration suit.
+            let key = diff::patch_key(&patch);
+            let job = tokio::task::spawn_blocking(move || {
+                diff::highlight_patch(&patch, history::PATCH_LIMIT_LINES)
+            });
+            if let Ok(styles) = job.await {
+                let _ = tx.send((
+                    server.clone(),
+                    Msg::DiffStyles {
+                        repo,
+                        target,
+                        key,
+                        styles,
+                    },
+                ));
+            }
+        }
         if let Some((repo, reference, path, lines, markdown_source)) = styling {
             // Chargement des grammaires et analyse : hors du fil de l'interface.
             let job = tokio::task::spawn_blocking(move || {

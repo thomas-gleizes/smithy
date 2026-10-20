@@ -11,6 +11,7 @@ use smithy_core::{
 };
 
 use crate::{
+    diff::{self, DiffInfo, DiffKind, DiffLine},
     highlight::{Run, Tok},
     logview::{LogLine, LogState, Part, TextView},
     request::Request,
@@ -441,8 +442,16 @@ impl CommitView {
                 let (preface, parts, notice) = diff_layout(&d, timeago::now_epoch());
                 self.text.set_sectioned(preface, parts);
                 self.text.notice = notice;
+                self.text.diff_key = Some(diff::patch_key(&d.patch));
             }
             Err(e) => self.text.state = LogState::Failed(e.to_string()),
+        }
+    }
+
+    /// La coloration syntaxique du correctif, arrivée après le texte.
+    pub fn apply_styles(&mut self, repo: &Repo, sha: &str, key: u64, styles: &[Vec<Vec<Run>>]) {
+        if *repo == self.repo && sha == self.sha {
+            self.text.set_diff_styles(key, styles);
         }
     }
 }
@@ -483,46 +492,42 @@ fn kind_status(kind: ChangeKind) -> Status {
     }
 }
 
-fn diff_line(raw: &str) -> LogLine {
-    let tok = if raw.starts_with("+++") || raw.starts_with("---") {
-        Some(Tok::Meta)
-    } else if raw.starts_with('+') {
-        Some(Tok::Added)
-    } else if raw.starts_with('-') {
-        Some(Tok::Removed)
-    } else if raw.starts_with("@@") {
-        Some(Tok::Hunk)
-    } else if raw.starts_with('\\')
-        || raw.starts_with("new file")
-        || raw.starts_with("deleted file")
-        || raw.starts_with("rename ")
-        || raw.starts_with("similarity")
-        || raw.starts_with("copy ")
-        || raw.starts_with("old mode")
-        || raw.starts_with("new mode")
-        || raw.starts_with("Binary files")
-    {
-        Some(Tok::Meta)
-    } else {
-        None
+/// Une ligne du correctif, avec ce qu'il faut à l'affichage (numéros, mots modifiés).
+fn diff_line(file: usize, idx: usize, l: DiffLine) -> LogLine {
+    let whole = |tok| {
+        vec![Run {
+            start: 0,
+            end: l.text.len() as u32,
+            tok,
+        }]
     };
-    plain(raw, tok)
-}
-
-/// Nom du fichier d'un en-tête `diff --git a/X b/Y` : Y, sauf pour un fichier supprimé.
-fn file_of_header(header: &str) -> String {
-    let rest = header.trim_start_matches("diff --git ");
-    match rest.split_once(" b/") {
-        Some((a, b)) => {
-            let a = a.trim_start_matches("a/");
-            if b.is_empty() {
-                a.to_owned()
+    // Le texte du code garde sa couleur : seul le préfixe `+`/`-` est peint (la coloration
+    // syntaxique, calculée à part, s'y ajoute).
+    let runs = match l.kind {
+        DiffKind::Added | DiffKind::Removed => vec![Run {
+            start: 0,
+            end: l.text.len().min(1) as u32,
+            tok: if l.kind == DiffKind::Added {
+                Tok::Added
             } else {
-                b.to_owned()
-            }
-        }
-        None => rest.to_owned(),
-    }
+                Tok::Removed
+            },
+        }],
+        DiffKind::Hunk => whole(Tok::Hunk),
+        DiffKind::Meta => whole(Tok::Meta),
+        DiffKind::Context => Vec::new(),
+    };
+    let mut line = LogLine::text(l.text);
+    line.runs = runs;
+    line.diff = Some(DiffInfo {
+        kind: l.kind,
+        old: l.old,
+        new: l.new,
+        file: file as u32,
+        idx: idx as u32,
+        marks: l.marks,
+    });
+    line
 }
 
 /// Met le commit en forme : un en-tête libre (empreinte, auteur, date, parents, message,
@@ -586,65 +591,28 @@ pub fn diff_layout(d: &CommitDetail, now: i64) -> (Vec<LogLine>, Vec<Part>, Opti
 /// couleur : nature du changement, d'après `files` ou, à défaut, les en-têtes du diff).
 /// Renvoie aussi si le plafond de lignes a coupé le correctif.
 pub fn diff_parts(patch: &str, files: &[FileChange]) -> (Vec<Part>, bool) {
-    struct Block {
-        path: String,
-        lines: Vec<LogLine>,
-        adds: usize,
-        dels: usize,
-        kind_hint: Option<ChangeKind>,
-    }
-    let mut blocks: Vec<Block> = Vec::new();
-    let mut total = 0usize;
-    let mut line_cut = false;
-    for raw in patch.lines() {
-        if raw.starts_with("diff --git ") {
-            blocks.push(Block {
-                path: file_of_header(raw),
-                lines: Vec::new(),
-                adds: 0,
-                dels: 0,
-                kind_hint: None,
-            });
-            continue;
-        }
-        let Some(b) = blocks.last_mut() else { continue };
-        // L'empreinte des blobs n'apporte rien à la lecture.
-        if raw.starts_with("index ") {
-            continue;
-        }
-        if total >= PATCH_LIMIT_LINES {
-            line_cut = true;
-            break;
-        }
-        total += 1;
-        if raw.starts_with("new file mode") {
-            b.kind_hint = Some(ChangeKind::Added);
-        } else if raw.starts_with("deleted file mode") {
-            b.kind_hint = Some(ChangeKind::Removed);
-        } else if raw.starts_with("rename from") {
-            b.kind_hint = Some(ChangeKind::Renamed);
-        } else if raw.starts_with('+') && !raw.starts_with("+++") {
-            b.adds += 1;
-        } else if raw.starts_with('-') && !raw.starts_with("---") {
-            b.dels += 1;
-        }
-        b.lines.push(diff_line(raw));
-    }
-
-    let parts: Vec<Part> = blocks
+    let (blocks, line_cut) = diff::parse(patch, PATCH_LIMIT_LINES);
+    let parts = blocks
         .into_iter()
-        .map(|b| {
+        .enumerate()
+        .map(|(n, b)| {
             let kind = files
                 .iter()
                 .find(|f| f.path == b.path)
                 .map(|f| f.kind)
-                .or(b.kind_hint)
+                .or(b.hint)
                 .unwrap_or(ChangeKind::Modified);
+            let lines: Vec<LogLine> = b
+                .lines
+                .into_iter()
+                .enumerate()
+                .map(|(i, l)| diff_line(n, i, l))
+                .collect();
             Part {
                 name: format!("{}  +{} −{}", b.path, b.adds, b.dels),
                 status: kind_status(kind),
-                collapsed: b.lines.len() >= COLLAPSE_FROM_LINES,
-                lines: b.lines,
+                collapsed: lines.len() >= COLLAPSE_FROM_LINES,
+                lines,
             }
         })
         .collect();
@@ -970,7 +938,7 @@ mod tests {
         assert_eq!(parts[0].status, Status::Running);
         assert_eq!(parts[1].status, Status::Success);
         assert!(parts.iter().all(|p| !p.collapsed));
-        // Les régions couvrent toute la ligne, sur des frontières de caractères
+        // Les régions tombent sur des frontières de caractères
         for p in &parts {
             for l in &p.lines {
                 for r in &l.runs {
@@ -979,6 +947,17 @@ mod tests {
                 }
             }
         }
+        // Numéros de ligne : le contexte compte des deux côtés, `-` avant et `+` après
+        let numbers: Vec<_> = parts[0]
+            .lines
+            .iter()
+            .filter_map(|l| l.diff.as_ref())
+            .map(|d| (d.old, d.new))
+            .collect();
+        assert_eq!(
+            numbers,
+            [(0, 0), (0, 0), (0, 0), (1, 1), (2, 0), (0, 2), (0, 3)]
+        );
     }
 
     #[test]
@@ -1035,9 +1014,9 @@ mod tests {
         let lines: Vec<_> = parts[0].lines.iter().map(|l| l.text.as_str()).collect();
         assert!(lines[3].starts_with("-    vieux\u{241b}"), "{lines:?}");
         assert_eq!(lines[4], "+    neuf");
-        // La couleur couvre le texte nettoyé
+        // Seul le préfixe est peint : le code garde la couleur du terminal
         let r = parts[0].lines[3].runs[0];
-        assert_eq!(r.end as usize, parts[0].lines[3].text.len());
+        assert_eq!((r.start, r.end, r.tok), (0, 1, Tok::Removed));
     }
 
     #[test]
@@ -1057,5 +1036,53 @@ mod tests {
         assert!(matches!(v.text.state, LogState::Ready(_)));
         v.apply_detail(&repo(), &commit(7).sha, Err(Error::Network("hs".into())));
         assert!(matches!(&v.text.state, LogState::Failed(m) if m.contains("hs")));
+    }
+
+    #[test]
+    fn la_coloration_du_correctif_arrive_apres_le_texte() {
+        let patch = "diff --git a/a.rs b/a.rs\n--- a/a.rs\n+++ b/a.rs\n@@ -1 +1 @@\n-let a = 1;\n+let b = 1;\n";
+        let (mut v, _) = CommitView::open(repo(), &commit(7), true);
+        v.apply_detail(&repo(), &commit(7).sha, Ok(detail(patch)));
+        let styles = diff::highlight_patch(patch, PATCH_LIMIT_LINES);
+        let keyword = |v: &CommitView| {
+            v.text
+                .window(80, 40)
+                .iter()
+                .filter(|r| r.text == "+let b = 1;")
+                .map(|r| r.runs.iter().any(|r| r.tok == Tok::Keyword))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            keyword(&v),
+            [false],
+            "texte seul : pas de couleur syntaxique"
+        );
+        // Autre commit, ou correctif qui a changé depuis : refusée
+        v.apply_styles(&repo(), "autre", diff::patch_key(patch), &styles);
+        v.apply_styles(&repo(), &commit(7).sha, 1, &styles);
+        assert_eq!(keyword(&v), [false]);
+        v.apply_styles(&repo(), &commit(7).sha, diff::patch_key(patch), &styles);
+        assert_eq!(keyword(&v), [true]);
+        // Le préfixe reste peint, la gouttière a la largeur du plus grand numéro
+        assert_eq!(v.text.gutter, 4);
+    }
+
+    #[test]
+    fn la_gouttiere_prend_de_la_largeur_aux_lignes_du_correctif_seulement() {
+        let patch = "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n+abcdefghij\n";
+        let (mut v, _) = CommitView::open(repo(), &commit(7), true);
+        v.apply_detail(&repo(), &commit(7).sha, Ok(detail(patch)));
+        // Gouttière de 4 colonnes : « +abcdefghij » (11) sur 8 colonnes = 4 de texte → 3 lignes
+        let rows = |w| {
+            v.text
+                .window(w, 400)
+                .iter()
+                .filter(|r| r.diff.is_some_and(|d| d.kind == diff::DiffKind::Added))
+                .count()
+        };
+        assert_eq!(rows(8), 3);
+        assert_eq!(rows(40), 1);
+        // L'en-tête (hors correctif) garde toute la largeur
+        assert_eq!(v.text.total_rows(40), v.text.window(40, 100).len());
     }
 }
