@@ -435,8 +435,10 @@ impl TextView {
         }
         // Ligne d'écran de l'occurrence : celle du morceau replié qui la contient.
         let mut row = self.row_of_line(width, m.line);
+        // Côte à côte, une ligne de correctif n'occupe qu'une ligne d'écran (pas de repli).
         if self.wrap
             && let Some(line) = self.lines().get(m.line)
+            && !(self.split_active(width) && line.diff.is_some())
         {
             let width = self.text_width(line, width);
             let parts = wrap::layout(&line.text, width, line.hang_width(), line.words);

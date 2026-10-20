@@ -135,9 +135,15 @@ pub fn parse(patch: &str, limit: usize) -> (Vec<FileDiff>, bool) {
         total += 1;
         let (kind, old, new) = if raw.starts_with("@@") {
             let starts = hunk_starts(raw);
+            // Ce qui sépare ce hunk de la fin du précédent (ou du début du fichier) : inconnu
+            // si l'un des deux en-têtes n'a pas pu être lu.
+            let skipped = match starts {
+                Some((_, n)) if at.is_none() || numbered => {
+                    n.saturating_sub(at.map_or(1, |(_, n)| n))
+                }
+                _ => 0,
+            };
             numbered = starts.is_some();
-            // Ce qui sépare ce hunk de la fin du précédent (ou du début du fichier).
-            let skipped = starts.map_or(0, |(_, n)| n.saturating_sub(at.map_or(1, |(_, n)| n)));
             if skipped > 0 {
                 file.lines.push(DiffLine {
                     kind: DiffKind::Gap,
@@ -346,6 +352,12 @@ fn mark_words(lines: &mut [DiffLine]) {
 
 // --- coloration
 
+/// Octets du préfixe (`+`, `-`, espace) d'une ligne : son premier caractère, quel qu'il soit
+/// (un correctif mal formé peut en avoir un multi-octet).
+fn prefix_len(text: &str) -> usize {
+    text.chars().next().map_or(0, char::len_utf8)
+}
+
 fn prefix_run(kind: DiffKind) -> Option<Run> {
     let tok = match kind {
         DiffKind::Added => Tok::Added,
@@ -384,7 +396,7 @@ pub fn highlight_file_diff(file: &FileDiff) -> Vec<Vec<Run>> {
                 .iter()
                 .map(|&i| {
                     let t = &hunk[i].text;
-                    t[t.len().min(1)..].to_owned()
+                    t[prefix_len(t)..].to_owned()
                 })
                 .collect();
             let Some(runs) = highlight::highlight_file(&file.path, &code) else {
@@ -396,7 +408,7 @@ pub fn highlight_file_diff(file: &FileDiff) -> Vec<Vec<Run>> {
                 if hunk[i].kind == DiffKind::Context && side == DiffKind::Removed {
                     continue;
                 }
-                let shift = u32::from(!hunk[i].text.is_empty());
+                let shift = prefix_len(&hunk[i].text) as u32;
                 out[start + i].extend(runs.into_iter().map(|r| Run {
                     start: r.start + shift,
                     end: r.end + shift,
@@ -616,5 +628,20 @@ mod tests {
                 .iter()
                 .all(|l| l.kind != DiffKind::Gap)
         );
+    }
+
+    #[test]
+    fn en_tete_illisible_pas_de_faux_ecart() {
+        let patch = "diff --git a/f b/f\n@@@ -1,2 -1,2 +1,3 @@@\n x\n@@ -500 +500 @@\n-a\n+b\n";
+        let (files, _) = parse(patch, 100);
+        assert!(files[0].lines.iter().all(|l| l.kind != DiffKind::Gap));
+    }
+
+    #[test]
+    fn ligne_de_contexte_commencant_par_un_caractere_multi_octet() {
+        // Un correctif mal formé ne doit pas faire paniquer la coloration
+        let patch = "diff --git a/a.rs b/a.rs\n@@ -1 +1 @@\né let x = 1;\n";
+        let styles = highlight_patch(patch, 100);
+        assert_eq!(styles[0].len(), 2, "en-tête et contexte, sans panique");
     }
 }

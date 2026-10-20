@@ -1156,7 +1156,6 @@ impl App {
         }
     }
 
-    /// Retour à la ligne (touche `w`) : la même ligne de log reste en haut de l'écran.
     /// Vue côte à côte des correctifs (commits, PR) ; le choix vaut pour les suivants.
     pub fn text_toggle_split(&mut self) {
         let (w, h) = self.view_size();
@@ -1166,6 +1165,7 @@ impl App {
         }
     }
 
+    /// Retour à la ligne (touche `w`) : la même ligne de log reste en haut de l'écran.
     pub fn text_toggle_wrap(&mut self) {
         // La vue Markdown se replie toujours par mots, et ne touche pas au réglage des logs.
         if self

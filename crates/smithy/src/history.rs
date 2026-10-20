@@ -1146,4 +1146,25 @@ mod tests {
         assert!(after.starts_with('-') || after.starts_with('+'), "{after}");
         assert!(v.text.scroll < 60);
     }
+
+    #[test]
+    fn recherche_cote_a_cote_vise_la_ligne_d_ecran_unique() {
+        let long = "mot ".repeat(60);
+        let patch = format!(
+            "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-{long}\n+{long}fin cherchee\n"
+        );
+        let (mut v, _) = CommitView::open(repo(), &commit(7), true);
+        v.apply_detail(&repo(), &commit(7).sha, Ok(detail(&patch)));
+        v.text.split = true;
+        v.text.begin_search();
+        "cherchee".chars().for_each(|c| v.text.prompt_type(c));
+        v.text.prompt_commit(130, 10);
+        // Une seule ligne d'écran par paire : le défilement reste dans le contenu
+        assert!(v.text.scroll <= v.text.max_scroll(130, 10));
+        let rows = v.text.window(130, 10);
+        assert!(rows.iter().any(|r| {
+            r.split
+                .is_some_and(|s| s.right.is_some_and(|r| r.text.contains("cherchee")))
+        }));
+    }
 }
