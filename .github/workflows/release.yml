@@ -180,10 +180,22 @@ jobs:
           tar -C "dist/${ARCHIVE}" -czf "dist/${ARCHIVE}.tar.gz" smithy README.md LICENSE-MIT LICENSE-APACHE
           ls -l dist
 
+      # Paquet Debian/Ubuntu : le binaire musl déjà compilé est emballé tel
+      # quel (`--no-build`), donc aucune dépendance à déclarer. La version
+      # vient du Cargo.toml reporté plus haut. Nom stable, comme les archives.
+      - name: Paquet .deb
+        if: matrix.os == 'linux'
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb -p smithy --no-build --target "$TARGET" -o "dist/${ARCHIVE}.deb"
+          ls -l dist
+
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ARCHIVE }}
-          path: dist/${{ env.ARCHIVE }}.tar.gz
+          path: |
+            dist/${{ env.ARCHIVE }}.tar.gz
+            dist/${{ env.ARCHIVE }}.deb
           if-no-files-found: error
 
   publish:
@@ -204,7 +216,7 @@ jobs:
       - name: Sommes de contrôle
         working-directory: dist
         run: |
-          sha256sum smithy_*.tar.gz > checksums.txt
+          sha256sum smithy_*.tar.gz smithy_*.deb > checksums.txt
           cat checksums.txt
 
       - name: Publication de la release
@@ -212,7 +224,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          files=(dist/smithy_*.tar.gz dist/checksums.txt)
+          files=(dist/smithy_*.tar.gz dist/smithy_*.deb dist/checksums.txt)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else

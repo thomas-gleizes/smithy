@@ -24,5 +24,17 @@ syntect = { version = "5", default-features = false, features = ["parsing", "reg
 two-face = { version = "0.5", default-features = false, features = ["syntect-fancy"] }
 pulldown-cmark = { version = "0.13", default-features = false }
 
+[package.metadata.deb]
+maintainer = "Thomas Gleizes <thomasgleizes34@gmail.com>"
+section = "utils"
+priority = "optional"
+extended-description = "Consulte la CI (runs, logs), le code, les commits et les pull requests de forges git (Forgejo, GitHub) dans le terminal."
+assets = [
+  ["target/release/smithy", "usr/bin/", "755"],
+  ["../../README.md", "usr/share/doc/smithy/README.md", "644"],
+  ["../../LICENSE-MIT", "usr/share/doc/smithy/LICENSE-MIT", "644"],
+  ["../../LICENSE-APACHE", "usr/share/doc/smithy/LICENSE-APACHE", "644"],
+]
+
 [lints]
 workspace = true

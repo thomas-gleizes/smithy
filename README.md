@@ -65,6 +65,13 @@ tar xzf smithy_linux_amd64.tar.gz smithy
 ./smithy --version
 ```
 
+On Debian/Ubuntu, each release also carries a `.deb` per Linux architecture (`smithy_linux_amd64.deb`, `smithy_linux_arm64.deb`):
+
+```sh
+curl -fLO https://github.com/thomas-gleizes/smithy/releases/latest/download/smithy_linux_amd64.deb
+sudo apt install ./smithy_linux_amd64.deb
+```
+
 Releases are published automatically: when CI passes on `main`, the next version is computed from the commit messages ([Conventional Commits](https://www.conventionalcommits.org/): `feat` → minor, `fix`/`perf`/`refactor` → patch, `!` or `BREAKING CHANGE` → major; `docs`/`chore`/`ci`/`test` alone → no release), tagged and published. Pushing a `vX.Y.Z` tag by hand publishes that version. Any commit can also be built without publishing from the *Release* workflow (Actions tab → *Release* → *Run workflow*): the archives are kept as artifacts of the run.
 
 ### From source
