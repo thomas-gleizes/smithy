@@ -271,6 +271,11 @@ pub struct TextView {
     pub split: bool,
     /// Empreinte du correctif affiché : une coloration n'est appliquée qu'à celui-là.
     pub diff_key: Option<u64>,
+    /// Lignes de texte choisies à la souris (ancre, extrémité), bornes comprises ; l'extrémité
+    /// peut précéder l'ancre.
+    selection: Option<(usize, usize)>,
+    /// Confirmation d'une copie, montrée au pied de page jusqu'à la touche suivante.
+    pub flash: Option<String>,
 }
 
 impl TextView {
@@ -288,11 +293,14 @@ impl TextView {
             gutter: 0,
             split: false,
             diff_key: None,
+            selection: None,
+            flash: None,
         }
     }
 
     /// Texte sans section (un fichier) : les lignes telles quelles.
     pub fn set_plain(&mut self, lines: Vec<String>) {
+        self.selection = None;
         self.sections.clear();
         self.selected = None;
         self.state = LogState::Ready(
@@ -548,6 +556,7 @@ impl TextView {
     /// vue pour la première fois prend le réglage par défaut selon son statut (donc une étape
     /// ouverte parce qu'elle tournait le reste après sa fin). Le défilement est à recaler.
     pub fn set_log(&mut self, log: &JobLog) {
+        self.selection = None;
         let preface = if log.steps.is_empty() {
             vec![LogLine::text(
                 "(aucune étape : le job n'a pas démarré)".to_owned(),
@@ -571,6 +580,7 @@ impl TextView {
     /// Remplace le contenu par des lignes libres suivies de sections pliables. L'état plié/déplié
     /// des sections déjà vues (par indice) est conservé ; une nouvelle prend `Part::collapsed`.
     pub fn set_sectioned(&mut self, preface: Vec<LogLine>, parts: Vec<Part>) {
+        self.selection = None;
         let previous: Vec<bool> = self.sections.iter().map(|s| s.collapsed).collect();
         let mut lines = preface;
         let mut sections = Vec::new();
@@ -604,6 +614,7 @@ impl TextView {
 
     /// Remplace le contenu par des lignes sans étape, donc jamais repliées (fichier, Markdown).
     pub fn set_lines(&mut self, lines: Vec<LogLine>) {
+        self.selection = None;
         self.sections.clear();
         self.gutter = gutter_of(&lines);
         self.state = LogState::Ready(lines);
@@ -860,6 +871,95 @@ impl TextView {
             .position(|l| matches!(l.kind, LineKind::Step(Status::Failure)))
             .map(Start::Line)
             .or(live.then_some(Start::End))
+    }
+
+    // --- sélection et copie
+
+    /// Commence une sélection sur la ligne d'écran `row` de la fenêtre (0 = celle du haut).
+    /// `false` si cette ligne d'écran ne montre rien.
+    pub fn select_start(&mut self, row: usize, width: usize, height: usize) -> bool {
+        self.selection = self
+            .window(width, height)
+            .get(row)
+            .map(|r| (r.line_no, r.line_no));
+        self.selection.is_some()
+    }
+
+    /// Étend la sélection jusqu'à la ligne d'écran `row` (ancre inchangée).
+    pub fn select_to(&mut self, row: usize, width: usize, height: usize) {
+        let Some((anchor, _)) = self.selection else {
+            return;
+        };
+        if let Some(r) = self.window(width, height).get(row) {
+            self.selection = Some((anchor, r.line_no));
+        }
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Plusieurs lignes sont-elles choisies ? (Une ancre seule n'est pas une sélection : c'est
+    /// un simple clic.)
+    pub fn has_selection(&self) -> bool {
+        self.selection.is_some_and(|(a, b)| a != b)
+    }
+
+    /// La ligne de texte `line` fait-elle partie de la sélection ?
+    pub fn is_selected(&self, line: usize) -> bool {
+        self.has_selection()
+            && self
+                .selection
+                .is_some_and(|(a, b)| (a.min(b)..=a.max(b)).contains(&line))
+    }
+
+    /// Le texte des lignes `from..=to`, une par ligne, sans celles que le repli cache. Le texte
+    /// est celui du log, jamais le retour à la ligne ni la gouttière d'un correctif.
+    fn text_of(&self, from: usize, to: usize) -> Option<(String, usize)> {
+        let kept: Vec<&str> = self
+            .lines()
+            .iter()
+            .skip(from)
+            .take(to.saturating_sub(from) + 1)
+            .filter(|l| !self.hidden(l))
+            .map(|l| l.text.as_str())
+            .collect();
+        (!kept.is_empty()).then(|| (kept.join("\n"), kept.len()))
+    }
+
+    /// Le texte de la sélection et son nombre de lignes.
+    pub fn selected_text(&self) -> Option<(String, usize)> {
+        let (a, b) = self.selection?;
+        self.text_of(a.min(b), a.max(b))
+    }
+
+    /// Le texte de la ligne d'écran `row` (clic droit).
+    pub fn line_text_at(&self, row: usize, width: usize, height: usize) -> Option<(String, usize)> {
+        let line = self.window(width, height).get(row)?.line_no;
+        self.text_of(line, line)
+    }
+
+    /// Les lignes que l'écran montre, de la première à la dernière (touche `y`).
+    pub fn screen_text(&self, width: usize, height: usize) -> Option<(String, usize)> {
+        let rows = self.window(width, height);
+        let from = rows.iter().map(|r| r.line_no).min()?;
+        let to = rows.iter().map(|r| r.line_no).max()?;
+        self.text_of(from, to)
+    }
+
+    /// La section courante, titre compris, dépliée ou non ; sans section, tout le texte
+    /// (touche `Y`).
+    pub fn section_text(&self, width: usize) -> Option<(String, usize)> {
+        let lines = self.lines();
+        let Some(step) = self.current_step(width) else {
+            return self.text_of(0, lines.len().saturating_sub(1));
+        };
+        let kept: Vec<&str> = lines
+            .iter()
+            .filter(|l| l.step == Some(step))
+            .map(|l| l.text.as_str())
+            .collect();
+        (!kept.is_empty()).then(|| (kept.join("\n"), kept.len()))
     }
 
     /// Les lignes d'écran visibles : de `scroll` sur `height` lignes.

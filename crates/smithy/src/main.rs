@@ -798,6 +798,8 @@ fn commit_key(app: &mut App, code: KeyCode) {
         KeyCode::Char('g') | KeyCode::Home => app.text_top(),
         KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
         KeyCode::Char('w') => app.text_toggle_wrap(),
+        KeyCode::Char('y') => app.text_copy_screen(),
+        KeyCode::Char('Y') => app.text_copy_section(),
         KeyCode::Char('v') => app.text_toggle_split(),
         KeyCode::Char('r') => app.refresh_current(),
         _ => {}
@@ -846,6 +848,8 @@ fn browser_key(app: &mut App, code: KeyCode) {
             KeyCode::Char('g') | KeyCode::Home => app.text_top(),
             KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
             KeyCode::Char('w') => app.text_toggle_wrap(),
+            KeyCode::Char('y') => app.text_copy_screen(),
+            KeyCode::Char('Y') => app.text_copy_section(),
             KeyCode::Char('m') => {
                 if let Some(b) = app.browser_mut() {
                     b.toggle_rendered();
@@ -1376,6 +1380,7 @@ fn on_key(
     store: Option<&SessionStore>,
     tx: &UnboundedSender<(String, Msg)>,
 ) {
+    app.text_clear_transient();
     if ctrl && code == KeyCode::Char('c') {
         app.should_quit = true;
     } else if let Some(form) = app.login.as_ref().map(|f| f.server.clone()) {
@@ -1510,6 +1515,8 @@ fn on_key(
             KeyCode::Char('g') | KeyCode::Home => app.text_top(),
             KeyCode::Char('G') | KeyCode::End => app.text_bottom(),
             KeyCode::Char('w') => app.text_toggle_wrap(),
+            KeyCode::Char('y') => app.text_copy_screen(),
+            KeyCode::Char('Y') => app.text_copy_section(),
             KeyCode::Char('r') => app.refetch_logs(),
             _ => {}
         }
@@ -1539,8 +1546,37 @@ fn on_mouse(
         MouseEventKind::ScrollDown => 1,
         MouseEventKind::ScrollUp => -1,
         MouseEventKind::Down(MouseButton::Left) => {
-            if let Some(target) = app.zones.hit(m.column, m.row) {
-                click(app, target, backends, store, tx);
+            app.text_clear_transient();
+            match app.zones.hit(m.column, m.row) {
+                // Dans un volet de texte, le clic attend le relâchement : un glissement choisit
+                // des lignes à copier, un simple clic plie ou déplie.
+                Some(Target::TextRow(row)) if !app.is_typing() => app.text_press(row),
+                Some(target) => click(app, target, backends, store, tx),
+                None => {}
+            }
+            return;
+        }
+        MouseEventKind::Drag(MouseButton::Left) => {
+            if let Some(Target::TextRow(row)) = app.zones.hit(m.column, m.row) {
+                app.text_drag_to(row);
+            }
+            return;
+        }
+        MouseEventKind::Up(MouseButton::Left) => {
+            let row = match app.zones.hit(m.column, m.row) {
+                Some(Target::TextRow(row)) => Some(row),
+                _ => None,
+            };
+            app.text_release(row);
+            return;
+        }
+        // Clic droit sur une ligne d'un volet de texte : la copie.
+        MouseEventKind::Down(MouseButton::Right) => {
+            app.text_clear_transient();
+            if let Some(Target::TextRow(row)) = app.zones.hit(m.column, m.row)
+                && !app.is_typing()
+            {
+                app.text_copy_row(row);
             }
             return;
         }

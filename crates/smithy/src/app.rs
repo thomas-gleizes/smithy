@@ -388,6 +388,8 @@ pub struct App {
     device_start: Option<String>,
     /// Texte à copier dans le presse-papiers : `main` l'envoie au terminal (OSC 52).
     copy: Option<String>,
+    /// Ligne d'écran où le bouton gauche a été pressé dans un volet de texte, tant qu'il l'est.
+    text_drag: Option<usize>,
     /// Les serveurs configurés, pour la liste (`S`) et les libellés de connexion.
     pub servers: Vec<ServerEntry>,
     /// Liste des serveurs ouverte par-dessus l'interface (indice de la ligne choisie).
@@ -460,6 +462,7 @@ impl App {
             gitlab_device_env: false,
             device_start: None,
             copy: None,
+            text_drag: None,
             servers: Vec::new(),
             server_picker: None,
             server_form: None,
@@ -1201,6 +1204,90 @@ impl App {
 
     fn view_size(&self) -> (usize, usize) {
         (self.viewport_width.get().max(1), self.viewport.get().max(1))
+    }
+
+    /// Met `text` (`lines` lignes) dans le presse-papiers et le dit au pied de page.
+    fn text_copied(&mut self, copied: Option<(String, usize)>) {
+        let Some((text, lines)) = copied else { return };
+        let flash = format!(
+            "{lines} ligne{} copiée{}",
+            if lines > 1 { "s" } else { "" },
+            if lines > 1 { "s" } else { "" }
+        );
+        self.copy = Some(text);
+        if let Some(v) = self.active_text_mut() {
+            v.flash = Some(flash);
+        }
+    }
+
+    /// Touche suivante ou clic : la confirmation d'une copie et la sélection s'effacent.
+    pub fn text_clear_transient(&mut self) {
+        self.text_drag = None;
+        if let Some(v) = self.active_text_mut() {
+            v.flash = None;
+            v.clear_selection();
+        }
+    }
+
+    /// Touche `y` : copie les lignes que l'écran montre.
+    pub fn text_copy_screen(&mut self) {
+        let (w, h) = self.view_size();
+        let copied = self.active_text().and_then(|v| v.screen_text(w, h));
+        self.text_copied(copied);
+    }
+
+    /// Touche `Y` : copie la section courante, ou tout le texte s'il n'a pas de section.
+    pub fn text_copy_section(&mut self) {
+        let (w, _) = self.view_size();
+        let copied = self.active_text().and_then(|v| v.section_text(w));
+        self.text_copied(copied);
+    }
+
+    /// Clic droit sur la ligne d'écran `row` : copie cette ligne de texte.
+    pub fn text_copy_row(&mut self, row: usize) {
+        let (w, h) = self.view_size();
+        let copied = self.active_text().and_then(|v| v.line_text_at(row, w, h));
+        self.text_copied(copied);
+    }
+
+    /// Bouton gauche pressé sur la ligne d'écran `row` : une sélection peut commencer.
+    pub fn text_press(&mut self, row: usize) {
+        let (w, h) = self.view_size();
+        self.text_drag = Some(row);
+        if let Some(v) = self.active_text_mut() {
+            v.select_start(row, w, h);
+        }
+    }
+
+    /// Pointeur déplacé bouton enfoncé, jusqu'à la ligne d'écran `row`.
+    pub fn text_drag_to(&mut self, row: usize) {
+        let (w, h) = self.view_size();
+        if self.text_drag.is_some()
+            && let Some(v) = self.active_text_mut()
+        {
+            v.select_to(row, w, h);
+        }
+    }
+
+    /// Bouton relâché : plusieurs lignes choisies sont copiées ; sinon c'était un simple clic.
+    pub fn text_release(&mut self, row: Option<usize>) {
+        if self.text_drag.take().is_none() {
+            return;
+        }
+        let copied = self
+            .active_text()
+            .filter(|v| v.has_selection())
+            .and_then(TextView::selected_text);
+        if copied.is_some() {
+            self.text_copied(copied);
+        } else {
+            if let Some(v) = self.active_text_mut() {
+                v.clear_selection();
+            }
+            if let Some(row) = row {
+                self.text_click(row);
+            }
+        }
     }
 
     pub fn text_scroll(&mut self, delta: isize) {

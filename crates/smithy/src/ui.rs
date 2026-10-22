@@ -652,6 +652,9 @@ fn search_line(view: &TextView) -> Option<String> {
     if let Some(p) = &view.prompt {
         return Some(format!("/{p}▏   Entrée valider · Échap annuler"));
     }
+    if let Some(flash) = &view.flash {
+        return Some(flash.clone());
+    }
     view.search_status().map(|(q, current, total)| {
         if total == 0 {
             format!("/{q}   aucune occurrence · / autre recherche · Échap efface")
@@ -891,50 +894,12 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
             view.window(width, height)
                 .into_iter()
                 .map(|r| {
-                    if let Some(split) = &r.split {
-                        return split_row(split, view, width);
-                    }
-                    match r.kind {
-                        LineKind::Step(st) => {
-                            let style = Style::new().fg(status_style(st).1).bold();
-                            // La section courante (celle que Espace plie) est en vidéo inverse.
-                            let style = if r.current {
-                                style.add_modifier(Modifier::REVERSED)
-                            } else {
-                                style
-                            };
-                            Line::from(Span::styled(r.text, style))
-                        }
-                        LineKind::Text if r.diff.is_some() => diff_row(&r, view, width),
-                        LineKind::Text
-                            if r.runs.is_empty() && r.hang.is_empty() && !view.has_search() =>
-                        {
-                            Line::from(r.text)
-                        }
-                        LineKind::Text => {
-                            let mut spans = Vec::new();
-                            // Suite d'une ligne repliée : le retrait de la puce, la barre de citation.
-                            if r.continuation && !r.hang.is_empty() {
-                                spans.push(Span::styled(r.hang, tok_style(Tok::Quote)));
-                            }
-                            let segments = highlight::segments(r.text, r.offset, r.runs);
-                            // Les occurrences de la recherche, de toute la ligne (une occurrence peut
-                            // être à cheval sur deux lignes d'écran), par-dessus les couleurs.
-                            let ranges = view.line_matches(r.line);
-                            let current = view
-                                .current_match()
-                                .filter(|m| m.line == r.line_no)
-                                .map(|m| (m.start, m.end));
-                            spans.extend(
-                                textsearch::overlay(segments, r.offset, &ranges, current)
-                                    .into_iter()
-                                    .map(|(text, tok, hit)| {
-                                        let base = tok.map_or_else(Style::new, tok_style);
-                                        Span::styled(text, base.patch(hit_style(hit)))
-                                    }),
-                            );
-                            Line::from(spans)
-                        }
+                    let selected = view.is_selected(r.line_no);
+                    let line = text_row(&r, view, width);
+                    if selected {
+                        line.patch_style(Style::new().add_modifier(Modifier::REVERSED))
+                    } else {
+                        line
                     }
                 })
                 .collect()
@@ -962,6 +927,53 @@ fn draw_text_pane(f: &mut Frame, app: &App, area: Rect, title: Line<'static>, vi
         app.zones.rows(zone(inner), 0, height, Target::TextRow);
     }
     f.render_widget(Paragraph::new(body).block(block), area);
+}
+
+/// Une ligne d'écran d'un volet de texte, avec ses couleurs.
+fn text_row<'a>(r: &logview::Row<'a>, view: &'a TextView, width: usize) -> Line<'a> {
+    if let Some(split) = &r.split {
+        return split_row(split, view, width);
+    }
+    match r.kind {
+        LineKind::Step(st) => {
+            let style = Style::new().fg(status_style(st).1).bold();
+            // La section courante (celle que Espace plie) est en vidéo inverse.
+            let style = if r.current {
+                style.add_modifier(Modifier::REVERSED)
+            } else {
+                style
+            };
+            Line::from(Span::styled(r.text, style))
+        }
+        LineKind::Text if r.diff.is_some() => diff_row(r, view, width),
+        LineKind::Text if r.runs.is_empty() && r.hang.is_empty() && !view.has_search() => {
+            Line::from(r.text)
+        }
+        LineKind::Text => {
+            let mut spans = Vec::new();
+            // Suite d'une ligne repliée : le retrait de la puce, la barre de citation.
+            if r.continuation && !r.hang.is_empty() {
+                spans.push(Span::styled(r.hang, tok_style(Tok::Quote)));
+            }
+            let segments = highlight::segments(r.text, r.offset, r.runs);
+            // Les occurrences de la recherche, de toute la ligne (une occurrence peut
+            // être à cheval sur deux lignes d'écran), par-dessus les couleurs.
+            let ranges = view.line_matches(r.line);
+            let current = view
+                .current_match()
+                .filter(|m| m.line == r.line_no)
+                .map(|m| (m.start, m.end));
+            spans.extend(
+                textsearch::overlay(segments, r.offset, &ranges, current)
+                    .into_iter()
+                    .map(|(text, tok, hit)| {
+                        let base = tok.map_or_else(Style::new, tok_style);
+                        Span::styled(text, base.patch(hit_style(hit)))
+                    }),
+            );
+            Line::from(spans)
+        }
+    }
 }
 
 /// Pied de page : l'erreur en rouge, sinon un message d'information en jaune, sinon l'aide.
@@ -1050,7 +1062,7 @@ fn logs_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · w retour à la ligne · r rafraîchir · Esc retour",
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · w retour à la ligne · y copier · r rafraîchir · Esc retour",
             "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · w retour à la ligne · r rafraîchir · Esc retour",
             "j/k défiler · ←/→ section · Espace plier · / chercher · w retour à la ligne · Esc retour",
             "j/k défiler · ←/→ section · Espace plier · a tout · w repli · Esc retour",
@@ -1106,7 +1118,7 @@ fn file_help(width: usize, markdown: bool, rendered: bool) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · / chercher · n/N · w retour à la ligne · r actualiser · Esc/← retour",
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · / chercher · n/N · w retour à la ligne · y copier · r actualiser · Esc/← retour",
             "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · w retour à la ligne · r actualiser · Esc/← retour",
             "j/k ↑/↓ défiler · g/G début/fin · / chercher · w retour à la ligne · Esc/← retour",
             "j/k défiler · g/G · w retour à la ligne · Esc retour",
@@ -1366,7 +1378,7 @@ fn commit_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ fichier · Espace plier · a tout · / chercher · n/N · w repli · v côte à côte · r actualiser · Esc retour",
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ fichier · Espace plier · a tout · / chercher · n/N · w repli · v côte à côte · y copier · r actualiser · Esc retour",
             "j/k défiler · ←/→ fichier · Espace plier · / chercher · w repli · v côte à côte · Esc retour",
             "←/→ · Espace · / · w · v · Esc",
             "Esc",
@@ -1695,7 +1707,7 @@ fn pull_help(width: usize) -> &'static str {
     pick_help(
         width,
         &[
-            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · e code · w repli · v côte à côte · r actualiser · Esc retour",
+            "j/k ↑/↓ défiler · f/PgDn page · g/G début/fin · ←/→ section · Espace plier · a tout · / chercher · n/N · e code · w repli · v côte à côte · y copier · r actualiser · Esc retour",
             "j/k défiler · ←/→ section · Espace plier · / chercher · e code · w repli · v côte à côte · Esc retour",
             "←/→ · Espace · / · e · w · v · Esc",
             "Esc",
@@ -4682,6 +4694,92 @@ mod tests {
         app.open_login("maison", "", false);
         render(&app, w, h);
         assert_eq!(app.zones.hit(0, h - 1), Some(Target::Overlay));
+    }
+
+    fn text_row_of(app: &App, w: u16, h: u16, needle: &str) -> usize {
+        let Some(Target::TextRow(row)) = hit_on(app, w, h, needle) else {
+            panic!("{needle} hors d'un volet de texte");
+        };
+        row
+    }
+
+    #[test]
+    fn souris_glisser_copie_les_lignes_choisies() {
+        let mut app = app_with_job(vec![
+            step("Preparation", Status::Success, 3),
+            step("Tests", Status::Failure, 4),
+        ]);
+        let (w, h) = (100, 14);
+        let first = text_row_of(&app, w, h, "Tests-ligne-2");
+        let last = text_row_of(&app, w, h, "Tests-ligne-4");
+        app.text_press(first);
+        app.text_drag_to(last);
+        // La sélection est montrée en vidéo inverse tant qu'elle dure.
+        assert!(
+            app.logs()
+                .unwrap()
+                .is_selected(first_line(&app, "Tests-ligne-3"))
+        );
+        app.text_release(Some(last));
+        assert_eq!(
+            app.take_copy().as_deref(),
+            Some("Tests-ligne-2\nTests-ligne-3\nTests-ligne-4")
+        );
+        assert!(render(&app, w, h).contains("3 lignes copiées"));
+        // La touche suivante efface la confirmation et la sélection.
+        app.text_clear_transient();
+        assert!(!render(&app, w, h).contains("3 lignes copiées"));
+        assert!(!app.logs().unwrap().has_selection());
+    }
+
+    fn first_line(app: &App, text: &str) -> usize {
+        match &app.logs().unwrap().state {
+            LogState::Ready(lines) => lines.iter().position(|l| l.text == text).unwrap(),
+            _ => panic!("log non chargé"),
+        }
+    }
+
+    #[test]
+    fn souris_sans_glisser_reste_un_clic_et_n_ecrase_pas_le_presse_papiers() {
+        let mut app = app_with_job(vec![
+            step("Preparation", Status::Success, 3),
+            step("Tests", Status::Failure, 2),
+        ]);
+        let (w, h) = (100, 14);
+        let title = text_row_of(&app, w, h, "▸ Preparation");
+        app.text_press(title);
+        app.text_release(Some(title));
+        assert_eq!(app.take_copy(), None);
+        assert!(
+            render(&app, w, h).contains("Preparation-ligne-1"),
+            "le clic déplie"
+        );
+    }
+
+    #[test]
+    fn souris_clic_droit_et_touches_y_copient() {
+        let mut app = app_with_job(vec![
+            step("Preparation", Status::Success, 3),
+            step("Tests", Status::Failure, 2),
+        ]);
+        let (w, h) = (100, 14);
+        let row = text_row_of(&app, w, h, "Tests-ligne-1");
+        app.text_copy_row(row);
+        assert_eq!(app.take_copy().as_deref(), Some("Tests-ligne-1"));
+        assert!(render(&app, w, h).contains("1 ligne copiée"));
+        // `y` : ce que l'écran montre ; les lignes d'une étape repliée n'en font pas partie.
+        app.text_copy_screen();
+        let screen = app.take_copy().unwrap();
+        assert!(screen.contains("Tests-ligne-2") && !screen.contains("Preparation-ligne-1"));
+        // `Y` : la section courante (la première, repliée : son titre et son contenu).
+        app.text_top();
+        app.text_copy_section();
+        assert_eq!(
+            app.take_copy().as_deref(),
+            Some(
+                "▸ Preparation (3 lignes)\nPreparation-ligne-1\nPreparation-ligne-2\nPreparation-ligne-3"
+            )
+        );
     }
 
     #[test]

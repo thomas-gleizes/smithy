@@ -199,8 +199,10 @@ Mouse and trackpad, everywhere:
 | Click a breadcrumb segment     | Go back to that page (the server name opens the server list, like `S`) |
 | Click a step or file title     | Fold / unfold it (logs, commit and pull request diffs) |
 | Click outside a pop-up list    | Close it, like `Esc` (tabs, servers, branches) |
+| Drag over lines of a text pane | Select whole lines (reverse video) and copy them when the button is released |
+| Right-click a line of a text pane | Copy that line |
 
-Forms (login, server) are keyboard only. While smithy captures the mouse, the terminal no longer selects text on its own: hold `Shift` (most terminals) or `Option` (iTerm2, Terminal.app) to select and copy.
+Forms (login, server) are keyboard only. While smithy captures the mouse, the terminal no longer selects text on its own: hold `Shift` (most terminals) or `Option` (iTerm2, Terminal.app) to select and copy, or use the copy gestures above and `y` / `Y`.
 
 Tabs, on every page (except while typing a filter):
 
@@ -289,11 +291,14 @@ In the log view:
 | `n` / `N`             | Next / previous occurrence (wraps around). An occurrence inside a folded step unfolds it |
 | `Esc`                 | Clear the search first; a second `Esc` goes back |
 | `w`                   | Toggle line wrapping (kept for the session) |
+| `y` / `Y`             | Copy the lines on screen / the selected step (the whole text when there are no steps) to the clipboard |
 | `r`                   | Refresh                         |
 | `Esc`, `q`, `Backspace` | Back to the runs              |
 | `Ctrl+C`              | Quit                            |
 
 The selected step is the one you moved to with `→` / `←`, or otherwise the one at the top of the screen; its title is shown in reverse video. Folding state survives refreshes, and a step that was open while running stays open when it finishes.
+
+Copying uses the OSC 52 escape sequence, so it is the terminal that fills the clipboard (this works over SSH; some terminals, or tmux without `set -g set-clipboard on`, ignore it silently). The copied text is the log text itself, one line per line: no wrapping, no diff gutter, and no lines hidden by a folded step. The footer confirms how many lines were copied.
 
 Long lines are clipped by default; `w` wraps them at the exact terminal width (characters are cut, not words, so paths and JSON stay intact). Scrolling counts screen rows when wrapped, so a single very long line can be read to its end. Output is capped to the last 50,000 lines per step.
 
