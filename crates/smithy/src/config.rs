@@ -13,6 +13,9 @@ pub enum ServerKind {
     /// l'API n'accepte pas de mot de passe.
     #[serde(rename = "github")]
     GitHub,
+    /// gitlab.com, ou une instance auto-hébergée (`https://<hôte>`).
+    #[serde(rename = "gitlab")]
+    GitLab,
 }
 
 impl ServerKind {
@@ -20,6 +23,7 @@ impl ServerKind {
         match self {
             ServerKind::Forgejo => "forgejo",
             ServerKind::GitHub => "github",
+            ServerKind::GitLab => "gitlab",
         }
     }
 
@@ -28,6 +32,7 @@ impl ServerKind {
         match self {
             ServerKind::Forgejo => "",
             ServerKind::GitHub => smithy_github::DEFAULT_API,
+            ServerKind::GitLab => smithy_gitlab::DEFAULT_URL,
         }
     }
 }

@@ -286,6 +286,9 @@ pub struct App {
     /// Un identifiant d'OAuth App est connu (réglé par `main`) : un serveur GitHub peut être
     /// ajouté sans token, la connexion par code suit.
     pub github_device: bool,
+    /// `SMITHY_GITLAB_CLIENT_ID` est réglé (réglé par `main`) : la connexion par code vaut pour
+    /// tout serveur GitLab ; sinon seulement pour gitlab.com, dont l'application est celle de smithy.
+    pub gitlab_device_env: bool,
     /// Serveur dont `main` doit lancer (ou relancer) la demande de code.
     device_start: Option<String>,
     /// Texte à copier dans le presse-papiers : `main` l'envoie au terminal (OSC 52).
@@ -359,6 +362,7 @@ impl App {
             login: None,
             device: None,
             github_device: false,
+            gitlab_device_env: false,
             device_start: None,
             copy: None,
             servers: Vec::new(),
@@ -1991,8 +1995,17 @@ impl App {
         self.device.take().is_some_and(|f| self.device_quits(&f))
     }
 
-    /// Un serveur GitHub sans token : GitHub n'a pas de connexion par mot de passe, on ouvre le
-    /// formulaire du serveur sur son token (à la place du login).
+    /// La connexion par code est possible pour un serveur de ce type et de cette adresse.
+    pub fn device_for(&self, kind: ServerKind, url: &str) -> bool {
+        match kind {
+            ServerKind::Forgejo => false,
+            ServerKind::GitHub => self.github_device,
+            ServerKind::GitLab => self.gitlab_device_env || smithy_gitlab::is_default_host(url),
+        }
+    }
+
+    /// Un serveur GitHub ou GitLab sans token : ni l'un ni l'autre n'a de connexion par mot de
+    /// passe, on ouvre le formulaire du serveur sur son token (à la place du login).
     pub fn open_token_form(&mut self, server: &str) {
         let Some(entry) = self.servers.iter().find(|s| s.name == server).cloned() else {
             return;
@@ -2004,16 +2017,22 @@ impl App {
             url: entry.url,
             token: String::new(),
             field: ServerField::Token,
-            error: Some(
-                "GitHub demande un token (pas de mot de passe) : classique « repo », ou à grain \
-                 fin en lecture (Actions, Contents, Pull requests, Commit statuses)"
+            error: Some(match entry.kind {
+                ServerKind::GitLab => {
+                    "GitLab demande un token (pas de mot de passe) : « read_api », \
+                     ou à permissions fines en lecture (Project, Pipeline, Job, Repository, \
+                     Branch, Commit, Merge Request)"
+                        .to_owned()
+                }
+                _ => "GitHub demande un token (pas de mot de passe) : classique « repo », ou à \
+                     grain fin en lecture (Actions, Contents, Pull requests, Commit statuses)"
                     .to_owned(),
-            ),
+            }),
             first_run: false,
         });
     }
 
-    /// Champ Type : bascule Forgejo ↔ GitHub ; l'URL suit tant qu'elle n'a pas été saisie.
+    /// Champ Type : Forgejo → GitHub → GitLab ; l'URL suit tant qu'elle n'a pas été saisie.
     pub fn server_form_toggle_kind(&mut self) {
         let Some(f) = self.server_form.as_mut() else {
             return;
@@ -2024,7 +2043,8 @@ impl App {
         let untouched = f.url.is_empty() || f.url == "https://" || f.url == f.kind.default_url();
         f.kind = match f.kind {
             ServerKind::Forgejo => ServerKind::GitHub,
-            ServerKind::GitHub => ServerKind::Forgejo,
+            ServerKind::GitHub => ServerKind::GitLab,
+            ServerKind::GitLab => ServerKind::Forgejo,
         };
         if untouched {
             f.url = match f.kind.default_url() {
@@ -2111,7 +2131,7 @@ impl App {
     /// Entrée : passe au champ suivant, ou valide sur le dernier. Renvoie ce qu'il faut
     /// enregistrer si la saisie est correcte ; sinon l'erreur reste dans le formulaire.
     pub fn server_form_enter(&mut self) -> Option<ServerDraft> {
-        let device = self.github_device;
+        let (github_device, gitlab_device_env) = (self.github_device, self.gitlab_device_env);
         let f = self.server_form.as_mut()?;
         if f.field != ServerField::Token {
             self.server_form_move(1);
@@ -2136,10 +2156,22 @@ impl App {
             return None;
         }
         let token = f.token.trim();
-        // Un nouveau serveur GitHub sans token ne pourrait se connecter que par code.
-        if f.kind == ServerKind::GitHub && f.original.is_none() && token.is_empty() && !device {
+        // Un nouveau serveur GitHub ou GitLab sans token ne pourrait se connecter que par code.
+        let device = match f.kind {
+            ServerKind::Forgejo => true,
+            ServerKind::GitHub => github_device,
+            ServerKind::GitLab => gitlab_device_env || smithy_gitlab::is_default_host(url),
+        };
+        if f.kind != ServerKind::Forgejo && f.original.is_none() && token.is_empty() && !device {
             f.field = ServerField::Token;
-            f.error = Some("GitHub : un token est obligatoire (pas de mot de passe)".to_owned());
+            f.error = Some(format!(
+                "{} : un token est obligatoire (pas de mot de passe)",
+                if f.kind == ServerKind::GitLab {
+                    "GitLab"
+                } else {
+                    "GitHub"
+                }
+            ));
             return None;
         }
         Some(ServerDraft {
@@ -2876,6 +2908,7 @@ mod tests {
             url: "http://a".into(),
             username: "thomas".into(),
             token: Some("t".into()),
+            refresh_token: None,
             cookies: Default::default(),
         };
         a.apply(Msg::LoggedIn {
@@ -4049,6 +4082,7 @@ mod tests {
             url: "http://B".into(),
             username: "thomas".into(),
             token: None,
+            refresh_token: None,
             cookies: Default::default(),
         };
         a.apply_for(
@@ -4084,6 +4118,7 @@ mod tests {
             url: "http://B".into(),
             username: String::new(),
             token: Some("gho_x".into()),
+            refresh_token: None,
             cookies: Default::default(),
         }
     }
@@ -4327,6 +4362,53 @@ mod tests {
     }
 
     #[test]
+    fn serveur_gitlab_la_connexion_par_code_vaut_pour_gitlab_com_seulement() {
+        let mut a = App::new();
+        a.server_form_add();
+        a.server_form_toggle_kind();
+        a.server_form_toggle_kind();
+        type_str(&mut a, "x"); // le type ne se tape pas
+        a.server_form_enter();
+        type_str(&mut a, "gl");
+        a.server_form_enter(); // -> URL (gitlab.com gardée)
+        a.server_form_enter(); // -> Token
+        let d = a
+            .server_form_enter()
+            .expect("gitlab.com : la connexion par code suffit");
+        assert_eq!(
+            (d.kind, d.url.as_str(), d.token),
+            (ServerKind::GitLab, "https://gitlab.com", None)
+        );
+        // Auto-hébergé : l'application OAuth de smithy n'y existe pas, un token est obligatoire
+        a.server_form_add();
+        a.server_form_toggle_kind();
+        a.server_form_toggle_kind();
+        a.server_form_enter();
+        type_str(&mut a, "pro");
+        a.server_form_enter();
+        for _ in 0.."https://gitlab.com".len() {
+            a.server_form_backspace();
+        }
+        type_str(&mut a, "https://git.example");
+        a.server_form_enter();
+        assert_eq!(a.server_form_enter(), None);
+        assert!(
+            a.server_form
+                .as_ref()
+                .unwrap()
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("GitLab")
+        );
+        // … sauf avec SMITHY_GITLAB_CLIENT_ID
+        a.gitlab_device_env = true;
+        assert!(a.server_form_enter().is_some());
+        assert!(a.device_for(ServerKind::GitLab, "https://git.example"));
+        assert!(!a.device_for(ServerKind::Forgejo, "https://gitlab.com"));
+    }
+
+    #[test]
     fn ajout_d_un_serveur_github_avec_token_obligatoire() {
         let mut a = fresh();
         a.set_servers(vec![entry("A")]);
@@ -4359,9 +4441,15 @@ mod tests {
                 Some("ghp_x")
             )
         );
-        // Revenir à Forgejo remet l'URL vide à compléter ; une URL saisie ne bouge plus
+        // GitLab propose gitlab.com ; revenir à Forgejo remet l'URL vide à compléter
         a.server_form_add();
         a.server_form_toggle_kind();
+        a.server_form_toggle_kind();
+        let f = a.server_form.as_ref().unwrap();
+        assert_eq!(
+            (f.kind, f.url.as_str()),
+            (ServerKind::GitLab, "https://gitlab.com")
+        );
         a.server_form_toggle_kind();
         assert_eq!(a.server_form.as_ref().unwrap().url, "https://");
         // Serveur GitHub sans token : le formulaire s'ouvre sur le token, type et nom figés

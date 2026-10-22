@@ -48,6 +48,9 @@ struct ApiCommit {
 #[derive(Deserialize)]
 struct ApiPipeline {
     id: u64,
+    /// Numéro dans le projet (`#2`), bien plus court que l'`id` global (`2976549425`).
+    #[serde(default)]
+    iid: Option<u64>,
     #[serde(default)]
     sha: String,
     #[serde(default, rename = "ref")]
@@ -85,7 +88,7 @@ impl Http {
             .map(|j| {
                 let (number, sha, branch) = match &j.pipeline {
                     Some(p) => (
-                        p.id,
+                        p.iid.unwrap_or(p.id),
                         p.sha.clone(),
                         if p.git_ref.is_empty() {
                             j.git_ref.clone()
@@ -178,8 +181,8 @@ mod tests {
         let runs = gitlab(&server).list_pipelines(&repo()).await.unwrap();
         assert_eq!(runs.len(), 3);
         assert_eq!(
-            runs[0].number, 2976549425,
-            "numéro du pipeline : le même pour tous ses jobs"
+            runs[0].number, 2,
+            "numéro du pipeline dans le projet : le même pour tous ses jobs"
         );
         assert_eq!(
             runs[0].workflow, "report",

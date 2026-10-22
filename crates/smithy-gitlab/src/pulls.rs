@@ -12,12 +12,12 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use smithy_core::{
-    CheckStatus, Comment, Error, PullDetail, PullFilter, PullPage, PullRequest, PullState, Repo,
-    Result, Review, ReviewComment, ReviewState, Status,
+    CheckStatus, Comment, Error, PullDetail, PullFilter, PullPage, PullRequest, PullState,
+    PullStats, Repo, Result, Review, ReviewComment, ReviewState, Status,
 };
 
 use crate::ci::map_status;
-use crate::code::{ApiCommit, decode_text, strip_preamble};
+use crate::code::{ApiCommit, decode_text, patch_stats, strip_preamble};
 use crate::{Http, MAX_PER_PAGE, project};
 
 /// Taille d'une page (comme Forgejo : l'application charge au fil de l'eau).
@@ -373,8 +373,17 @@ impl Http {
         let checks = head_pipeline.map(|(_, status)| combined(&statuses, status));
         let (buf, _, patch_truncated) = diff?;
         let patch = strip_preamble(&decode_text(&buf, patch_truncated)).to_owned();
+        // La liste n'a pas de compteurs : on les tire du correctif (et de la conversation).
+        let mut pull = PullRequest::from(mr);
+        let (changed_files, additions, deletions) = patch_stats(&patch);
+        pull.stats = Some(PullStats {
+            additions,
+            deletions,
+            changed_files,
+            comments: comments.as_ref().map_or(0, |c| c.len() as u64),
+        });
         Ok(PullDetail {
-            pull: mr.into(),
+            pull,
             commits_truncated: more.is_some(),
             commits,
             reviews,
@@ -551,6 +560,8 @@ mod tests {
         assert!(d.patch.starts_with("diff --git"));
         assert!(!d.patch_truncated);
         assert_eq!(d.pull.number, 1);
+        let stats = d.pull.stats.unwrap();
+        assert_eq!((stats.changed_files, stats.comments), (1, 2));
     }
 
     #[tokio::test]

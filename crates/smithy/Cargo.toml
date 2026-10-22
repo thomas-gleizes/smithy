@@ -11,6 +11,7 @@ rust-version.workspace = true
 smithy-core.workspace = true
 smithy-forgejo.workspace = true
 smithy-github.workspace = true
+smithy-gitlab.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 ratatui.workspace = true

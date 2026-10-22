@@ -199,6 +199,29 @@ fn file_patch(f: &ApiFileDiff) -> String {
     out
 }
 
+/// Fichiers, lignes ajoutées et lignes retirées d'un correctif unifié : la liste des merge
+/// requests n'en donne aucun et le détail seulement `changes_count`.
+pub(crate) fn patch_stats(patch: &str) -> (u64, u64, u64) {
+    let (mut files, mut added, mut removed) = (0, 0, 0);
+    let mut in_hunk = false;
+    for line in patch.lines() {
+        if line.starts_with("diff --git ") {
+            files += 1;
+            in_hunk = false;
+        } else if line.starts_with("@@") {
+            in_hunk = true;
+        } else if in_hunk {
+            // Dans un morceau, `+++`/`---` sont des lignes de contenu, pas des en-têtes.
+            match line.as_bytes().first() {
+                Some(b'+') => added += 1,
+                Some(b'-') => removed += 1,
+                _ => {}
+            }
+        }
+    }
+    (files, added, removed)
+}
+
 /// Assemble les fichiers d'un diff, en s'arrêtant au plafond d'octets. Renvoie le correctif et
 /// s'il est incomplet (plafond atteint, ou fichier que GitLab n'a pas voulu produire).
 pub(crate) fn patch_of(files: &[ApiFileDiff], max_bytes: usize) -> (String, bool) {

@@ -86,7 +86,7 @@ pub fn draw(f: &mut Frame, app: &App) {
     }
     if let Some(form) = &app.server_form {
         app.zones.add(zone(f.area()), Target::Overlay);
-        draw_server_form(f, form, app.github_device);
+        draw_server_form(f, form, app.device_for(form.kind, &form.url));
     }
     if let Some(form) = &app.login {
         app.zones.add(zone(f.area()), Target::Overlay);
@@ -388,8 +388,11 @@ fn draw_server_form(f: &mut Frame, form: &ServerForm, device: bool) {
     };
     let token_hint = match (editing, form.kind) {
         (true, _) => "(vide : inchangé)",
-        (false, ServerKind::GitHub) if device => "(facultatif : sinon connexion par code)",
+        (false, ServerKind::GitHub | ServerKind::GitLab) if device => {
+            "(facultatif : sinon connexion par code)"
+        }
         (false, ServerKind::GitHub) => "(obligatoire : GitHub n'accepte pas de mot de passe)",
+        (false, ServerKind::GitLab) => "(obligatoire : GitLab n'accepte pas de mot de passe)",
         (false, ServerKind::Forgejo) => "(facultatif : sinon connexion par mot de passe)",
     };
     let kind = if editing {
@@ -2316,7 +2319,7 @@ fn draw_device(f: &mut Frame, form: &DeviceForm, quits: bool) {
     let keys = match &form.state {
         DeviceState::Requesting => {
             lines.push(Line::from(Span::styled(
-                "demande du code à GitHub…",
+                "demande du code…",
                 Style::new().fg(Color::Cyan),
             )));
             "t saisir un token"

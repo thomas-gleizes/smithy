@@ -23,9 +23,13 @@ pub struct Session {
     /// Token d'API créé au login (lecture seule) ; absent si le token vient de la config.
     #[serde(default)]
     pub token: Option<String>,
+    /// De quoi renouveler le token sans refaire la connexion (OAuth GitLab : il expire en 2 h).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_token: Option<String>,
     pub cookies: BTreeMap<String, String>,
 }
 
+#[derive(Clone)]
 pub struct SessionStore {
     dir: PathBuf,
 }
@@ -145,6 +149,7 @@ mod tests {
             url: url.into(),
             username: "thomas".into(),
             token: Some("tok".into()),
+            refresh_token: None,
             cookies: BTreeMap::from([("session".to_owned(), "abc".to_owned())]),
         }
     }

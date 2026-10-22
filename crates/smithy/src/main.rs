@@ -34,6 +34,7 @@ use ratatui::DefaultTerminal;
 use smithy_core::{Error, Provider};
 use smithy_forgejo::Forgejo;
 use smithy_github::GitHub;
+use smithy_gitlab::GitLab;
 use tokio::sync::mpsc::{self, UnboundedSender};
 
 use app::{App, Msg};
@@ -123,6 +124,7 @@ fn parse_args() -> Result<bool> {
 enum AnyProvider {
     Forgejo(Forgejo),
     GitHub(GitHub),
+    GitLab(GitLab),
 }
 
 macro_rules! delegate {
@@ -130,6 +132,7 @@ macro_rules! delegate {
         match $self {
             AnyProvider::Forgejo($p) => $call,
             AnyProvider::GitHub($p) => $call,
+            AnyProvider::GitLab($p) => $call,
         }
     };
 }
@@ -231,10 +234,14 @@ impl Provider for AnyProvider {
     }
 }
 
+/// `refresh` : de quoi renouveler le token OAuth d'un serveur GitLab (il expire en 2 h) ; le
+/// nouveau token est réécrit dans la session sauvegardée.
 fn build_provider(
     server: &Server,
     token: String,
     cookies: BTreeMap<String, String>,
+    refresh: Option<String>,
+    store: Option<&SessionStore>,
 ) -> Arc<AnyProvider> {
     Arc::new(match server.kind {
         ServerKind::Forgejo => {
@@ -242,6 +249,32 @@ fn build_provider(
         }
         // Ni cookie ni route web : le token suffit à tout.
         ServerKind::GitHub => AnyProvider::GitHub(GitHub::new(server.url.clone(), token)),
+        ServerKind::GitLab => {
+            let gitlab = GitLab::new(&server.url, token);
+            match (refresh, device_client_id(server)) {
+                (Some(refresh), Some(client_id)) => {
+                    let (store, name, url) =
+                        (store.cloned(), server.name.clone(), server.url.clone());
+                    AnyProvider::GitLab(gitlab.with_refresh(client_id, refresh, move |t| {
+                        // Rien à faire d'une erreur d'écriture ici : le token garde jusqu'au
+                        // prochain renouvellement, et la reconnexion reste possible.
+                        if let Some(store) = &store {
+                            let _ = store.save(
+                                &name,
+                                &Session {
+                                    url: url.clone(),
+                                    username: String::new(),
+                                    token: Some(t.access_token.clone()),
+                                    refresh_token: t.refresh_token.clone(),
+                                    cookies: BTreeMap::new(),
+                                },
+                            );
+                        }
+                    }))
+                }
+                _ => AnyProvider::GitLab(gitlab),
+            }
+        }
     })
 }
 
@@ -257,8 +290,10 @@ fn ask_credentials(
     match b.server.kind {
         ServerKind::Forgejo => app.open_login(name, &b.username, switch_to),
         // Connexion par code si on connaît l'identifiant de l'OAuth App, sinon un token à saisir.
-        ServerKind::GitHub if github_client_id().is_some() => app.open_device(name, switch_to),
-        ServerKind::GitHub => app.open_token_form(name),
+        ServerKind::GitHub | ServerKind::GitLab if device_client_id(&b.server).is_some() => {
+            app.open_device(name, switch_to)
+        }
+        ServerKind::GitHub | ServerKind::GitLab => app.open_token_form(name),
     }
 }
 
@@ -271,6 +306,28 @@ fn github_client_id() -> Option<String> {
         .filter(|v| !v.is_empty())
         .or_else(|| {
             Some(smithy_github::oauth::DEFAULT_CLIENT_ID.to_owned()).filter(|v| !v.is_empty())
+        })
+}
+
+/// L'identifiant de l'application OAuth à utiliser pour la connexion par code de ce serveur.
+/// GitLab : `SMITHY_GITLAB_CLIENT_ID`, sinon celui de gitlab.com (une instance auto-hébergée n'a
+/// pas l'application de smithy : jeton à saisir, ou son propre identifiant).
+fn device_client_id(server: &Server) -> Option<String> {
+    match server.kind {
+        ServerKind::Forgejo => None,
+        ServerKind::GitHub => github_client_id(),
+        ServerKind::GitLab => gitlab_client_id(&server.url),
+    }
+}
+
+fn gitlab_client_id(url: &str) -> Option<String> {
+    std::env::var("SMITHY_GITLAB_CLIENT_ID")
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .or_else(|| {
+            smithy_gitlab::is_default_host(url)
+                .then(|| smithy_gitlab::oauth::DEFAULT_CLIENT_ID.to_owned())
         })
 }
 
@@ -293,26 +350,57 @@ fn spawn_device(
                 },
             ));
         };
-        let Some(client_id) = github_client_id() else {
-            return fail("identifiant d'OAuth App absent".to_owned());
+        let Some(client_id) = device_client_id(&server) else {
+            return fail("identifiant d'application OAuth absent".to_owned());
         };
-        let web = smithy_github::oauth::web_base(&server.url);
-        let code = match smithy_github::oauth::request_code(&web, &client_id).await {
-            Ok(c) => c,
-            Err(e) => return fail(e),
-        };
-        let _ = tx.send((
-            name.clone(),
-            Msg::Device {
-                server: name.clone(),
-                result: Ok(app::DeviceInfo {
+        // Les deux forges font le même protocole ; seuls le serveur web, les noms et ce que
+        // rend l'attente (GitLab : aussi de quoi renouveler le token) changent.
+        let polled = match server.kind {
+            ServerKind::GitLab => {
+                let web = smithy_gitlab::oauth::web_base(&server.url);
+                let code = match smithy_gitlab::oauth::request_code(&web, &client_id).await {
+                    Ok(c) => c,
+                    Err(e) => return fail(e),
+                };
+                let shown = app::DeviceInfo {
                     user_code: code.user_code.clone(),
                     verification_uri: code.verification_uri.clone(),
-                }),
-            },
-        ));
-        match smithy_github::oauth::poll_token(&web, &client_id, &code).await {
-            Ok(token) => {
+                };
+                let _ = tx.send((
+                    name.clone(),
+                    Msg::Device {
+                        server: name.clone(),
+                        result: Ok(shown),
+                    },
+                ));
+                smithy_gitlab::oauth::poll_token(&web, &client_id, &code)
+                    .await
+                    .map(|t| (t.access_token, t.refresh_token))
+            }
+            _ => {
+                let web = smithy_github::oauth::web_base(&server.url);
+                let code = match smithy_github::oauth::request_code(&web, &client_id).await {
+                    Ok(c) => c,
+                    Err(e) => return fail(e),
+                };
+                let shown = app::DeviceInfo {
+                    user_code: code.user_code.clone(),
+                    verification_uri: code.verification_uri.clone(),
+                };
+                let _ = tx.send((
+                    name.clone(),
+                    Msg::Device {
+                        server: name.clone(),
+                        result: Ok(shown),
+                    },
+                ));
+                smithy_github::oauth::poll_token(&web, &client_id, &code)
+                    .await
+                    .map(|t| (t, None))
+            }
+        };
+        match polled {
+            Ok((token, refresh_token)) => {
                 let _ = tx.send((
                     name.clone(),
                     Msg::LoggedIn {
@@ -321,6 +409,7 @@ fn spawn_device(
                             url: server.url.clone(),
                             username: String::new(),
                             token: Some(token),
+                            refresh_token,
                             cookies: BTreeMap::new(),
                         }),
                     },
@@ -983,13 +1072,16 @@ fn spawn_login(
             ServerKind::Forgejo => {
                 smithy_forgejo::login(&server.url, &username, &password, create).await
             }
-            // Jamais ouvert pour GitHub (voir `ask_credentials`).
-            ServerKind::GitHub => Err(Error::Unsupported("connexion par mot de passe")),
+            // Jamais ouvert pour GitHub ni GitLab (voir `ask_credentials`).
+            ServerKind::GitHub | ServerKind::GitLab => {
+                Err(Error::Unsupported("connexion par mot de passe"))
+            }
         }
         .map(|l| Session {
             url: server.url.clone(),
             username: l.username,
             token: l.token.or(known_token),
+            refresh_token: None,
             cookies: l.cookies,
         })
         .map_err(|e| e.to_string());
@@ -1011,6 +1103,8 @@ struct Backend {
     provider: Option<Arc<AnyProvider>>,
     username: String,
     saved_token: Option<String>,
+    /// Pour renouveler le token OAuth (GitLab) sans refaire la connexion.
+    saved_refresh: Option<String>,
 }
 
 impl Backend {
@@ -1020,14 +1114,18 @@ impl Backend {
         let saved = store.and_then(|s| s.load(&server.name, &server.url).ok().flatten());
         let username = saved.as_ref().map_or(String::new(), |s| s.username.clone());
         let saved_token = saved.as_ref().and_then(|s| s.token.clone());
+        let saved_refresh = saved.as_ref().and_then(|s| s.refresh_token.clone());
         let token = server.token.clone().or_else(|| saved_token.clone());
         let cookies = saved.map(|s| s.cookies).unwrap_or_default();
-        let provider = token.map(|t| build_provider(&server, t, cookies));
+        // Le token de la config n'expire pas : seul celui d'une session se renouvelle.
+        let refresh = saved_refresh.clone().filter(|_| server.token.is_none());
+        let provider = token.map(|t| build_provider(&server, t, cookies, refresh, store));
         Self {
             server,
             provider,
             username,
             saved_token,
+            saved_refresh,
         }
     }
 
@@ -1196,11 +1294,12 @@ fn logout_server(
         return;
     }
     b.saved_token = None;
+    b.saved_refresh = None;
     b.username.clear();
     let from_config = b.server.token.clone();
     b.provider = from_config
         .clone()
-        .map(|t| build_provider(&b.server, t, BTreeMap::new()));
+        .map(|t| build_provider(&b.server, t, BTreeMap::new(), None, store));
     if b.provider.is_some() {
         announce(app, b);
         app.server_note =
@@ -1457,6 +1556,8 @@ async fn run(
     let (tx, mut rx) = mpsc::unbounded_channel::<(String, Msg)>();
     let mut app = App::new();
     app.github_device = github_client_id().is_some();
+    app.gitlab_device_env =
+        std::env::var("SMITHY_GITLAB_CLIENT_ID").is_ok_and(|v| !v.trim().is_empty());
     app.set_servers(
         servers
             .iter()
@@ -1556,10 +1657,18 @@ async fn run(
                     if let Some(b) = backends.get_mut(name) {
                         b.username.clone_from(&session.username);
                         b.saved_token.clone_from(&session.token);
+                        b.saved_refresh.clone_from(&session.refresh_token);
                         // Le token de la config prime ; les cookies viennent de ce login.
                         if let Some(token) = b.known_token() {
-                            b.provider =
-                                Some(build_provider(&b.server, token, session.cookies.clone()));
+                            let refresh =
+                                b.saved_refresh.clone().filter(|_| b.server.token.is_none());
+                            b.provider = Some(build_provider(
+                                &b.server,
+                                token,
+                                session.cookies.clone(),
+                                refresh,
+                                store.as_ref(),
+                            ));
                             announce(&mut app, b);
                         }
                         if let Some(Err(e)) = store.as_ref().map(|s| s.save(name, session)) {
@@ -1619,6 +1728,7 @@ async fn run(
                 let result = match kind {
                     ServerKind::Forgejo => smithy_forgejo::ping(&url).await,
                     ServerKind::GitHub => smithy_github::ping(&url).await,
+                    ServerKind::GitLab => smithy_gitlab::ping(&url).await,
                 };
                 let _ = tx.send((
                     name.clone(),
