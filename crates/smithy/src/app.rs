@@ -196,7 +196,7 @@ pub struct ServerEntry {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServerField {
-    /// Forgejo ou GitHub ; seulement à l'ajout.
+    /// Forgejo, GitHub ou GitLab ; seulement à l'ajout.
     Kind,
     Name,
     Url,

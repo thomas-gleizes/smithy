@@ -6,7 +6,7 @@
 pkgname=smithy-bin
 pkgver=0.1.0
 pkgrel=1
-pkgdesc="TUI pour consulter la CI de forges git (Forgejo, GitHub)"
+pkgdesc="TUI pour consulter la CI de forges git (Forgejo, GitHub, GitLab)"
 arch=('x86_64' 'aarch64')
 url="https://github.com/thomas-gleizes/smithy"
 license=('MIT' 'Apache-2.0')

@@ -29,7 +29,7 @@ pulldown-cmark = { version = "0.13", default-features = false }
 maintainer = "Thomas Gleizes <thomasgleizes34@gmail.com>"
 section = "utils"
 priority = "optional"
-extended-description = "Consulte la CI (runs, logs), le code, les commits et les pull requests de forges git (Forgejo, GitHub) dans le terminal."
+extended-description = "Consulte la CI (runs, logs), le code, les commits et les pull requests de forges git (Forgejo, GitHub, GitLab) dans le terminal."
 assets = [
   ["target/release/smithy", "usr/bin/", "755"],
   ["../../README.md", "usr/share/doc/smithy/README.md", "644"],
@@ -38,7 +38,7 @@ assets = [
 ]
 
 [package.metadata.generate-rpm]
-summary = "TUI pour consulter la CI de ses forges (Forgejo, GitHub)"
+summary = "TUI pour consulter la CI de ses forges (Forgejo, GitHub, GitLab)"
 assets = [
   { source = "target/release/smithy", dest = "/usr/bin/smithy", mode = "755" },
   { source = "README.md", dest = "/usr/share/doc/smithy/README.md", mode = "644", doc = true },
