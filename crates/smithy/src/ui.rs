@@ -296,7 +296,13 @@ fn draw_server_picker(f: &mut Frame, app: &App, selected: usize) {
             let here = s.name == app.server_name;
             // D'abord le réseau (le serveur répond-il ?), ensuite la session (identifiants).
             let network = match app.reach.get(&s.name) {
-                Some(Reach::Up(_)) => Span::styled("joignable", Style::new().fg(Color::Green)),
+                Some(Reach::Up(version)) => Span::styled(
+                    match version.as_deref().filter(|v| !v.is_empty()) {
+                        Some(v) => format!("joignable (v{})", v.trim_start_matches('v')),
+                        None => "joignable".to_owned(),
+                    },
+                    Style::new().fg(Color::Green),
+                ),
                 Some(Reach::Down(why)) => Span::styled(
                     format!("injoignable ({why})"),
                     Style::new().fg(Color::Red).bold(),
@@ -3854,7 +3860,10 @@ mod tests {
         reach(&mut app, "A", Ok(Some("15.0".into())));
         reach(&mut app, "B", Err("délai dépassé".into()));
         let text = render(&app, 120, 14);
-        assert!(text.contains("joignable · session ouverte"), "{text}");
+        assert!(
+            text.contains("joignable (v15.0) · session ouverte"),
+            "{text}"
+        );
         assert!(
             text.contains("injoignable (délai dépassé) · pas de session"),
             "{text}"
