@@ -65,6 +65,15 @@ tar xzf smithy_linux_amd64.tar.gz smithy
 ./smithy --version
 ```
 
+`checksums.txt` is signed with [cosign](https://docs.sigstore.dev/) (keyless, from the release workflow). To check that it really comes from this repository's workflow, before trusting the checksums:
+
+```sh
+curl -fLO https://github.com/thomas-gleizes/smithy/releases/latest/download/checksums.txt.sigstore.json
+cosign verify-blob checksums.txt --bundle checksums.txt.sigstore.json \
+  --certificate-identity-regexp '^https://github.com/thomas-gleizes/smithy/\.github/workflows/release\.yml@' \
+  --certificate-oidc-issuer https://token.actions.githubusercontent.com
+```
+
 On Debian/Ubuntu, each release also carries a `.deb` per Linux architecture (`smithy_linux_amd64.deb`, `smithy_linux_arm64.deb`):
 
 ```sh

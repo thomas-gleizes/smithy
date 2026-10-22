@@ -214,6 +214,12 @@ jobs:
       always() && needs.build.result == 'success' &&
       (needs.tag.outputs.tag != '' || github.ref_type == 'tag')
     runs-on: ubuntu-latest
+    # `id-token` : cosign signe sans clé, avec l'identité OIDC du workflow. Une
+    # section `permissions` de job remplace celle du workflow : on répète
+    # `contents`.
+    permissions:
+      contents: write
+      id-token: write
     env:
       TAG: ${{ needs.tag.outputs.tag || github.ref_name }}
     steps:
@@ -229,12 +235,22 @@ jobs:
           sha256sum smithy_*.tar.gz smithy_*.deb smithy_*.rpm > checksums.txt
           cat checksums.txt
 
+      # On signe `checksums.txt` (qui couvre toutes les archives et paquets),
+      # pas chaque fichier : une seule signature à vérifier. Le bundle contient
+      # la signature, le certificat éphémère et la preuve d'inscription au
+      # journal de transparence Rekor.
+      - uses: sigstore/cosign-installer@v3
+
+      - name: Signature de checksums.txt (cosign, sans clé)
+        working-directory: dist
+        run: cosign sign-blob --yes --bundle checksums.txt.sigstore.json checksums.txt
+
       - name: Publication de la release
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: |
-          files=(dist/smithy_*.tar.gz dist/smithy_*.deb dist/smithy_*.rpm dist/checksums.txt)
+          files=(dist/smithy_*.tar.gz dist/smithy_*.deb dist/smithy_*.rpm dist/checksums.txt dist/checksums.txt.sigstore.json)
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber
           else
