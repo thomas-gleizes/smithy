@@ -77,12 +77,16 @@ pub(crate) fn map_status(status: &str) -> Status {
 
 impl Http {
     pub(crate) async fn fetch_pipelines(&self, repo: &Repo) -> Result<Vec<Pipeline>> {
-        let jobs: Vec<ApiJob> = self
+        let mut jobs: Vec<ApiJob> = self
             .get(
                 &format!("/projects/{}/jobs", project(repo)),
                 &[("per_page", MAX_PER_PAGE.to_string())],
             )
             .await?;
+        // L'API trie par identifiant de job : un job relancé après coup passerait au-dessus des
+        // jobs de pipelines plus récents et couperait son pipeline en deux. Le tri est stable :
+        // l'ordre des jobs d'un même pipeline ne bouge pas.
+        jobs.sort_by_key(|j| std::cmp::Reverse(j.pipeline.as_ref().map_or(j.id, |p| p.id)));
         Ok(jobs
             .into_iter()
             .map(|j| {
@@ -197,6 +201,29 @@ mod tests {
         assert_eq!(runs[1].job, "flaky (échec toléré)");
         assert_eq!(runs[2].status, Status::Skipped, "manuel : pas en cours");
         assert!(runs[0].url.as_deref().unwrap().ends_with("/jobs/3"));
+    }
+
+    #[tokio::test]
+    async fn un_job_relance_reste_avec_son_pipeline() {
+        let server = MockServer::start().await;
+        let on = |mut j: serde_json::Value, pipeline: u64| {
+            j["pipeline"]["id"] = json!(pipeline);
+            j["pipeline"]["iid"] = json!(pipeline - 100);
+            j
+        };
+        // Le job 30 (pipeline 105) a été relancé après ceux du pipeline 106 : il arrive en tête
+        Mock::given(path("/api/v4/projects/groupe%2Fsous%2Fapp/jobs"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!([
+                on(job(30, "relance", "test", "success", false), 105),
+                on(job(21, "b", "test", "success", false), 106),
+                on(job(20, "a", "build", "success", false), 106),
+                on(job(10, "c", "build", "success", false), 105),
+            ])))
+            .mount(&server)
+            .await;
+        let runs = gitlab(&server).list_pipelines(&repo()).await.unwrap();
+        let order: Vec<_> = runs.iter().map(|r| (r.number, r.job.as_str())).collect();
+        assert_eq!(order, [(6, "b"), (6, "a"), (5, "relance"), (5, "c")]);
     }
 
     fn pipeline(id: u64) -> Pipeline {

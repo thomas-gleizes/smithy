@@ -1681,7 +1681,7 @@ async fn run(
                 Msg::Logs {
                     result: Err(Error::SessionExpired),
                     ..
-                } if app.login.is_none() && origin == app.server_name => {
+                } if app.login.is_none() && app.device.is_none() && origin == app.server_name => {
                     ask_credentials(&mut app, &backends, &origin, false);
                 }
                 _ => {}
