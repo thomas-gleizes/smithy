@@ -1457,6 +1457,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "smithy-gitlab"
+version = "0.1.0"
+dependencies = [
+ "reqwest",
+ "serde",
+ "serde_json",
+ "smithy-core",
+ "tokio",
+ "wiremock",
+]
+
+[[package]]
 name = "socket2"
 version = "0.6.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"

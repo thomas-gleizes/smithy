@@ -26,6 +26,7 @@ wiremock = "0.6"
 smithy-core = { path = "crates/smithy-core" }
 smithy-forgejo = { path = "crates/smithy-forgejo" }
 smithy-github = { path = "crates/smithy-github" }
+smithy-gitlab = { path = "crates/smithy-gitlab" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

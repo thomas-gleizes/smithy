@@ -1,0 +1,90 @@
+2026-10-22T12:41:48.938851Z 00O [0KRunning with gitlab-runner 19.6.0~pre.2364.gcc7d9535 (cc7d9535)[0;m
+2026-10-22T12:41:48.938877Z 00O [0K  on k8s.saas-linux-small-amd64.runners-manager.gitlab.com/default nezyxEJex, system ID: r_SRZJTZJdS1ZX[0;m
+2026-10-22T12:41:48.938879Z 00O [0K  UUID: 019fd6c6-56c4-78a2-8961-bbb53e204387[0;m
+2026-10-22T12:41:48.938887Z 00O [0K  feature flags: FF_USE_GIT_PROACTIVE_AUTH:true, FF_HASH_CACHE_KEYS:true, FF_USE_JOB_ROUTER:true, FF_MACHINE_OPTIONS_EXPAND_ENV:true, FF_DOCKER_MACHINE_JSON_OUTPUT:true[0;m
+2026-10-22T12:41:48.938932Z 00O section_start:1792672908:prepare_executor[0K
+2026-10-22T12:41:48.938936Z 00O+[0K[36;1mPreparing the "docker+machine" executor[0;m[0;m
+2026-10-22T12:41:49.017572Z 00O [0KUsing Docker executor with image alpine:3.20 ...[0;m
+2026-10-22T12:41:49.017610Z 00O [0KUsing helper image:  us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535  (overridden, default would be  registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper:x86_64-v19.6.0 )[0;m
+2026-10-22T12:41:49.017618Z 00O [0KUsing effective pull policy of [always] for container us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535[0;m
+2026-10-22T12:41:49.018243Z 00O [0KPulling docker image us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535 ...[0;m
+2026-10-22T12:41:50.835743Z 00O [0KUsing docker image sha256:e516a5247b58c0dc65b851e6182e8e82adb95c17e9e1c7296766587e65d20e20 for us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535 with digest us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper@sha256:594cc89134ef76aa73685eba2879d66e742c61917fb7fb0921f3f939e61d4e2d ...[0;m
+2026-10-22T12:41:52.628700Z 00O [0KUsing helper image:  us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535  (overridden, default would be  registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper:x86_64-v19.6.0 )[0;m
+2026-10-22T12:41:52.628711Z 00O [0KUsing effective pull policy of [always] for container us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535[0;m
+2026-10-22T12:41:52.629590Z 00O [0KUsing docker image sha256:e516a5247b58c0dc65b851e6182e8e82adb95c17e9e1c7296766587e65d20e20 for us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535 with digest us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper@sha256:594cc89134ef76aa73685eba2879d66e742c61917fb7fb0921f3f939e61d4e2d ...[0;m
+2026-10-22T12:41:52.629599Z 00O [0KUsing effective pull policy of [always] for container alpine:3.20[0;m
+2026-10-22T12:41:52.630071Z 00O [0KPulling docker image alpine:3.20 ...[0;m
+2026-10-22T12:41:54.175554Z 00O [0KUsing docker image sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731 for alpine:3.20 with digest alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc ...[0;m
+2026-10-22T12:41:54.175623Z 00O section_end:1792672914:prepare_executor[0K
+2026-10-22T12:41:54.175744Z 00O+section_start:1792672914:prepare_script[0K
+2026-10-22T12:41:54.175749Z 00O+[0K[36;1mPreparing environment[0;m[0;m
+2026-10-22T12:41:54.175777Z 00O [0KUsing helper image:  us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535  (overridden, default would be  registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper:x86_64-v19.6.0 )[0;m
+2026-10-22T12:41:54.175785Z 00O [0KUsing effective pull policy of [always] for container us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535[0;m
+2026-10-22T12:41:54.176656Z 00O [0KUsing docker image sha256:e516a5247b58c0dc65b851e6182e8e82adb95c17e9e1c7296766587e65d20e20 for us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper:cc7d9535 with digest us-east1-docker.pkg.dev/gitlab-com-artifact-registry/containers-public/gitlab-runner-helper@sha256:594cc89134ef76aa73685eba2879d66e742c61917fb7fb0921f3f939e61d4e2d ...[0;m
+2026-10-22T12:41:54.176666Z 00O [0KUsing effective pull policy of [always] for container sha256:e516a5247b58c0dc65b851e6182e8e82adb95c17e9e1c7296766587e65d20e20[0;m
+2026-10-22T12:41:54.550193Z 01O Running on runner-nezyxejex-project-87869859-concurrent-0 via runner-nezyxejex-s-l-s-amd64-1792672860-37ef25c4...
+2026-10-22T12:41:54.553075Z 01O Running on CPU: AMD EPYC 7B13 (avx, avx2)
+2026-10-22T12:41:54.722941Z 00O section_end:1792672914:prepare_script[0K
+2026-10-22T12:41:54.723240Z 00O+section_start:1792672914:get_sources[0K
+2026-10-22T12:41:54.723245Z 00O+[0K[36;1mGetting source from Git repository[0;m[0;m
+2026-10-22T12:41:55.107268Z 01O [32;1mGitaly correlation ID: a2323fe7aa4e4fa0b38966c8e5fd127f[0;m
+2026-10-22T12:41:55.113764Z 01O [32;1mFetching changes with git depth set to 20...[0;m
+2026-10-22T12:41:55.116844Z 01O Initialized empty Git repository in /builds/thomas-gleizes/smithy-test/.git/
+2026-10-22T12:41:55.119007Z 01O [32;1mCreated fresh repository.[0;m
+2026-10-22T12:41:55.722936Z 01O [32;1mChecking out 67dc94ec as detached HEAD (ref is feat/feature-1)...[0;m
+2026-10-22T12:41:55.765090Z 01O 
+2026-10-22T12:41:55.765093Z 01O [32;1mSkipping Git submodules setup[0;m
+2026-10-22T12:41:55.765149Z 01O [32;1m$ git remote set-url origin "${CI_REPOSITORY_URL}" || echo 'Not a git repository; skipping'[0;m
+2026-10-22T12:41:55.938210Z 00O section_end:1792672915:get_sources[0K
+2026-10-22T12:41:55.938724Z 00O+section_start:1792672915:step_script[0K
+2026-10-22T12:41:55.938729Z 00O+[0K[36;1mExecuting "step_script" stage of the job script[0;m[0;m
+2026-10-22T12:41:55.938738Z 00O [0KUsing effective pull policy of [always] for container alpine:3.20[0;m
+2026-10-22T12:41:55.939692Z 00O [0KUsing docker image sha256:bf8527eb54c3680e728d5b4b383a8ba730d72dae7236fbc8dff97ed6b224a731 for alpine:3.20 with digest alpine@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc ...[0;m
+2026-10-22T12:41:56.308362Z 01O [32;1m$ echo "compilation"[0;m
+2026-10-22T12:41:56.308384Z 01O compilation
+2026-10-22T12:41:56.308384Z 01O [32;1m$ for i in $(seq 1 40); do echo "ligne $i"; done[0;m
+2026-10-22T12:41:56.309207Z 01O ligne 1
+2026-10-22T12:41:56.309208Z 01O ligne 2
+2026-10-22T12:41:56.309208Z 01O ligne 3
+2026-10-22T12:41:56.309209Z 01O ligne 4
+2026-10-22T12:41:56.309209Z 01O ligne 5
+2026-10-22T12:41:56.309209Z 01O ligne 6
+2026-10-22T12:41:56.309210Z 01O ligne 7
+2026-10-22T12:41:56.309210Z 01O ligne 8
+2026-10-22T12:41:56.309210Z 01O ligne 9
+2026-10-22T12:41:56.309210Z 01O ligne 10
+2026-10-22T12:41:56.309211Z 01O ligne 11
+2026-10-22T12:41:56.309211Z 01O ligne 12
+2026-10-22T12:41:56.309211Z 01O ligne 13
+2026-10-22T12:41:56.309212Z 01O ligne 14
+2026-10-22T12:41:56.309212Z 01O ligne 15
+2026-10-22T12:41:56.309212Z 01O ligne 16
+2026-10-22T12:41:56.309212Z 01O ligne 17
+2026-10-22T12:41:56.309213Z 01O ligne 18
+2026-10-22T12:41:56.309213Z 01O ligne 19
+2026-10-22T12:41:56.309213Z 01O ligne 20
+2026-10-22T12:41:56.309213Z 01O ligne 21
+2026-10-22T12:41:56.309213Z 01O ligne 22
+2026-10-22T12:41:56.309214Z 01O ligne 23
+2026-10-22T12:41:56.309214Z 01O ligne 24
+2026-10-22T12:41:56.309214Z 01O ligne 25
+2026-10-22T12:41:56.309214Z 01O ligne 26
+2026-10-22T12:41:56.309215Z 01O ligne 27
+2026-10-22T12:41:56.309215Z 01O ligne 28
+2026-10-22T12:41:56.309215Z 01O ligne 29
+2026-10-22T12:41:56.309215Z 01O ligne 30
+2026-10-22T12:41:56.309216Z 01O ligne 31
+2026-10-22T12:41:56.309216Z 01O ligne 32
+2026-10-22T12:41:56.309216Z 01O ligne 33
+2026-10-22T12:41:56.309216Z 01O ligne 34
+2026-10-22T12:41:56.309217Z 01O ligne 35
+2026-10-22T12:41:56.309217Z 01O ligne 36
+2026-10-22T12:41:56.309217Z 01O ligne 37
+2026-10-22T12:41:56.309217Z 01O ligne 38
+2026-10-22T12:41:56.309217Z 01O ligne 39
+2026-10-22T12:41:56.309218Z 01O ligne 40
+2026-10-22T12:41:56.476140Z 00O section_end:1792672916:step_script[0K
+2026-10-22T12:41:56.476657Z 00O+section_start:1792672916:cleanup_file_variables[0K
+2026-10-22T12:41:56.476661Z 00O+[0K[36;1mCleaning up project directory and file based variables[0;m[0;m
+2026-10-22T12:41:57.010234Z 00O section_end:1792672917:cleanup_file_variables[0K
+2026-10-22T12:41:57.024725Z 00O [32;1mJob succeeded[0;m
