@@ -156,6 +156,16 @@ Environment variables override the first server (or define one if the file has n
 | `SMITHY_GITHUB_CLIENT_ID` | Client ID of the OAuth App used for GitHub sign-in by code |
 | `SMITHY_GITLAB_CLIENT_ID` | Client ID of the OAuth application used for GitLab sign-in by code (needed on a self-hosted GitLab) |
 | `SMITHY_SERVER` | Name of the server to use            |
+| `SMITHY_LOG`    | Log level: `error`, `info` (default), `debug` or `off` |
+
+### Log file
+
+smithy keeps a log in `~/.config/smithy/smithy.log` (next to `config.toml`): one line per event, UTC timestamps. By default it records what you do and what fails: start and stop, every page or tab you move to, sign-ins (including by code), tokens renewed, servers added, edited or removed, and every failed request (quota reached, session expired, network down) or crash. `SMITHY_LOG=debug` adds every successful request, including the 5-second refresh. The same error repeating is written once, followed by “répété N fois”. The file is private (`0600`), turns over at 1 MiB (`smithy.log.1` keeps the previous one), and tokens and passwords are never written.
+
+```text
+2026-10-22T13:32:41.921Z INFO  navigation : gl › Accueil › thomas-gleizes/smithy-test
+2026-10-22T13:32:48.964Z ERROR [gl] dépôts Mine : non authentifié (token absent ou invalide)
+```
 
 ### Logging in
 

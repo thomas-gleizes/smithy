@@ -125,6 +125,101 @@ pub enum Msg {
     },
 }
 
+impl Msg {
+    /// Ce que le journal retient d'une réponse : de quoi il s'agit et, si la requête a échoué, la
+    /// raison. `None` pour ce qui ne mérite pas une ligne (les colorations).
+    pub fn outcome(&self) -> Option<(String, Option<String>)> {
+        fn failed<T>(r: &Result<T, Error>) -> Option<String> {
+            r.as_ref().err().map(ToString::to_string)
+        }
+        Some(match self {
+            Msg::Repos { source, result } => (format!("dépôts {source:?}"), failed(result)),
+            Msg::RepoInfo { repo, result } => {
+                (format!("fiche de {}", repo.full_name()), failed(result))
+            }
+            Msg::Pipelines { repo, result } => (
+                format!("runs de {}", repo.full_name()),
+                result.as_ref().err().cloned(),
+            ),
+            Msg::Branches { repo, result } => {
+                (format!("branches de {}", repo.full_name()), failed(result))
+            }
+            Msg::Dir {
+                repo,
+                reference,
+                path,
+                result,
+            } => (
+                format!("dossier {}:{reference}/{path}", repo.full_name()),
+                failed(result),
+            ),
+            Msg::File {
+                repo,
+                reference,
+                path,
+                result,
+            } => (
+                format!("fichier {}:{reference}/{path}", repo.full_name()),
+                failed(result),
+            ),
+            Msg::Logs {
+                repo,
+                pipeline_id,
+                result,
+            } => (
+                format!("logs du job {pipeline_id} de {}", repo.full_name()),
+                failed(result),
+            ),
+            Msg::Commits {
+                repo,
+                reference,
+                page,
+                result,
+            } => (
+                format!("commits de {} ({reference}, page {page})", repo.full_name()),
+                failed(result),
+            ),
+            Msg::CommitDetail { repo, sha, result } => (
+                format!("commit {sha} de {}", repo.full_name()),
+                failed(result),
+            ),
+            Msg::Pulls {
+                repo,
+                filter,
+                page,
+                result,
+            } => (
+                format!(
+                    "pull requests de {} ({filter:?}, page {page})",
+                    repo.full_name()
+                ),
+                failed(result),
+            ),
+            Msg::PullDetail {
+                repo,
+                number,
+                result,
+            } => (
+                format!("pull request #{number} de {}", repo.full_name()),
+                failed(result),
+            ),
+            Msg::Reach { url, result, .. } => (
+                format!("joignabilité de {url}"),
+                result.as_ref().err().cloned(),
+            ),
+            Msg::Device { server, result } => (
+                format!("connexion par code sur « {server} »"),
+                result.as_ref().err().cloned(),
+            ),
+            Msg::LoggedIn { server, result } => (
+                format!("connexion à « {server} »"),
+                result.as_ref().err().cloned(),
+            ),
+            Msg::FileStyles { .. } | Msg::DiffStyles { .. } => return None,
+        })
+    }
+}
+
 /// Nombre maximal d'onglets : chacun garde ses pages (un log peut compter 50 000 lignes).
 pub const MAX_TABS: usize = 10;
 

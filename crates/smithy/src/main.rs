@@ -6,6 +6,7 @@ mod diff;
 mod graph;
 mod highlight;
 mod history;
+mod log;
 mod logview;
 mod markdown;
 mod mouse;
@@ -53,7 +54,9 @@ const TICK: Duration = Duration::from_millis(100);
 async fn main() -> Result<()> {
     // Les arguments d'abord : `--help` doit répondre sans configuration.
     let fresh = parse_args()?;
-    let cfg = config::load()?;
+    log::init();
+    log::install_panic_hook();
+    let cfg = config::load().inspect_err(|e| log::error!("configuration illisible : {e:#}"))?;
     let wanted = std::env::var("SMITHY_SERVER").ok();
     // Vérifie le nom demandé (erreur claire) avant d'ouvrir le terminal. Sans serveur, rien à
     // vérifier : l'application en fait configurer un au lancement.
@@ -61,13 +64,57 @@ async fn main() -> Result<()> {
         cfg.server(wanted.as_deref())?;
     }
     let store = SessionStore::default_location();
+    log::info!(
+        "démarrage de smithy {}{} ; serveurs : {}",
+        env!("CARGO_PKG_VERSION"),
+        if fresh { " (--fresh)" } else { "" },
+        cfg.servers
+            .iter()
+            .map(|s| format!("{} [{} {}]", s.name, s.kind.label(), s.url))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
 
     let mut terminal = ratatui::init();
     mouse_capture(true);
     let result = run(&mut terminal, cfg.servers.clone(), wanted, store, fresh).await;
     mouse_capture(false);
     ratatui::restore();
+    match &result {
+        Ok(()) => log::info!("arrêt de smithy"),
+        Err(e) => log::error!("arrêt de smithy sur une erreur : {e:#}"),
+    }
+    log::flush();
     result
+}
+
+/// Une ligne du journal pour une réponse : une erreur (toujours), une connexion (action), le reste
+/// au niveau `debug` (chaque requête réussie, dont le rafraîchissement toutes les 5 s).
+fn log_outcome(server: &str, msg: &Msg) {
+    let Some((what, error)) = msg.outcome() else {
+        return;
+    };
+    match error {
+        Some(e) => log::error!("[{server}] {what} : {e}"),
+        None if matches!(msg, Msg::LoggedIn { .. } | Msg::Device { .. }) => {
+            log::info!("[{server}] {what} : ok");
+        }
+        None => log::debug!("[{server}] {what} : ok"),
+    }
+}
+
+/// Où l'on est : le fil d'Ariane de l'onglet affiché, et le nombre d'onglets s'il y en a plusieurs.
+fn navigation(app: &App) -> String {
+    let crumb = app
+        .breadcrumb_pages()
+        .into_iter()
+        .map(|(segment, _)| segment)
+        .collect::<Vec<_>>()
+        .join(" › ");
+    match app.tab_count() {
+        0 | 1 => crumb,
+        n => format!("{crumb} (onglet, {n} ouverts)"),
+    }
 }
 
 /// Souris et trackpad (clic, molette). Le terminal ne sélectionne alors plus le texte de
@@ -256,6 +303,11 @@ fn build_provider(
                     let (store, name, url) =
                         (store.cloned(), server.name.clone(), server.url.clone());
                     AnyProvider::GitLab(gitlab.with_refresh(client_id, refresh, move |t| {
+                        log::info!(
+                            "« {name} » : token renouvelé (valable {} s)",
+                            t.expires_in
+                                .map_or_else(|| "?".to_owned(), |s| s.to_string())
+                        );
                         // Rien à faire d'une erreur d'écriture ici : le token garde jusqu'au
                         // prochain renouvellement, et la reconnexion reste possible.
                         if let Some(store) = &store {
@@ -1221,7 +1273,17 @@ fn save_server(
         Some(f) => *f = file_server,
         None => file.push(file_server),
     }
-    config::save_servers(&file).map_err(|e| format!("config non enregistrée : {e:#}"))?;
+    config::save_servers(&file).map_err(|e| {
+        log::error!("config non enregistrée : {e:#}");
+        format!("config non enregistrée : {e:#}")
+    })?;
+    log::info!(
+        "serveur « {} » {} ([{} {}])",
+        server.name,
+        if old.is_some() { "modifié" } else { "ajouté" },
+        server.kind.label(),
+        server.url
+    );
 
     let mut list = known;
     match list.iter_mut().find(|s| s.name == server.name) {
@@ -1263,7 +1325,9 @@ fn delete_server(
         config::save_servers(&file).map_err(|e| format!("config non enregistrée : {e:#}"))?;
     }
     backends.remove(name);
+    log::info!("serveur « {name} » supprimé");
     if let Some(Err(e)) = store.map(|s| s.clear(name)) {
+        log::error!("session de « {name} » non effacée : {e}");
         app.error = Some(format!("session non effacée : {e}"));
     }
     app.forget_caps(name);
@@ -1290,9 +1354,11 @@ fn logout_server(
         return;
     };
     if let Some(Err(e)) = store.map(|s| s.clear(name)) {
+        log::error!("session de « {name} » non effacée : {e}");
         app.server_note = Some(format!("session non effacée : {e}"));
         return;
     }
+    log::info!("« {name} » : session effacée (déconnexion)");
     b.saved_token = None;
     b.saved_refresh = None;
     b.username.clear();
@@ -1624,6 +1690,7 @@ async fn run(
         Some(_) => {}
     }
     let mut last_refresh = Instant::now();
+    let mut last_nav = String::new();
     let mut device_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let _lock = owner_lock;
@@ -1648,6 +1715,7 @@ async fn run(
         }
 
         while let Ok((origin, msg)) = rx.try_recv() {
+            log_outcome(&origin, &msg);
             let mut save_error = None;
             match &msg {
                 Msg::LoggedIn {
@@ -1682,6 +1750,7 @@ async fn run(
                     result: Err(Error::SessionExpired),
                     ..
                 } if app.login.is_none() && app.device.is_none() && origin == app.server_name => {
+                    log::info!("« {origin} » : session expirée, reconnexion demandée");
                     ask_credentials(&mut app, &backends, &origin, false);
                 }
                 _ => {}
@@ -1698,6 +1767,13 @@ async fn run(
             }
         }
 
+        // Chaque changement de page ou d'onglet est une action à retrouver dans le journal.
+        let nav = navigation(&app);
+        if nav != last_nav {
+            log::info!("navigation : {nav}");
+            last_nav = nav;
+        }
+
         // Connexion par code : la tâche qui attend l'autorisation s'arrête avec la fenêtre.
         if app.device.is_none()
             && let Some(t) = device_task.take()
@@ -1709,6 +1785,7 @@ async fn run(
                 t.abort();
             }
             if let Some(b) = backends.get(&name) {
+                log::info!("« {name} » : connexion par code demandée");
                 device_task = Some(spawn_device(&b.server, &tx));
             }
         }
