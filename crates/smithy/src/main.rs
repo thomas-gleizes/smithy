@@ -103,20 +103,6 @@ fn log_outcome(server: &str, msg: &Msg) {
     }
 }
 
-/// Où l'on est : le fil d'Ariane de l'onglet affiché, et le nombre d'onglets s'il y en a plusieurs.
-fn navigation(app: &App) -> String {
-    let crumb = app
-        .breadcrumb_pages()
-        .into_iter()
-        .map(|(segment, _)| segment)
-        .collect::<Vec<_>>()
-        .join(" › ");
-    match app.tab_count() {
-        0 | 1 => crumb,
-        n => format!("{crumb} (onglet, {n} ouverts)"),
-    }
-}
-
 /// Souris et trackpad (clic, molette). Le terminal ne sélectionne alors plus le texte de
 /// lui-même : la plupart le permettent encore avec Maj (Option sur iTerm2 / Terminal.app).
 fn mouse_capture(on: bool) {
@@ -1690,7 +1676,6 @@ async fn run(
         Some(_) => {}
     }
     let mut last_refresh = Instant::now();
-    let mut last_nav = String::new();
     let mut device_task: Option<tokio::task::JoinHandle<()>> = None;
 
     let _lock = owner_lock;
@@ -1765,13 +1750,6 @@ async fn run(
             if save_error.is_some() {
                 app.error = save_error;
             }
-        }
-
-        // Chaque changement de page ou d'onglet est une action à retrouver dans le journal.
-        let nav = navigation(&app);
-        if nav != last_nav {
-            log::info!("navigation : {nav}");
-            last_nav = nav;
         }
 
         // Connexion par code : la tâche qui attend l'autorisation s'arrête avec la fenêtre.
