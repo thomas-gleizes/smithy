@@ -1028,6 +1028,7 @@ mod tests {
 
     fn view(texts: &[&str]) -> LogView {
         let pipeline = Pipeline {
+            started_at: None,
             id: 1,
             number: 1,
             job: "j".into(),

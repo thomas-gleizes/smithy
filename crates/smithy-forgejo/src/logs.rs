@@ -400,6 +400,7 @@ mod tests {
 
     fn pipeline(job: &str) -> Pipeline {
         Pipeline {
+            started_at: None,
             id: 99, // l'id de tâche ne doit jamais servir dans le chemin
             number: 7,
             job: job.into(),

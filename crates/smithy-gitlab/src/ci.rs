@@ -37,6 +37,10 @@ struct ApiJob {
     commit: Option<ApiCommit>,
     #[serde(default)]
     pipeline: Option<ApiPipeline>,
+    #[serde(default)]
+    started_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -118,6 +122,7 @@ impl Http {
                     commit: sha,
                     status: map_status(&j.status),
                     url: j.web_url,
+                    started_at: j.started_at.or(j.created_at),
                 }
             })
             .collect())
@@ -228,6 +233,7 @@ mod tests {
 
     fn pipeline(id: u64) -> Pipeline {
         Pipeline {
+            started_at: None,
             id,
             number: 1,
             job: "j".into(),

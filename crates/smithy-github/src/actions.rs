@@ -51,6 +51,10 @@ struct ApiRun {
     head_branch: Option<String>,
     #[serde(default)]
     head_sha: String,
+    #[serde(default)]
+    run_started_at: Option<String>,
+    #[serde(default)]
+    created_at: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -152,6 +156,7 @@ impl Http {
                     commit: run.head_sha.clone(),
                     status: map_status(&job.status, job.conclusion.as_deref()),
                     url: job.html_url,
+                    started_at: run.run_started_at.clone().or(run.created_at.clone()),
                 });
             }
         }

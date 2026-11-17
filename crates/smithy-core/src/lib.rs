@@ -95,6 +95,9 @@ pub struct Pipeline {
     pub commit: String,
     pub status: Status,
     pub url: Option<String>,
+    /// Heure de déclenchement (RFC 3339), si le serveur la donne.
+    #[serde(default)]
+    pub started_at: Option<String>,
 }
 
 /// Une étape d'un job avec sa sortie, déjà nettoyée (voir [`clean_log_line`]).

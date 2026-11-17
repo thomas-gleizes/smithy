@@ -641,6 +641,7 @@ mod tests {
 
     fn pipe(id: u64) -> Pipeline {
         Pipeline {
+            started_at: None,
             id,
             number: id,
             job: "build".into(),
@@ -1000,6 +1001,7 @@ mod tests {
 
     fn run(id: u64, workflow: &str, branch: &str, title: &str, status: Status) -> Pipeline {
         Pipeline {
+            started_at: None,
             id,
             number: id,
             job: format!("job{id}"),

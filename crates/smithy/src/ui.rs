@@ -2207,6 +2207,7 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
         // Les jobs d'un même run se suivent : le run n'est écrit qu'une fois, ses jobs reliés.
         let positions = run_positions(&visible);
         let dim = Style::new().fg(Color::DarkGray);
+        let now = timeago::now_epoch();
         let table_rows: Vec<Row> = visible
             .iter()
             .zip(&positions)
@@ -2232,6 +2233,7 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
                         Cell::from(""),
                         Cell::from(""),
                         Cell::from(""),
+                        Cell::from(""),
                     ]);
                 }
                 Row::new(vec![
@@ -2241,6 +2243,13 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
                     job,
                     Cell::from(p.branch.clone()),
                     Cell::from(p.commit.chars().take(7).collect::<String>()),
+                    Cell::from(Span::styled(
+                        p.started_at
+                            .as_deref()
+                            .map(|d| timeago::ago_rfc3339(now, d))
+                            .unwrap_or_default(),
+                        dim,
+                    )),
                     Cell::from(p.title.clone()),
                 ])
             })
@@ -2254,12 +2263,20 @@ fn draw_runs(f: &mut Frame, app: &App, r: &RunsView, area: Rect) {
                 Constraint::Max(20),
                 Constraint::Length(14),
                 Constraint::Length(8),
+                Constraint::Length(13),
                 Constraint::Min(10),
             ],
         )
         .header(
             Row::new([
-                "Statut", "Run", "Workflow", "Job", "Branche", "Commit", "Titre",
+                "Statut",
+                "Run",
+                "Workflow",
+                "Job",
+                "Branche",
+                "Commit",
+                "Déclenché",
+                "Titre",
             ])
             .style(Style::new().bold()),
         )
@@ -2451,6 +2468,7 @@ mod tests {
 
     fn pipe(id: u64, workflow: &str, status: Status) -> Pipeline {
         Pipeline {
+            started_at: None,
             id,
             number: id,
             job: "build".into(),

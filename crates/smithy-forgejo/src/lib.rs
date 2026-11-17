@@ -132,6 +132,10 @@ struct ApiRun {
     status: String,
     #[serde(default)]
     url: String,
+    #[serde(default)]
+    run_started_at: String,
+    #[serde(default)]
+    created_at: String,
 }
 
 fn map_status(s: &str) -> Status {
@@ -170,6 +174,9 @@ impl From<ApiRun> for Pipeline {
             commit: r.head_sha,
             status: map_status(&r.status),
             url: (!r.url.is_empty()).then_some(r.url),
+            started_at: [r.run_started_at, r.created_at]
+                .into_iter()
+                .find(|d| d.len() > 4 && !d.starts_with("0001")),
         }
     }
 }

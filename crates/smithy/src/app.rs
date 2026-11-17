@@ -2637,6 +2637,7 @@ mod tests {
 
     fn pipe(id: u64) -> Pipeline {
         Pipeline {
+            started_at: None,
             id,
             number: id,
             job: "build".into(),
