@@ -18,6 +18,7 @@ mod session;
 mod textsearch;
 mod timeago;
 mod ui;
+mod update;
 mod workspace;
 mod wrap;
 
@@ -53,6 +54,14 @@ const TICK: Duration = Duration::from_millis(100);
 #[tokio::main]
 async fn main() -> Result<()> {
     // Les arguments d'abord : `--help` doit répondre sans configuration.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().map(String::as_str) == Some("update") {
+        return match args.get(1).map(String::as_str) {
+            None => update::run(false).await,
+            Some("--check") if args.len() == 2 => update::run(true).await,
+            _ => anyhow::bail!("usage : smithy update [--check]"),
+        };
+    }
     let fresh = parse_args()?;
     log::init();
     log::install_panic_hook();
@@ -125,7 +134,10 @@ fn mouse_capture(on: bool) {
 const USAGE: &str = "smithy : consulter la CI et le code de vos forges git dans le terminal
 
 Usage : smithy [--fresh]
+        smithy update [--check]
 
+  update      remplace smithy par la dernière release (somme SHA-256 vérifiée) ;
+              --check dit seulement s'il y en a une
   --fresh     ne rouvre pas les onglets de la dernière session (démarre sur l'accueil)
   --version   affiche la version
   --help      affiche ce message
